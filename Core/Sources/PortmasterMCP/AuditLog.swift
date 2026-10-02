@@ -1,10 +1,14 @@
 import Darwin
 import Foundation
 
-/// Appends one JSON line per MCP tool call to `~/.portmaster/mcp-audit.log`.
+/// Appends one JSON line per MCP **mutation attempt** to
+/// `~/.portmaster/mcp-audit.log`. Reads are deliberately not logged: they change
+/// nothing, and logging them would bury the entries that matter.
 ///
 /// Lines have the shape `{ts, tool, arguments, outcome, reason, pid}` with every
-/// key always present (a nil `reason` is written as JSON `null`). The log file is
+/// key always present (a nil `reason` is written as JSON `null`). `outcome` is
+/// one of `denied` (the gate refused; nothing happened), `allowed` (the action
+/// succeeded), or `failed` (it was permitted but did not work). The log file is
 /// created owner-only (`0600`) inside a `0700` directory.
 public struct AuditLog: Sendable {
     private static let fileName = "mcp-audit.log"

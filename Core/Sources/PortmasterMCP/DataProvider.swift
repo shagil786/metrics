@@ -83,8 +83,9 @@ public struct SettingsSnapshot: Codable, Sendable {
     }
 }
 
-/// Result of a stop action, keyed by pid: `"stopped"`, `"failed: <msg>"`, or
-/// `"unsupported"`. Mirrors `StopCoordinator.Outcome.Status`.
+/// Result of a stop action, keyed by pid: `"stopped"` or `"failed: <reason>"`.
+/// Mirrors `StopCoordinator.Outcome.Status`, which has no separate unsupported
+/// case — an unsupported host arrives as `.failed(reason:)`.
 public struct StopReport: Codable, Sendable {
     public let results: [String: String]
 

@@ -282,7 +282,7 @@ public struct ToolExecutor: Sendable {
                 + "rate has not been measured yet sort last, never as zero.",
             arguments: [
                 (name: "metric", required: true, help: "cpu | memory | network | disk"),
-                (name: "limit", required: false, help: "How many apps to return (default 10)")
+                (name: "limit", required: false, help: "How many apps to return (1-100, default 10)")
             ],
             effect: .read
         ),
@@ -376,46 +376,71 @@ public struct ToolExecutor: Sendable {
         )
     ]
 
+    /// Largest number of apps `get_top_apps` will return for one call. Bounds a
+    /// single response so a client cannot ask for an unbounded payload.
+    public static let maxTopApps = 100
+
     /// Runs one tool call.
     ///
     /// Failure is data, not a thrown error: every problem comes back as a
     /// `ToolOutcome` with `isError` set, so the MCP host never has to guess.
+    ///
+    /// Audit vocabulary, one line per mutation attempt: `denied` (the gate
+    /// refused, so no provider call happened), `allowed` (the provider
+    /// succeeded), `failed` (the provider threw). The line is written after the
+    /// provider call, so the log answers "did the stop actually work?" — not
+    /// merely "was it permitted?".
     public func execute(name: String, arguments: [String: String]) async -> ToolOutcome {
         guard let tool = Self.catalog.first(where: { $0.name == name }) else {
             return ToolOutcome(text: "Unknown tool: \(name)", isError: true)
         }
+        // A blank required argument is a missing argument. The executor is the
+        // only validation layer, so it rejects whitespace-only values here
+        // rather than handing "" to a provider.
         for argument in tool.arguments where argument.required {
-            guard arguments[argument.name] != nil else {
+            let value = arguments[argument.name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let value, !value.isEmpty else {
                 return ToolOutcome(text: "Missing argument: \(argument.name)", isError: true)
             }
         }
 
-        if tool.effect == .mutation {
-            switch gate.decide(isMutation: true) {
-            case .deny(let reason):
-                audit.record(
-                    tool: name, arguments: arguments, outcome: "denied", reason: reason
-                )
-                return ToolOutcome(text: reason, isError: true)
-            case .allow:
-                audit.record(
-                    tool: name, arguments: arguments, outcome: "allowed", reason: nil
-                )
-            }
+        let isMutation = tool.effect == .mutation
+        if isMutation, case .deny(let reason) = gate.decide(isMutation: true) {
+            audit.record(tool: name, arguments: arguments, outcome: "denied", reason: reason)
+            return ToolOutcome(text: reason, isError: true)
         }
 
         do {
             let payload = try await dispatch(tool, arguments: arguments)
-            return ToolOutcome(text: try Self.encode(payload), isError: false)
-        } catch let error as MCPToolError {
-            return ToolOutcome(text: error.message, isError: true)
-        } catch let error as EncodingError {
-            return ToolOutcome(
-                text: "Could not encode \(name) result: \(error)",
-                isError: true
-            )
+            let text = try Self.encode(payload)
+            if isMutation {
+                audit.record(
+                    tool: name, arguments: arguments, outcome: "allowed", reason: nil
+                )
+            }
+            return ToolOutcome(text: text, isError: false)
         } catch {
-            return ToolOutcome(text: error.localizedDescription, isError: true)
+            let reason = Self.failureText(for: error, tool: name)
+            if isMutation {
+                audit.record(tool: name, arguments: arguments, outcome: "failed", reason: reason)
+            }
+            return ToolOutcome(text: reason, isError: true)
+        }
+    }
+
+    /// The caller-facing text for a failed call. A provider that throws a plain
+    /// Swift error would otherwise render as `localizedDescription`'s
+    /// "The operation couldn't be completed. (Module.Error error 1.)", so
+    /// providers are expected to wrap failures in `MCPToolError`.
+    private static func failureText(for error: Error, tool: String) -> String {
+        switch error {
+        case let error as MCPToolError:
+            return error.message
+        case let error as EncodingError:
+            return "Could not encode \(tool) result: \(error)"
+        default:
+            return error.localizedDescription
         }
     }
 
@@ -473,8 +498,8 @@ public struct ToolExecutor: Sendable {
 
     private static func limit(_ raw: String?) throws -> Int {
         guard let raw else { return 10 }
-        guard let limit = Int(raw), limit > 0 else {
-            throw MCPToolError(message: "Invalid limit: \(raw)")
+        guard let limit = Int(raw), limit > 0, limit <= maxTopApps else {
+            throw MCPToolError(message: "Invalid limit: \(raw) (must be 1...\(maxTopApps))")
         }
         return limit
     }

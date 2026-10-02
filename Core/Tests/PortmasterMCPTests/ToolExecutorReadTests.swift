@@ -8,14 +8,9 @@ import PortmasterMCP
 /// errors, so a test can assert both "what was asked" and "what was answered".
 /// `@unchecked Sendable` because the counters are guarded by a lock.
 final class StubProvider: DataProvider, @unchecked Sendable {
-    /// Provider-side failure. Carries the message the executor must surface.
-    struct Failure: Error, Equatable {
-        let message: String
-    }
-
     private let lock = NSLock()
     private var counters: [String: Int] = [:]
-    private var failures: [String: Failure] = [:]
+    private var failures: [String: MCPToolError] = [:]
 
     // Canned results. Tests overwrite whichever one they exercise.
     var sample = StubProvider.makeSample()
@@ -59,8 +54,10 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return rollup
     }
 
+    /// Arms a provider failure, modelled the way `DataProvider` documents it:
+    /// wrapped in `MCPToolError` so the message is caller- and log-safe.
     func fail(_ call: String, with message: String) {
-        lock.withLock { failures[call] = Failure(message: message) }
+        lock.withLock { failures[call] = MCPToolError(message: message) }
     }
 
     func count(of call: String) -> Int {
@@ -73,9 +70,9 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var topAppsCallCount: Int { count(of: "topApps") }
     var appDetailCallCount: Int { count(of: "appDetail") }
 
-    /// Counts the call, then throws when the test armed a failure for it.
+    /// Counts the call, then throws the armed `MCPToolError` when there is one.
     private func enter(_ call: String) throws {
-        let failure: Failure? = lock.withLock {
+        let failure: MCPToolError? = lock.withLock {
             counters[call, default: 0] += 1
             return failures[call]
         }
@@ -236,6 +233,11 @@ final class ToolExecutorReadTests: XCTestCase {
         let json = try jsonObject(outcome.text)
         XCTAssertNotNil(json["cpu"], "overview must carry a cpu section: \(outcome.text)")
         XCTAssertNotNil(json["memory"])
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: dir.appendingPathComponent("mcp-audit.log").path),
+            "reads are not audit-logged: they change nothing and would bury the mutation entries"
+        )
     }
 
     func testTopAppsSortsByCPUDescendingAndHonorsLimit() async throws {
@@ -284,6 +286,21 @@ final class ToolExecutorReadTests: XCTestCase {
         )
     }
 
+    func testTopAppsRejectsUnboundedLimit() async throws {
+        let dir = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+
+        let outcome = await tool.execute(
+            name: "get_top_apps", arguments: ["metric": "cpu", "limit": "100000"]
+        )
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertTrue(outcome.text.contains("Invalid limit"), outcome.text)
+        XCTAssertEqual(stub.topAppsCallCount, 0)
+    }
+
     func testAppDetailUnknownIDIsError() async throws {
         let dir = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -314,6 +331,25 @@ final class ToolExecutorReadTests: XCTestCase {
         XCTAssertEqual(stub.appDetailCallCount, 0, "argument validation precedes the provider")
     }
 
+    func testBlankRequiredArgumentIsError() async throws {
+        let dir = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+
+        for blank in ["", "   ", "\n\t "] {
+            let outcome = await tool.execute(
+                name: "quit_app", arguments: ["id": blank]
+            )
+            XCTAssertTrue(outcome.isError, "id: \(blank.debugDescription)")
+            XCTAssertEqual(outcome.text, "Missing argument: id")
+        }
+        XCTAssertEqual(
+            stub.quitAppCallCount, 0,
+            "a blank id must never reach a mutation provider, even when mutations are allowed"
+        )
+    }
+
     func testUnknownToolIsError() async throws {
         let dir = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -338,6 +374,10 @@ final class ToolExecutorReadTests: XCTestCase {
 
         XCTAssertTrue(outcome.isError)
         XCTAssertEqual(stub.quitAppCallCount, 0, "a denied mutation must never reach the provider")
+        XCTAssertEqual(
+            outcome.text, "MCP mutations are disabled in Portmaster settings.",
+            "the caller must see the gate's reason, not a generic refusal"
+        )
     }
 
     func testSuccessfulMutationWritesAuditEntry() async throws {
@@ -351,16 +391,68 @@ final class ToolExecutorReadTests: XCTestCase {
         XCTAssertFalse(outcome.isError, outcome.text)
         XCTAssertEqual(stub.quitAppCallCount, 1)
 
-        let logURL = dir.appendingPathComponent("mcp-audit.log")
-        let contents = try String(contentsOf: logURL, encoding: .utf8)
-        let entries = contents.split(separator: "\n").map(String.init)
-        let line = try XCTUnwrap(
-            entries.first { $0.contains("\"tool\":\"quit_app\"") },
-            "the allowed mutation must be audit-logged: \(contents)"
-        )
         let entry = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            auditEntries(in: dir).first { $0["tool"] as? String == "quit_app" },
+            "the allowed mutation must be audit-logged"
         )
         XCTAssertEqual(entry["outcome"] as? String, "allowed")
+    }
+
+    func testDeniedMutationWritesDeniedAuditEntry() async throws {
+        let dir = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        let tool = executor(stub, mode: .off, appRunning: true, directory: dir)
+
+        let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
+
+        XCTAssertTrue(outcome.isError)
+        let entries = try auditEntries(in: dir)
+        XCTAssertEqual(entries.count, 1, "exactly one line per mutation attempt")
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry["tool"] as? String, "quit_app")
+        XCTAssertEqual(entry["outcome"] as? String, "denied")
+        XCTAssertEqual(
+            entry["reason"] as? String, "MCP mutations are disabled in Portmaster settings."
+        )
+    }
+
+    func testFailedMutationWritesFailedAuditEntry() async throws {
+        let dir = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        stub.fail("quitApp", with: "PID 4321: still running after the stop signal")
+        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+
+        let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(stub.quitAppCallCount, 1, "the gate allowed it, so it was attempted")
+
+        let entry = try XCTUnwrap(
+            auditEntries(in: dir).first { $0["tool"] as? String == "quit_app" }
+        )
+        XCTAssertEqual(
+            entry["outcome"] as? String, "failed",
+            "a permitted action that did not work must not read as allowed"
+        )
+        XCTAssertEqual(
+            entry["reason"] as? String, "PID 4321: still running after the stop signal"
+        )
+    }
+
+    // MARK: Audit reading
+
+    /// Parsed audit lines, in write order. Throws when the log is absent, which
+    /// is itself the assertion for "nothing was logged".
+    private func auditEntries(in directory: URL) throws -> [[String: Any]] {
+        let logURL = directory.appendingPathComponent("mcp-audit.log")
+        let contents = try String(contentsOf: logURL, encoding: .utf8)
+        return try contents.split(separator: "\n").map { line in
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                "every audit line must be a JSON object: \(line)"
+            )
+        }
     }
 }
