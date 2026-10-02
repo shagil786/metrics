@@ -8,6 +8,9 @@ let package = Package(
     products: [
         .library(name: "PortmasterCore", targets: ["PortmasterCore"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.12.1")
+    ],
     targets: [
         .target(
             name: "PMShim",
@@ -21,6 +24,21 @@ let package = Package(
         .testTarget(
             name: "PortmasterCoreTests",
             dependencies: ["PortmasterCore", "PMShim"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .target(
+            name: "PortmasterMCP",
+            dependencies: ["PortmasterCore", .product(name: "MCP", package: "swift-sdk")],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "portmaster-mcp",
+            dependencies: ["PortmasterMCP"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "PortmasterMCPTests",
+            dependencies: ["PortmasterMCP"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
