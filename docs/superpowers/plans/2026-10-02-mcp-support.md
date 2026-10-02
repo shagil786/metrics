@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Repository is **not a git repo** (as of 2026-10-02): skip all commit steps; a task is done when its verification commands pass. (If git has since been initialized, commit per task.)
+- Repository is a **fresh git repo initialized at plan start** (baseline `00e93d9` on `main`, work on branch `mcp-slice-1`): commit at the end of every task.
 - Tests: `cd Core && swift test` must stay green for **all** suites (147+ pre-existing tests plus these).
 - App build: `xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build` must stay green after the `Core/Package.swift` change.
 - Language mode v5 for repo targets; platform floor macOS 14.
@@ -199,7 +199,6 @@ func testTopAppsNetworkSortsNilRatesLast()             // stub rollups with nil 
 func testAppDetailUnknownIDIsError()                   // id "nope" → isError, message contains "not found"
 func testMissingArgumentIsError()                      // get_app_detail without id → text == "Missing argument: id"
 func testUnknownToolIsError()
-func testUnimplementedToolIsError()                    // e.g. get_containers → isError (until Task 4)
 func testPermissionDeniedDoesNotCallProvider()         // gate mode .off; execute("quit_app", …) → isError; stub.quitAppCallCount == 0
 func testSuccessfulMutationWritesAuditEntry()          // mode .allowSession + appRunning; quit_app → audit file gains outcome "allowed"
 ```
@@ -299,7 +298,7 @@ Note on `testSetPreferenceMcpModeWritesSettingsFile`: to keep this testable, `To
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter ToolExecutorMutationTests`
-Expected: FAIL — mutations return `"Tool not implemented yet"`.
+Expected: FAIL on the `set_preference` tests (they return `"Tool not implemented yet"`); the `quit_app`/`stop_container`/audit tests pass immediately (they cover Task 3's dispatch — regression value).
 
 - [ ] **Step 3: Implement mutation dispatch + allowlist** per semantics.
 
