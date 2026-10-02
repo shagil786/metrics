@@ -1,0 +1,9 @@
+.DS_Store
+xcuserdata/
+DerivedData/
+.build/
+*.xcodeproj
+!*.xcodeproj/project.pbxproj
+.swiftpm/
+*.o
+*.dSYM

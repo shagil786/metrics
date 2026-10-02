@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BuildMachineOSBuild</key>
+	<string>25G83</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Portmaster</string>
+	<key>CFBundleExecutable</key>
+	<string>Portmaster</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.portmaster.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Portmaster</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>DTCompiler</key>
+	<string>com.apple.compilers.llvm.clang.1_0</string>
+	<key>DTPlatformBuild</key>
+	<string>26A425</string>
+	<key>DTPlatformName</key>
+	<string>macosx</string>
+	<key>DTPlatformVersion</key>
+	<string>27.0</string>
+	<key>DTSDKBuild</key>
+	<string>26A425</string>
+	<key>DTSDKName</key>
+	<string>macosx27.0</string>
+	<key>DTXcode</key>
+	<string>2700</string>
+	<key>DTXcodeBuild</key>
+	<string>27A266a</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Portmaster captures only the app output you select to adjust its volume. Audio is replayed locally and never saved.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Portmaster. All observation stays on this Mac.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Portmaster measures the microphone level only when you enable its meter. Audio is never saved or sent.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string></string>
+	<key>SUPublicEDKey</key>
+	<string></string>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+</dict>
+</plist>

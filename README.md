@@ -1,0 +1,101 @@
+# Portmaster
+
+Developer workstation observability for macOS. Portmaster answers five questions from one menu-bar app:
+
+1. What is using my CPU and memory right now?
+2. Which **app** (not 1,000 helper processes) caused the load?
+3. Which local development services are using ports?
+4. Which services look quiet — and what exactly would stop if I chose to stop one?
+5. What has been acting up while I wasn't looking?
+
+All observation is local. No account, no analytics, no telemetry, no cloud upload — nothing to send, and no entitlement to send it with.
+
+## Build & run
+
+Requires Xcode with the macOS 14 SDK or newer and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+
+```sh
+xcodegen generate          # creates Portmaster.xcodeproj from project.yml
+open Portmaster.xcodeproj  # select the Portmaster scheme, Cmd+R
+```
+
+Or from the shell:
+
+```sh
+xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build
+open ~/Library/Developer/Xcode/DerivedData/Portmaster-*/Build/Products/Debug/Portmaster.app
+```
+
+Core tests (parser, attribution, sampling math, plus live-system smoke tests):
+
+```sh
+cd Core && swift test
+```
+
+## What's in the box
+
+- **Menu bar readouts** — separate native items for CPU, kernel memory-pressure state, memory used, busiest-process CPU, GPU, temperature, download, upload and disk writes. Each can show a value, graph or both, with optional icon/caption and compact sizing. macOS owns their ⌘-drag order. Right-click opens window/Settings/Quit actions; the shared dropdown has its own configurable tabs and overview tiles/list.
+- **Overview** — machine summary, CPU history, memory-pressure bar, busiest processes, plus a "Worth a Look" strip of the newest acting-up alerts and an explicit pill whenever sampling is paused.
+- **Hardware & Sensors** — read-only AppleSMC temperature and fan readings. The Overview Hardware card shows the hottest sensor, CPU/GPU maxima, and maximum fan RPM; the popover Sensors tab lists individual fans. Discovery runs off the sampling queue, caches temperature-type keys, and re-reads them about every 5 s while a surface is open (slower in the background). Absent or invalid readings show “—”; fanless and unreadable fans are not conflated with 0 RPM. Settings can show the hottest temperature in the menu bar. Battery capacity health and charge cycles appear only when battery IORegistry metadata supplies them.
+- **Inside App** — the app-detail sheet behind every rollup's Details button: the app's processes grouped into semantic categories (browsers get their real anatomy — Tabs / GPU / Extensions / Browser / Network — Docker splits out its Linux-VM engine), a headline sentence ("Tabs use 82% of its memory"), a segmented share bar with a Memory/CPU toggle, and expandable member lists. Categorization is pure Core code with tests.
+- **Projects & Ports** — listening services grouped by detected project, with search and an activity filter. Quiet services are labeled "No recent CPU activity (observed over the last 5 minutes)" — an observation, never a recommendation.
+- **Containers** — Docker containers via the docker CLI (`docker ps` + `docker stats --no-stream`, slow lane, fixed argv, hard timeout). Availability is stated verbatim: not installed / daemon down / running; per-container CPU and memory appear only when docker stats answers.
+- **Keeping This Mac Awake** — the sleep-preventing power assertions macOS attributes to each process, read from `pmset -g assertions` (window Power tab and popover battery tab). Sourced from macOS's own assertion list, never inferred from CPU or energy use.
+- **Processes** — searchable, sortable list grouped by app and project ("Unattributed" when evidence is missing). Details (executable path, arguments, working directory) are fetched only when you open the detail sheet and stay on-device.
+- **App rollups** — every helper/renderer process is grouped under its host app, so you see dozens of apps instead of a thousand processes. Helpers inherit the app's CPU and memory totals; the popover shows the three busiest apps.
+- **Acting-up alerts** — plain-language observations in the Alerts tab, the Overview strip, and Notification Center: "Chrome is keeping the CPU busy — 70% average over the last 10 minutes", "Slack keeps using more memory — up 1.4 GB in the last hour", "Encoder is hammering the disk — 62 MB/s written on average over the last 10 minutes", "Syncer is using a lot of network — 11 MB/s downloaded on average over the last 10 minutes". Thresholds: 50%+ CPU averaged over a full 10-minute window, 1 GB+ memory growth within an hour, 50 MB/s disk writes or 10 MB/s downloads averaged over 10 minutes; at most one alert per app per kind per hour. Notification permission is requested only when you enable alerts. Per-app power-draw alerting isn't offered — macOS doesn't expose it through supported APIs.
+- **History** — 1 h / 12 h / 24 h / 7 d / 30 d viewing ranges, separate from 24 h / 3 d / 7 d / 30 d retention. System charts cover CPU, memory, GPU, network, disk I/O, battery readings, temperatures and fastest fan where available. App charts cover CPU, memory and reported network/disk rates. Bundle identities combine helpers across PID changes; rankings integrate elapsed CPU time and show recorded averages and peak memory. Missing readings and pauses break lines; plots are bounded to ~200 points. Legacy process/project records stay separate. Large-store queries still run on the main thread and can stall range changes; asynchronous aggregation is pending.
+- **Settings** — sidebar pages with a live readout preview, window/dropdown layout controls, Celsius/Fahrenheit, network bytes/bits, app/process CPU per core/per Mac, configurable global shortcuts, sampling cadence (2/3/5 s live, 15/30/60 s background), retention, login item, Dock visibility, privacy and preview data. System CPU/GPU stay whole-chip percentages; Docker CPU uses its VM's basis. Use Arrange for available window sections; statistics strips move as groups.
+- **Shortcuts actions** — get an observed reading with units, get the current busiest app, open Portmaster and show its dropdown. Readings wait for a recent snapshot and label preview data. Build metadata contains all four actions; end-to-end invocation from Apple's Shortcuts app remains unverified.
+
+## Stop actions (destructive, user-initiated only)
+
+Graceful stop sends SIGTERM; force quit sends SIGKILL and is offered after an unsuccessful graceful attempt, with another confirmation. Project quit includes every currently attributed process, including non-listeners. The confirmation freezes the exact names/PIDs and affected ports. Start times are rechecked before each signal; reused or unknown identities are skipped, newly spawned processes require a new confirmation, and outcomes cover the whole confirmed set. No process is stopped automatically.
+
+## Permissions and distribution
+
+- The read-only dashboard needs **no permissions** — it reads your own user's processes and socket tables.
+- Direct distribution build (App Sandbox **off**). That's what makes per-process metrics, project attribution, and stop actions possible; a sandboxed Mac App Store build would show "Unattributed" for other apps' processes and would have stop actions disabled.
+- Hardened runtime is on; the app is ad-hoc signed for local development. For wider distribution, add Developer ID signing and notarization — configuration only, no code changes.
+- [Local DMG packaging and signed-update setup](Support/Release.md): the installer includes an Applications shortcut. Sparkle checks are disabled until a real HTTPS feed and Ed25519 public key are configured. Developer ID signing/notarization and actual update delivery remain release work.
+- New installs see a welcome screen; legacy preferences skip it. Welcome can be reopened from Settings → Privacy. Notification permission is requested through an explicit Alerts action rather than at launch.
+- Launch-at-login uses `SMAppService` (macOS 13+); if approval is pending, Settings shows the exact status.
+
+## Minimum macOS
+
+macOS 14 (Sonoma). The floor is set by Swift Charts + `NavigationSplitView`-era APIs the UI relies on (13) plus modern `Settings` and `Table` behaviors (14). Collectors themselves (Mach host APIs, libproc, lsof) work back much further, but v1 targets one floor to keep the surface testable.
+
+## Honest limitations (shown in the UI, not hidden)
+
+- AppleSMC's sensor keys and encodings are undocumented and can change with hardware/firmware. Temperature grouping uses key-name conventions, not per-model calibration. Read-only temperature/fan readings are verified on an M4; Intel fixed-point encodings have unit tests, but have not been tested on live Intel hardware. No fan-control writes are implemented. Battery health is full-charge/design capacity from optional IORegistry properties; it is not a service recommendation or charge percentage.
+- Per-process values need two sampling sweeps; the first shows "—" instead of a plausible number.
+- Port ownership comes from `lsof` snapshots every ~10 s; brand-new or very short-lived listeners may lag by one poll.
+- Project attribution is heuristic (working directories + project markers); anything unrecognized is "Unattributed".
+- Per-app GPU attribution, energy impact and power watts remain unavailable through the supported collectors; system GPU and reported per-process disk I/O are shown.
+- Process CPU is stored as percent of one core and can exceed 100 for multithreaded work. Mach ticks are converted through the machine timebase; the per-Mac display preference divides by the core count once.
+
+## Preview mode
+
+Settings → General → "Use preview data" swaps in synthetic fixtures, labeled "Preview data — not your machine" in every surface. It is never the default and never mixed with live data.
+
+## Layout
+
+```
+project.yml              XcodeGen manifest (app target, macOS 14)
+App/                     SwiftUI app: menu bar, windows, sheets, settings
+Core/                    PortmasterCore package (no UI deps)
+  Sources/PMShim/        C shim: proc_pidinfo cwd, KERN_PROCARGS2 argv
+  Sources/PortmasterCore/
+    Models/              ProcessRow, SystemSample, ports, preferences, SwiftData models
+    Collectors/          Mach CPU/memory, libproc processes, lsof ports,
+                         nettop, pmset sleep assertions, docker CLI, read-only SMC sensors
+    Attribution/         project attribution heuristics, app rollups,
+                         AppBreakdown ("what's inside this app")
+    Sampling/            cadence engine (2s live / 15s background, idle pause,
+                         slow lane for nettop/pmset/docker/SMC)
+    Stop/                SIGTERM/SIGKILL coordinator with verification
+    History/             SwiftData store, retention, clear-all
+    Fixtures/            preview data (opt-in, labeled)
+  Tests/                 parser/attribution/breakdown unit tests + live smoke tests
+design-reference/        captured frames of the Vitals 1.2 reference video
+```
