@@ -1,9 +1,2 @@
-.DS_Store
-xcuserdata/
-DerivedData/
+.superpowers/
 .build/
-*.xcodeproj
-!*.xcodeproj/project.pbxproj
-.swiftpm/
-*.o
-*.dSYM
