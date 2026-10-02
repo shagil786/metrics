@@ -70,6 +70,11 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var topAppsCallCount: Int { count(of: "topApps") }
     var appDetailCallCount: Int { count(of: "appDetail") }
 
+    /// What `quitApp` was actually asked for, so a test can pin that the value
+    /// the executor validated is the value the provider receives.
+    private(set) var lastQuitAppID: String?
+    private(set) var lastQuitAppForce: Bool?
+
     /// Counts the call, then throws the armed `MCPToolError` when there is one.
     private func enter(_ call: String) throws {
         let failure: MCPToolError? = lock.withLock {
@@ -134,6 +139,8 @@ final class StubProvider: DataProvider, @unchecked Sendable {
 
     func quitApp(id: String, force: Bool) async throws -> StopReport {
         try enter("quitApp")
+        lastQuitAppID = id
+        lastQuitAppForce = force
         return stopReport
     }
 
@@ -331,6 +338,34 @@ final class ToolExecutorReadTests: XCTestCase {
         XCTAssertEqual(stub.appDetailCallCount, 0, "argument validation precedes the provider")
     }
 
+    func testPaddedArgumentsAreForwardedAndAuditedTrimmed() async throws {
+        let dir = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+
+        let outcome = await tool.execute(
+            name: "quit_app", arguments: ["id": "  4321\n", "force": " true "]
+        )
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertEqual(
+            stub.lastQuitAppID, "4321",
+            "the value that passed validation must be the value the provider receives"
+        )
+        XCTAssertEqual(stub.lastQuitAppForce, true, "optional arguments are trimmed too")
+
+        let entry = try XCTUnwrap(
+            auditEntries(in: dir).first { $0["tool"] as? String == "quit_app" }
+        )
+        let audited = try XCTUnwrap(entry["arguments"] as? [String: String])
+        XCTAssertEqual(
+            audited["id"], "4321",
+            "the audit line must record what was acted on, not what was typed"
+        )
+        XCTAssertEqual(audited["force"], "true")
+    }
+
     func testBlankRequiredArgumentIsError() async throws {
         let dir = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -348,6 +383,7 @@ final class ToolExecutorReadTests: XCTestCase {
             stub.quitAppCallCount, 0,
             "a blank id must never reach a mutation provider, even when mutations are allowed"
         )
+        XCTAssertNil(stub.lastQuitAppID)
     }
 
     func testUnknownToolIsError() async throws {

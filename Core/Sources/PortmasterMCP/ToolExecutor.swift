@@ -394,36 +394,47 @@ public struct ToolExecutor: Sendable {
         guard let tool = Self.catalog.first(where: { $0.name == name }) else {
             return ToolOutcome(text: "Unknown tool: \(name)", isError: true)
         }
-        // A blank required argument is a missing argument. The executor is the
-        // only validation layer, so it rejects whitespace-only values here
-        // rather than handing "" to a provider.
-        for argument in tool.arguments where argument.required {
-            let value = arguments[argument.name]?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let value, !value.isEmpty else {
+        // Trim once, here. The value that is validated must be the value that is
+        // used and audited — a `" foo "` that passes a trim-based emptiness
+        // check and is then looked up untrimmed would make the audit line
+        // disagree with what was actually acted on. Absent and blank are the
+        // same failure to a caller, so both report a missing argument.
+        var normalized = arguments
+        for argument in tool.arguments {
+            guard let value = normalized[argument.name] else {
+                if argument.required {
+                    return ToolOutcome(
+                        text: "Missing argument: \(argument.name)", isError: true
+                    )
+                }
+                continue
+            }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty || !argument.required else {
                 return ToolOutcome(text: "Missing argument: \(argument.name)", isError: true)
             }
+            normalized[argument.name] = trimmed
         }
 
         let isMutation = tool.effect == .mutation
         if isMutation, case .deny(let reason) = gate.decide(isMutation: true) {
-            audit.record(tool: name, arguments: arguments, outcome: "denied", reason: reason)
+            audit.record(tool: name, arguments: normalized, outcome: "denied", reason: reason)
             return ToolOutcome(text: reason, isError: true)
         }
 
         do {
-            let payload = try await dispatch(tool, arguments: arguments)
+            let payload = try await dispatch(tool, arguments: normalized)
             let text = try Self.encode(payload)
             if isMutation {
                 audit.record(
-                    tool: name, arguments: arguments, outcome: "allowed", reason: nil
+                    tool: name, arguments: normalized, outcome: "allowed", reason: nil
                 )
             }
             return ToolOutcome(text: text, isError: false)
         } catch {
             let reason = Self.failureText(for: error, tool: name)
             if isMutation {
-                audit.record(tool: name, arguments: arguments, outcome: "failed", reason: reason)
+                audit.record(tool: name, arguments: normalized, outcome: "failed", reason: reason)
             }
             return ToolOutcome(text: reason, isError: true)
         }
