@@ -85,7 +85,10 @@ struct HistoryTrendPayload: Encodable {
 }
 
 /// Uniform shape for sensors: `available` false means "this machine reports no
-/// SMC sensor", and every reading is then null rather than a fabricated zero.
+/// SMC sensor". The synthesized `Encodable` **omits** nil keys rather than
+/// emitting `null`, so on such a machine the readings are absent entirely
+/// (`{"available":false,"fans":[]}`) — never a fabricated zero. Anything reading
+/// these must treat a missing reading as unavailable rather than defaulting it.
 struct TemperaturesPayload: Encodable {
     let available: Bool
     let cpuTempC: Double?
@@ -136,8 +139,10 @@ struct AlertsPayload: Encodable {
     }
 }
 
-/// One recorded reading of a single resource. `value` stays null when the sensor
-/// had nothing to report: the line breaks there rather than drawing a zero.
+/// One recorded reading of a single resource. When the sensor had nothing to
+/// report the synthesized `Encodable` omits `value` rather than emitting `null`,
+/// so an unavailable reading is an absent key and the line breaks there instead
+/// of dropping to zero. Consumers must check for the key's absence.
 struct ResourceHistoryPointPayload: Encodable {
     let at: Date
     let metric: String

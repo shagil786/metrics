@@ -25,13 +25,17 @@ public protocol SnapshotSource: Sendable {
     func currentSnapshot(maxWait: TimeInterval) async throws -> ObservationSnapshot
 }
 
-/// The live source: one long-lived `SamplingEngine`, started on first use.
+/// The live source: one `SamplingEngine` per source instance, started on first use.
 ///
-/// Sampling continues between calls on purpose. Several readings Portmaster
-/// reports are differences between sweeps — CPU and disk rates need two sweeps,
-/// per-process network needs a `nettop` pass — so a sampler started and polled
-/// once per tool call would report "unknown" forever. Keeping one engine alive
-/// costs a background cadence and makes every call after the first honest.
+/// Whether an engine outlives a single call is the caller's decision, not this
+/// type's, and the two choices cost different things. A caller that holds one
+/// source across calls gets continuing sampling — which several readings need,
+/// since CPU and disk rates are differences between sweeps and per-process
+/// network needs a `nettop` pass. A caller that builds a source per call pays a
+/// cold sweep every time instead; slice 1's `LiveMCPCallContext` does exactly
+/// that, which is why a read carries a ~10 s budget for its first reading.
+/// Neither behavior should be assumed from the type — check how the source is
+/// owned.
 public final class LiveSnapshotSource: SnapshotSource, @unchecked Sendable {
     /// The engine a live source collects from. Injected so a caller (or a test)
     /// can supply fixture collectors without this file knowing about them.

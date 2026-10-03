@@ -32,6 +32,8 @@ Core tests (parser, attribution, sampling math, plus live-system smoke tests):
 cd Core && swift test
 ```
 
+The same package also builds the MCP server, which has its own build and registration steps: [MCP server (for AI assistants)](#mcp-server-for-ai-assistants).
+
 ## What's in the box
 
 - **Menu bar readouts** — separate native items for CPU, kernel memory-pressure state, memory used, busiest-process CPU, GPU, temperature, download, upload and disk writes. Each can show a value, graph or both, with optional icon/caption and compact sizing. macOS owns their ⌘-drag order. Right-click opens window/Settings/Quit actions; the shared dropdown has its own configurable tabs and overview tiles/list.
@@ -68,13 +70,15 @@ The binary lands in SwiftPM's release bin directory; ask SwiftPM where that is r
 cd Core && swift build -c release --show-bin-path   # e.g. .build/out/Products/Release
 ```
 
-Register it with an MCP client. For Claude Code:
+Register it with an MCP client once it is built. For Claude Code:
 
 ```sh
-claude mcp add portmaster -- "$(cd Core && swift build -c release --show-bin-path)/portmaster-mcp"
+claude mcp add portmaster -- "$PWD/$(cd Core && swift build -c release --show-bin-path)/portmaster-mcp"
 ```
 
-`claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same binary path. The executable takes no arguments and needs no environment; stdout carries JSON-RPC and nothing else.
+Run that from the repository root. The registration stores the path **verbatim** and later spawns the binary with the client's own working directory, so a relative path would work only while launching from here — `$PWD` makes it absolute. This form registers in the default `--scope local`, meaning it is available in this project only; pass `--scope user` to make it available everywhere you use the client.
+
+`claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same absolute binary path. The executable takes no arguments and needs no environment; stdout carries JSON-RPC and nothing else.
 
 ### Tools
 
@@ -87,7 +91,7 @@ Nine read tools and four mutations. A read never changes anything; a mutation is
 | `get_app_detail` | One app's totals plus a per-process breakdown | `id` (required, from `get_top_apps`) |
 | `get_containers` | Docker containers, and whether Docker is installed / daemon up / down | — |
 | `get_projects` | Detected repositories with process counts and listening ports | — |
-| `get_history_rankings` | Apps ranked by recorded CPU time over a window | `range` (required: `1h`/`12h`/`24h`/`7d`/`30d`), `resource` (optional) |
+| `get_history_rankings` | Apps ranked by recorded CPU time over a window. **Passing `resource` switches the response shape**: you get that one resource's recorded readings as `{at, metric, value}` points, which belong to no app — not per-app rankings | `range` (required: `1h`/`12h`/`24h`/`7d`/`30d`), `resource` (optional; changes the response shape, see the note below) |
 | `get_temperatures_fans` | Sensor temperatures and fan RPMs, or "unavailable" | — |
 | `get_active_alerts` | "This app is acting up" observations, with provenance | — |
 | `get_settings` | Current preferences, including the MCP mutation mode | — |
@@ -96,7 +100,7 @@ Nine read tools and four mutations. A read never changes anything; a mutation is
 | `stop_project` | **Mutation** — stop every process in a detected project | `id` (required) |
 | `set_preference` | **Mutation** — change one allowlisted preference | `key`, `value` (both required) |
 
-A value that has not been measured is **left out** of the payload (and `get_temperatures_fans` says so with `available: false`) rather than filled with a plausible zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
+A value that has not been measured is **left out** of the payload rather than filled with a plausible zero. What "left out" looks like depends on the shape: an entire section of `get_system_overview` (say `battery`) is simply absent, and `get_temperatures_fans` adds `available: false`; but inside a *series* such as a `get_history_rankings` resource reading, each point is present and only its `value` is absent — so treat a missing `value` as a gap in the line, not as a zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
 
 ### Mutation modes
 
@@ -109,7 +113,7 @@ Mode lives in `~/.portmaster/mcp-settings.json` as one key:
 | Mode | Effect |
 | --- | --- |
 | `off` (default) | Every mutation is refused: *"MCP mutations are disabled in Portmaster settings."* |
-| `confirmEach` | Asks Portmaster to approve each action. **Always refuses in this release** — see limitations. |
+| `confirmEach` | **Always refuses in this release** — the intended behavior is to prompt the running app, which does not exist yet. See limitations. |
 | `allowSession` | Mutations are permitted while the Portmaster app is running, and refused when it is not. |
 
 **`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: edit that file, or use Settings once the in-app MCP panel lands. That is deliberate — an assistant cannot widen its own permissions.

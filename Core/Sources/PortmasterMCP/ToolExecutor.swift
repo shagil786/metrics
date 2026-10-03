@@ -333,7 +333,10 @@ public struct ToolExecutor: Sendable {
         ),
         ToolDefinition(
             name: "get_history_rankings",
-            description: "Apps ranked by recorded CPU time over a window.",
+            description: "Apps ranked by recorded CPU time over a window. With "
+                + "'resource' the response is a different shape: recorded readings "
+                + "of that one resource as {at, metric, value} points belonging to no "
+                + "app, not per-app rankings.",
             arguments: [
                 (name: "range", required: true, help: "1h | 12h | 24h | 7d | 30d"),
                 (name: "resource", required: false, help: "HistoryResource raw value")
