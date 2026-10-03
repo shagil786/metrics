@@ -40,14 +40,6 @@ public enum MCPStdioRunner {
     /// client, long enough to cost nothing while idle.
     static let pumpInterval: TimeInterval = 0.02
 
-    /// Longest the server stays alive after stdin reaches EOF.
-    ///
-    /// A client that pipes its requests and closes stdin — `echo '{…}' |
-    /// portmaster-mcp`, the manual check in a README, a shell one-liner — must
-    /// still get its replies. A client that keeps the pipe open, which every
-    /// long-lived MCP client does, never reaches this at all.
-    public static let eofDrainTimeout: TimeInterval = 2
-
     /// How long the drain waits with no call in flight before it believes the
     /// outstanding work is finished.
     ///
@@ -60,6 +52,21 @@ public enum MCPStdioRunner {
     /// cannot be satisfied by a handler that never finishes, and the timeout ends
     /// the wait regardless.
     static let eofQuietPeriod: TimeInterval = 0.25
+
+    /// Longest the server stays alive after stdin reaches EOF.
+    ///
+    /// A stuck-handler allowance, **not** a shutdown-latency budget. In the normal
+    /// case the drain returns `eofQuietPeriod` after the last reply however large
+    /// this is; it is a ceiling on what a wedged handler can cost, not a wait
+    /// anyone normally sits through.
+    ///
+    /// Derived from the read budget rather than picked, because a cap below it
+    /// silently loses the slowest legitimate tool: a piped `get_system_overview`
+    /// on a cold sampler can spend the whole budget waiting for its first
+    /// reading, and a cap under that answers nothing at all. Expressed in terms
+    /// of the provider's own number so the two cannot drift apart.
+    public static let eofDrainTimeout: TimeInterval =
+        OnDemandProvider.defaultSnapshotTimeout + eofQuietPeriod
 
     /// Serves one session over `transport` and returns when the client is done —
     /// that is, when the transport's input reaches EOF.

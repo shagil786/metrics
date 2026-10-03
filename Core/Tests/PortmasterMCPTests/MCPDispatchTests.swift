@@ -7,7 +7,7 @@
 
 import Foundation
 import PortmasterCore
-import PortmasterMCP
+@testable import PortmasterMCP
 import XCTest
 
 final class MCPDispatchTests: XCTestCase {
@@ -53,8 +53,9 @@ final class MCPDispatchTests: XCTestCase {
             context.executorsMade, 2,
             "an executor cached across calls would freeze the settings a call sees"
         )
-        // Two reads of the same settings are allowed to differ only because the
-        // snapshot is taken twice — proof the calls really went through.
+        // Both calls answered with the stub's settings rather than one coming back
+        // empty-handed. The count above is the real assertion here; this only
+        // confirms neither call was swallowed.
         XCTAssertEqual(first.text, second.text)
     }
 
@@ -210,6 +211,24 @@ final class MCPDispatchTests: XCTestCase {
         XCTAssertGreaterThan(
             Date().timeIntervalSince(began), 0.1,
             "an idle drain must still wait out the quiet period"
+        )
+    }
+
+    /// The cap is derived from the read budget so the two cannot drift apart.
+    /// This names the invariant behind that derivation: a cap shorter than the
+    /// budget silently loses the slowest legitimate tool, and the symptom — a
+    /// piped read answering with nothing — looks like a broken server rather than
+    /// a number that was picked too small.
+    func testDrainCapIsNotShorterThanASlowReadCanTake() {
+        XCTAssertGreaterThanOrEqual(
+            MCPStdioRunner.eofDrainTimeout,
+            OnDemandProvider.defaultSnapshotTimeout,
+            "the EOF drain must outlast a tool that is legitimately waiting for a reading"
+        )
+        XCTAssertGreaterThanOrEqual(
+            MCPStdioRunner.eofDrainTimeout,
+            MCPStdioRunner.eofQuietPeriod,
+            "the cap is a ceiling on a stuck handler, not a reason to skip the quiet period"
         )
     }
 }

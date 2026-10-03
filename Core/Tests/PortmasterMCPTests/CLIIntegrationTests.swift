@@ -239,9 +239,12 @@ final class MCPServerProcess {
             fromServer: LineReader(handle: fromServer.fileHandleForReading),
             stderrReader: LineReader(handle: errors.fileHandleForReading)
         )
-        process.terminationHandler = { finished in
-            server.fromServer.noteExit("status \(finished.terminationStatus)")
-            server.stop(expectingExit: false)
+        // Weak: this closure is retained by `process`, and `server` holds `process`. A
+        // strong capture is a cycle, so `deinit` never runs and neither the child
+        // nor either pipe is ever released for the rest of the test run.
+        process.terminationHandler = { [weak server] finished in
+            server?.fromServer.noteExit("status \(finished.terminationStatus)")
+            server?.stop(expectingExit: false)
         }
         return server
     }
@@ -296,7 +299,28 @@ final class MCPServerProcess {
         // finishes on its own; give it a moment, then take what it collected.
         let readDeadline = Date().addingTimeInterval(5)
         while !fromServer.isClosed, Date() < readDeadline { usleep(20_000) }
+        assertNoFramingNoise()
         return fromServer.drain()
+    }
+
+    /// The stdio transport is newline-delimited, so a blank line is not
+    /// whitespace to be tidy about — it is a line a client tries to parse.
+    ///
+    /// Asserted here because this is the one place a test inspects a whole
+    /// session's stdout. Elsewhere a blank line is skipped rather than parsed,
+    /// which is right for reading replies and exactly why a stray `print` in the
+    /// executable can pass every other test in this file unremarked.
+    private func assertNoFramingNoise() {
+        let blanks = fromServer.blankLineCount
+        guard blanks > 0 else { return }
+        XCTFail(
+            """
+            \(blanks) blank line(s) on stdout. This server's stdout is \
+            newline-delimited JSON-RPC, so a blank line is framing noise a client \
+            will try to parse — in the executable that means a stray print or a \
+            log line written to the wrong stream.
+            """
+        )
     }
 
     /// Sends a request and returns the reply carrying the same id. Any other line
@@ -389,6 +413,12 @@ final class MCPServerProcess {
 
     /// Runs a command to completion, or gives up and returns `timedOut` — a
     /// command that hangs must not hang the test run with it.
+    ///
+    /// Both pipes are drained concurrently, before the wait. Draining one to EOF
+    /// and *then* the other blocks here until the child exits, which is precisely
+    /// the case the deadline exists for: this runs when the binary is missing,
+    /// and a `swift build` that hangs on SwiftPM's build lock would otherwise
+    /// park the whole test run before the deadline was ever consulted.
     private static func run(
         _ arguments: [String], in directory: URL, timeout: TimeInterval
     ) throws -> CommandOutput {
@@ -400,10 +430,33 @@ final class MCPServerProcess {
         let err = Pipe()
         process.standardOutput = out
         process.standardError = err
-        try process.run()
-        // Read before waiting: a build that fills the pipe buffer would deadlock.
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
+
+        // Started before `run()` so nothing can fill a pipe buffer while the
+        // parent is elsewhere: a build that writes more than the buffer holds
+        // would block the child forever.
+        let captured = CapturedOutput()
+        let readers = DispatchGroup()
+        readers.enter()
+        DispatchQueue.global().async {
+            captured.setStdout(out.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+        readers.enter()
+        DispatchQueue.global().async {
+            captured.setStderr(err.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            // Never started, so nothing will ever close these for the readers.
+            try? out.fileHandleForWriting.close()
+            try? err.fileHandleForWriting.close()
+            _ = readers.wait(timeout: .now() + 2)
+            throw error
+        }
+
         let exited = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             process.waitUntilExit()
@@ -414,13 +467,30 @@ final class MCPServerProcess {
             process.terminate()
             _ = exited.wait(timeout: .now() + 10)
         }
-        let status = process.terminationStatus
+        // The pipes close with the child, so the readers finish on their own.
+        // Bounded anyway: this join is for completeness of the output, not for
+        // the process, which is already accounted for.
+        _ = readers.wait(timeout: .now() + 5)
+
         return CommandOutput(
-            status: finished ? status : -1,
-            stdout: String(decoding: outData, as: UTF8.self),
-            stderr: String(decoding: errData, as: UTF8.self),
+            status: finished ? process.terminationStatus : -1,
+            stdout: captured.stdout,
+            stderr: captured.stderr,
             timedOut: !finished
         )
+    }
+
+    /// A command's output, filled in from two queues at once.
+    private final class CapturedOutput: @unchecked Sendable {
+        private let lock = NSLock()
+        private var outData = Data()
+        private var errData = Data()
+
+        func setStdout(_ data: Data) { lock.withLock { outData = data } }
+        func setStderr(_ data: Data) { lock.withLock { errData = data } }
+
+        var stdout: String { lock.withLock { String(decoding: outData, as: UTF8.self) } }
+        var stderr: String { lock.withLock { String(decoding: errData, as: UTF8.self) } }
     }
 
     /// A JSON-RPC line as a dictionary. `JSONSerialization` is used rather than
@@ -474,6 +544,7 @@ final class LineReader: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: [String] = []
     private var closed = false
+    private var blankLines = 0
     private var collected: [String] = []
 
     init(handle: FileHandle) {
@@ -530,6 +601,14 @@ final class LineReader: @unchecked Sendable {
     /// True once the pipe reached EOF and nothing more can arrive.
     var isClosed: Bool { lock.withLock { closed } }
 
+    /// Empty lines seen on the pipe.
+    ///
+    /// Counted rather than discarded. Skipping them silently is what let the
+    /// executable's placeholder `print("")` survive every test in this file: the
+    /// one artifact the stdio framing rules actually forbid, and the one no
+    /// assertion was looking at.
+    var blankLineCount: Int { lock.withLock { blankLines } }
+
     /// Takes every line read so far and empties the queue.
     func drain() -> [String] { lock.withLock { defer { pending.removeAll() }; return pending } }
 
@@ -547,10 +626,14 @@ private func readLoop() {
             guard byte == UInt8(ascii: "\n") else { continue }
             let text = String(decoding: buffer.dropLast(), as: UTF8.self)
             buffer.removeAll(keepingCapacity: true)
-            // An empty line is not a message. The stdio transport drops them too,
-            // and a stray newline on stdout is exactly the framing noise these
-            // tests should not have to work around.
-            guard !text.isEmpty else { continue }
+            // Not a message, so not queued — but counted, so a test that inspects
+            // a whole session can say the executable wrote framing noise. The
+            // stdio transport drops empty lines for the same reason; that is why
+            // the noise is invisible unless something here looks for it.
+            guard !text.isEmpty else {
+                lock.withLock { blankLines += 1 }
+                continue
+            }
             lock.withLock {
                 collected.append(text)
                 pending.append(text)

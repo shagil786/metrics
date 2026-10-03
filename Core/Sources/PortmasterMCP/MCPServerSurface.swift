@@ -291,16 +291,23 @@ public actor CallTracker {
         }
     }
 
-    /// Waits until no call has been in flight for `quiet`, or until `timeout` has
-    /// passed — whichever comes first.
+    /// Waits until no call has been in flight for `quiet`, then returns.
     ///
-    /// Always returns, and never sooner than `quiet`, so a handler that hangs
-    /// costs the timeout and nothing more: the server cannot be kept alive by
-    /// work it is waiting to finish.
+    /// The deadline is `max(quiet, timeout)`: if a call is still running when it
+    /// arrives, the wait ends there and the outstanding count is left alone. The
+    /// floor is `quiet` so a caller cannot shorten the settle window by passing a
+    /// small `timeout` — the two are one policy, not two knobs.
+    ///
+    /// A handler that hangs therefore costs the deadline and nothing more: the
+    /// server cannot be kept alive by work it is waiting to finish.
     public func waitUntilIdle(quiet: TimeInterval, timeout: TimeInterval) async {
         let deadline = Date().addingTimeInterval(max(quiet, timeout))
         var idleSince = Date()
         while Date() < deadline {
+            // Without this a cancelled task spins here: `Task.sleep` throws
+            // immediately once cancelled, so every iteration is a busy iteration
+            // all the way to the deadline.
+            guard !Task.isCancelled else { return }
             if inFlight == 0 {
                 if Date().timeIntervalSince(idleSince) >= quiet { return }
             } else {
