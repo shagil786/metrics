@@ -13,46 +13,12 @@ import PortmasterMCP
 /// would tell a caller "the call failed" when the machine simply answered.
 final class ToolExecutorReadMoreTests: XCTestCase {
 
-    /// A fresh directory, created up front. Every test here is a read, so the
-    /// audit log is never written and the directory would otherwise not exist —
-    /// leaving the cleanup to fail on a path that was never made.
-    private func temporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ToolExecutorReadMoreTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }
-
-    private func executor(_ provider: DataProvider, directory: URL) -> ToolExecutor {
-        ToolExecutor(
-            provider: provider,
-            gate: PermissionGate(settings: MCPSettings(mode: .off), appRunning: false),
-            audit: AuditLog(directory: directory)
-        )
-    }
-
-    private func jsonObject(_ text: String) throws -> [String: Any] {
-        try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-            "payload must be a JSON object: \(text)"
-        )
-    }
-
-    private func jsonArray(_ text: String) throws -> [[String: Any]] {
-        try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]],
-            "payload must be a JSON array: \(text)"
-        )
-    }
-
     // MARK: get_containers
 
     func testContainersDaemonDownIsDataNotError() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.dockerSample = DockerSample(availability: .daemonDown, containers: [])
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_containers", arguments: [:])
 
@@ -71,11 +37,71 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertEqual(stub.count(of: "containers"), 1)
     }
 
+    /// Every container field is named after a different measurement, so a
+    /// transposition here (in for out, cpu from the wrong container) would ship
+    /// wrong numbers to clients while every other test still passed. Each value
+    /// below is deliberately distinct.
+    func testContainersMapsEveryFieldFromItsOwnSource() async throws {
+        let stub = StubProvider()
+        stub.dockerSample = DockerSample(
+            availability: .running,
+            containers: [
+                DockerContainer(
+                    id: "abc123", name: "api", image: "ghcr.io/portmaster/api:1.2.3",
+                    statusText: "Up 8 minutes", ports: [5432, 8080],
+                    cpuPercent: 12.5, memoryBytes: 268_435_456,
+                    networkInBytesPerSec: 1_000, networkOutBytesPerSec: 2_000,
+                    diskReadBytesPerSec: 3_000, diskWriteBytesPerSec: 4_000
+                )
+            ]
+        )
+        let tool = try makeExecutor(provider: stub)
+
+        let outcome = await tool.execute(name: "get_containers", arguments: [:])
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        let json = try jsonObject(outcome.text)
+        XCTAssertEqual(json["availability"] as? String, "running")
+        XCTAssertNotNil(json["at"], "the sample's timestamp travels with the list")
+        let containers = try XCTUnwrap(json["containers"] as? [[String: Any]])
+        XCTAssertEqual(containers.count, 1)
+        let container = try XCTUnwrap(containers.first)
+        XCTAssertEqual(container["id"] as? String, "abc123")
+        XCTAssertEqual(container["name"] as? String, "api")
+        XCTAssertEqual(container["image"] as? String, "ghcr.io/portmaster/api:1.2.3")
+        XCTAssertEqual(container["statusText"] as? String, "Up 8 minutes")
+        XCTAssertEqual(
+            container["isRunning"] as? Bool, true,
+            "isRunning is derived from the status text, not sent by the caller"
+        )
+        XCTAssertEqual(
+            container["ports"] as? [Int], [5432, 8080],
+            "the collector sorts ports; the payload passes them through as given"
+        )
+        XCTAssertEqual(try XCTUnwrap(container["cpuPercent"] as? Double), 12.5, accuracy: 0.001)
+        XCTAssertEqual(
+            try XCTUnwrap(container["memoryBytes"] as? UInt64), 268_435_456,
+            "memory must not be folded into another rate"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(container["networkInBytesPerSec"] as? Double), 1_000, accuracy: 0.001,
+            "in and out must not be transposed"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(container["networkOutBytesPerSec"] as? Double), 2_000, accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(container["diskReadBytesPerSec"] as? Double), 3_000, accuracy: 0.001,
+            "read and write must not be transposed"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(container["diskWriteBytesPerSec"] as? Double), 4_000, accuracy: 0.001
+        )
+    }
+
     // MARK: get_projects
 
     func testProjectsDerivesSummaryFields() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.projectSummaries = [
             PortmasterMCP.ProjectSummary(
@@ -83,7 +109,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
                 processCount: 3, ports: [3000, 8080]
             )
         ]
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_projects", arguments: [:])
 
@@ -100,10 +126,8 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_history_rankings
 
     func testHistoryRankingsInvalidRangeIsError() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(
             name: "get_history_rankings", arguments: ["range": "3h"]
@@ -119,8 +143,6 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     }
 
     func testHistoryRankingsValidRangeMapsSinceDate() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         // Built through the real aggregation so the payload is exercised with a
         // trend the provider could actually produce (the model has no public
@@ -131,7 +153,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
             ), interval: 60
         )
         stub.trends = AppHistoryTrend.aggregate([point], since: Date().addingTimeInterval(-3600))
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(
             name: "get_history_rankings", arguments: ["range": "12h"]
@@ -153,23 +175,24 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertEqual(trends.count, 1)
         let trend = try XCTUnwrap(trends.first)
         XCTAssertEqual(trend["displayName"] as? String, "Chrome")
-        XCTAssertEqual(trend["averageCPU"] as? Double ?? 0, 70, accuracy: 0.001)
-        XCTAssertEqual(trend["cpuSeconds"] as? Double ?? 0, 42, accuracy: 0.001)
+        XCTAssertEqual(
+            try XCTUnwrap(trend["averageCPU"] as? Double), 70, accuracy: 0.001,
+            "a missing or wrongly-typed averageCPU must fail here, not read as 0"
+        )
+        XCTAssertEqual(try XCTUnwrap(trend["cpuSeconds"] as? Double), 42, accuracy: 0.001)
     }
 
     /// A resource reading belongs to no app, so resource mode must return the
     /// recorded points themselves. Decoding them as `AppHistoryTrend` would
     /// invent an app to hang a GPU temperature on.
     func testHistoryRankingsWithResourceReadsResourcePoints() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.resourcePoints = [
             ResourceHistoryPoint(at: Date(), metric: "gpuTemperature", value: 61.5),
             // An unavailable reading stays null; it is not a zero.
             ResourceHistoryPoint(at: Date(), metric: "gpuTemperature", value: nil)
         ]
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(
             name: "get_history_rankings",
@@ -201,10 +224,8 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     }
 
     func testHistoryRankingsInvalidResourceIsError() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(
             name: "get_history_rankings",
@@ -220,14 +241,33 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         )
     }
 
+    /// A blank `resource` is a value the caller sent, not an absent one. Treating
+    /// it as absent would answer with app trends while the caller asked about a
+    /// resource, which reads as if the resource had been honoured.
+    func testHistoryRankingsBlankResourceIsRejectedNotAbsent() async throws {
+        let stub = StubProvider()
+        let tool = try makeExecutor(provider: stub)
+
+        let outcome = await tool.execute(
+            name: "get_history_rankings",
+            arguments: ["range": "24h", "resource": "   "]
+        )
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, "Invalid resource: ")
+        XCTAssertEqual(
+            stub.count(of: "historyRankings"), 0,
+            "a blank resource must not fall through to app trends"
+        )
+        XCTAssertEqual(stub.count(of: "historyResources"), 0)
+    }
+
     // MARK: get_temperatures_fans
 
     func testTemperaturesUnavailableIsDataNotError() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.thermal = nil
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_temperatures_fans", arguments: [:])
 
@@ -249,11 +289,49 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertEqual((json["fans"] as? [Any])?.count, 0)
     }
 
+    /// The nil branch above cannot tell a correct mapping from a transposed one,
+    /// so the populated path names each field's own sensor. CPU, GPU and hottest
+    /// are three distinct numbers precisely so a swap is visible.
+    func testTemperaturesMapsEachSensorAndFanToItsOwnField() async throws {
+        let stub = StubProvider()
+        stub.thermal = ThermalSample(
+            cpuTempC: 72.3125, gpuTempC: 60.5, hottestTempC: 88.125,
+            fans: [
+                FanSample(name: "Fan 1", currentRPM: 1_800),
+                // An unreadable fan keeps a null RPM rather than reporting 0.
+                FanSample(name: nil, currentRPM: nil)
+            ]
+        )
+        let tool = try makeExecutor(provider: stub)
+
+        let outcome = await tool.execute(name: "get_temperatures_fans", arguments: [:])
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        let json = try jsonObject(outcome.text)
+        XCTAssertEqual(
+            json["available"] as? Bool, true,
+            "a sample was reported, so the sensors are available"
+        )
+        XCTAssertEqual(try XCTUnwrap(json["cpuTempC"] as? Double), 72.3125, accuracy: 0.0001)
+        XCTAssertEqual(
+            try XCTUnwrap(json["gpuTempC"] as? Double), 60.5, accuracy: 0.0001,
+            "the GPU sensor must not be reported as the CPU one"
+        )
+        XCTAssertEqual(try XCTUnwrap(json["hottestTempC"] as? Double), 88.125, accuracy: 0.0001)
+        let fans = try XCTUnwrap(json["fans"] as? [[String: Any]])
+        XCTAssertEqual(fans.count, 2)
+        XCTAssertEqual(fans[0]["name"] as? String, "Fan 1")
+        XCTAssertEqual(try XCTUnwrap(fans[0]["currentRPM"] as? Double), 1_800, accuracy: 0.001)
+        XCTAssertNil(fans[1]["name"], "an unnamed fan stays null")
+        XCTAssertNil(
+            fans[1]["currentRPM"],
+            "an unreadable fan must not be reported as 0 RPM"
+        )
+    }
+
     // MARK: get_active_alerts
 
     func testGetActiveAlertsReturnsAlertJSON() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.alertSource = .historyApproximate
         stub.alerts = [
@@ -274,7 +352,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
                 at: Date(timeIntervalSince1970: 1_700_000_100)
             )
         ]
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_active_alerts", arguments: [:])
 
@@ -300,12 +378,10 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     /// ran" must not look the same.
     func testGetActiveAlertsEmptyStillReportsSource() async throws {
         for source in [AlertSource.historyApproximate, .live] {
-            let dir = try temporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: dir) }
             let stub = StubProvider()
             stub.alertSource = source
             stub.alerts = []
-            let tool = executor(stub, directory: dir)
+            let tool = try makeExecutor(provider: stub)
 
             let outcome = await tool.execute(name: "get_active_alerts", arguments: [:])
 
@@ -322,10 +398,8 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_settings
 
     func testGetSettingsReturnsSnapshotJSON() async throws {
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, directory: dir)
+        let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_settings", arguments: [:])
 

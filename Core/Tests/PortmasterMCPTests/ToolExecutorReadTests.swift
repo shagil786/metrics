@@ -192,38 +192,6 @@ final class StubProvider: DataProvider, @unchecked Sendable {
 /// the gate must never be fooled on: a denied mutation never reaches the provider.
 final class ToolExecutorReadTests: XCTestCase {
 
-    private func temporaryDirectory() -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("ToolExecutorReadTests-\(UUID().uuidString)")
-    }
-
-    private func executor(
-        _ provider: DataProvider,
-        mode: MCPMutationMode,
-        appRunning: Bool,
-        directory: URL
-    ) -> ToolExecutor {
-        ToolExecutor(
-            provider: provider,
-            gate: PermissionGate(settings: MCPSettings(mode: mode), appRunning: appRunning),
-            audit: AuditLog(directory: directory)
-        )
-    }
-
-    private func jsonObject(_ text: String) throws -> [String: Any] {
-        try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-            "payload must be a JSON object: \(text)"
-        )
-    }
-
-    private func jsonArray(_ text: String) throws -> [[String: Any]] {
-        try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]],
-            "payload must be a JSON array: \(text)"
-        )
-    }
-
     // MARK: Catalog
 
     func testCatalogDeclaresThirteenToolsAndClassifiesEffects() {
@@ -255,11 +223,12 @@ final class ToolExecutorReadTests: XCTestCase {
     // MARK: Reads
 
     func testOverviewReturnsSystemSampleJSON() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.sample = StubProvider.makeSample()
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .off, appRunning: false, directory: dir
+        )
 
         let outcome = await tool.execute(name: "get_system_overview", arguments: [:])
 
@@ -275,15 +244,13 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testTopAppsSortsByCPUDescendingAndHonorsLimit() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.rollups = [
             StubProvider.makeRollup(name: "Low", pid: 1, cpu: 1.5, memory: 100),
             StubProvider.makeRollup(name: "High", pid: 2, cpu: 90, memory: 100),
             StubProvider.makeRollup(name: "Mid", pid: 3, cpu: 40, memory: 100)
         ]
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(
             name: "get_top_apps", arguments: ["metric": "cpu", "limit": "2"]
@@ -297,15 +264,13 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testTopAppsNetworkSortsNilRatesLast() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.rollups = [
             StubProvider.makeRollup(name: "Unknown", pid: 1, cpu: 0, memory: 0, netIn: nil),
             StubProvider.makeRollup(name: "Light", pid: 2, cpu: 0, memory: 0, netIn: 100),
             StubProvider.makeRollup(name: "Heavy", pid: 3, cpu: 0, memory: 0, netIn: 5_000)
         ]
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(
             name: "get_top_apps", arguments: ["metric": "network", "limit": "10"]
@@ -321,10 +286,8 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testTopAppsRejectsUnboundedLimit() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(
             name: "get_top_apps", arguments: ["metric": "cpu", "limit": "100000"]
@@ -336,10 +299,8 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testAppDetailUnknownIDIsError() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(name: "get_app_detail", arguments: ["id": "nope"])
 
@@ -353,10 +314,8 @@ final class ToolExecutorReadTests: XCTestCase {
     // MARK: Error contract
 
     func testMissingArgumentIsError() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(name: "get_app_detail", arguments: [:])
 
@@ -366,10 +325,11 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testPaddedArgumentsAreForwardedAndAuditedTrimmed() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
 
         let outcome = await tool.execute(
             name: "quit_app", arguments: ["id": "  4321\n", "force": " true "]
@@ -394,10 +354,8 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testBlankRequiredArgumentIsError() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .allowSession, appRunning: true)
 
         for blank in ["", "   ", "\n\t "] {
             let outcome = await tool.execute(
@@ -414,10 +372,8 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testUnknownToolIsError() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: false, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: false)
 
         let outcome = await tool.execute(name: "no_such_tool", arguments: [:])
 
@@ -428,10 +384,8 @@ final class ToolExecutorReadTests: XCTestCase {
     // MARK: Mutations
 
     func testPermissionDeniedDoesNotCallProvider() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: true, directory: dir)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: true)
 
         let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
 
@@ -444,10 +398,11 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testSuccessfulMutationWritesAuditEntry() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
 
         let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
 
@@ -462,10 +417,11 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testDeniedMutationWritesDeniedAuditEntry() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
-        let tool = executor(stub, mode: .off, appRunning: true, directory: dir)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .off, appRunning: true, directory: dir
+        )
 
         let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
 
@@ -481,11 +437,12 @@ final class ToolExecutorReadTests: XCTestCase {
     }
 
     func testFailedMutationWritesFailedAuditEntry() async throws {
-        let dir = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.fail("quitApp", with: "PID 4321: still running after the stop signal")
-        let tool = executor(stub, mode: .allowSession, appRunning: true, directory: dir)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
 
         let outcome = await tool.execute(name: "quit_app", arguments: ["id": "4321"])
 
