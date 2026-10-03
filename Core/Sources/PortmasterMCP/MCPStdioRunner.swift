@@ -74,27 +74,13 @@ public enum MCPStdioRunner {
     /// This is the whole server, with no assumption about which thread or run
     /// loop the caller has: everything below belongs to whoever called it. Call
     /// `runMain` for the stdio process.
+    ///
+    /// The session itself lives in `MCPServerSurface.serveSession`, which the socket
+    /// host also calls — the two transports must serve the same `initialize` and
+    /// drain the same way, so there is one implementation of both rather than two
+    /// that agree today.
     public static func serve(context: any MCPCallContext, transport: any Transport) async throws {
-        let server = Server(
-            name: serverName,
-            version: serverVersion,
-            instructions: instructions,
-            // The catalog is fixed for the life of the process, so there is
-            // nothing to announce.
-            capabilities: .init(tools: .init(listChanged: false))
-        )
-        // Handlers are registered before `start` so the server is complete the
-        // moment it can see a byte.
-        let tracker = await MCPServerSurface.configure(server, context: context)
-        try await server.start(transport: transport)
-        // Returns when the SDK's message loop ends, which is EOF.
-        await server.waitUntilCompleted()
-
-        // EOF. The loop is already over, but a tool call it read just before the
-        // input ended may still be running, and stopping now would throw away a
-        // reply the caller is waiting for. So: drain, bounded.
-        await tracker.waitUntilIdle(quiet: eofQuietPeriod, timeout: eofDrainTimeout)
-        await server.stop()
+        try await MCPServerSurface.serveSession(context: context, transport: transport)
     }
 
     /// Serves MCP on stdin/stdout until the client closes stdin. Does not return:

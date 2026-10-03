@@ -53,6 +53,56 @@ final class MCPHostServerTests: XCTestCase {
         XCTAssertEqual(called.isError, false, "get_settings must not fail over the socket")
     }
 
+    /// A client has no reason to wait between the handshake and its first message:
+    /// the host acknowledges nothing, so there is nothing to wait *for*. One `write`
+    /// carrying both is therefore the natural thing to do, and it is what the CLI in
+    /// task 6 will do.
+    ///
+    /// It works only because the handshake read hands back whatever arrived past the
+    /// newline. A host that kept the handshake line and dropped the rest would accept
+    /// the token, see nothing more, and leave the client waiting on a reply to a
+    /// message it had already delivered — until the client's own timeout, with no
+    /// error on either side to explain it.
+    func testAHandshakeAndInitializeInOneWriteAreBothDelivered() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+
+        let descriptor = try harness.connectRawSocket()
+        addTeardownBlock { close(descriptor) }
+
+        let initialize = """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":\
+            {"protocolVersion":"2025-06-18","capabilities":{},\
+            "clientInfo":{"name":"pipelined","version":"0"}}}
+            """
+        // One write, one `write` syscall's worth of bytes, both messages.
+        try Self.writeAll(
+            Data(#"{"token":"\#(try harness.token)"}"# .utf8)
+                + Data([0x0A])
+                + Data((initialize + "\n").utf8),
+            to: descriptor
+        )
+
+        let reply = try Self.readUntilClose(from: descriptor, timeout: 10)
+        let text = try XCTUnwrap(
+            String(data: reply.bytes, encoding: .utf8),
+            "the host must answer the initialize that arrived with the handshake"
+        )
+        let first = try XCTUnwrap(
+            text.split(separator: "\n").first.map(String.init),
+            "the host sent \(text.count) bytes but no complete line"
+        )
+
+        let object = try jsonObject(first)
+        XCTAssertNil(object["error"], "initialize must not fail: \(first)")
+        let result = try XCTUnwrap(object["result"] as? [String: Any])
+        let serverInfo = try XCTUnwrap(result["serverInfo"] as? [String: Any])
+        XCTAssertEqual(
+            serverInfo["name"] as? String, MCPStdioRunner.serverName,
+            "a pipelined initialize must be served exactly like a separate one"
+        )
+    }
+
     // MARK: - The handshake
 
     /// The handshake is transport-level: a connection that has not presented the
@@ -170,6 +220,49 @@ final class MCPHostServerTests: XCTestCase {
         )
     }
 
+    /// Two connections from one process, which is what an agent does when it asks two
+    /// questions at once.
+    ///
+    /// The identity of a *connection* has to be distinct from the identity of a
+    /// *process*, or `Identifiable` is a lie: a SwiftUI `List` given two rows with the
+    /// same id shows one of them, and the user watching "connected clients" would lose
+    /// a connection without any indication that they had.
+    func testTwoConnectionsFromOneProcessHaveDistinctIdsAndTheSamePid() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+
+        let first = try await harness.connectClient()
+        defer { first.cancel() }
+        let second = try await harness.connectClient()
+        defer { second.cancel() }
+
+        try await Self.eventually(timeout: 5) { harness.host.connectedClients().count == 2 }
+        let clients = harness.host.connectedClients()
+        XCTAssertEqual(clients.count, 2)
+        // Guarded rather than indexed straight away: XCTest assertions do not stop the
+        // test, so `clients[1]` on a one-row list would crash the run and bury the
+        // actual failure under a signal.
+        guard clients.count == 2 else { return }
+
+        // Two connections, so two identities — this is the assertion the pid-as-id
+        // arrangement could not make.
+        XCTAssertNotEqual(
+            clients[0].id, clients[1].id,
+            "two open connections must be two rows, even from one process"
+        )
+        XCTAssertEqual(Set(clients.map(\.id)).count, 2)
+
+        // …and one process, so one pid. Which is the point of keeping `pid` at all.
+        XCTAssertEqual(
+            Set(clients.map(\.pid)).count, 1,
+            "both connections come from this test process, so both report this pid"
+        )
+        XCTAssertEqual(
+            clients[0].pid, ProcessInfo.processInfo.processIdentifier,
+            "the peer pid must be the process on the other end of the socket"
+        )
+    }
+
     // MARK: - Bookkeeping for Settings
 
     /// Settings has to be able to say "something is connected" without the host
@@ -226,7 +319,7 @@ final class MCPHostServerTests: XCTestCase {
     func testAnUnboundedReadClearsAPreviouslySetReadTimeout() async throws {
         let directory = try makeTemporaryDirectory(prefix: "pm")
         let path = directory.appendingPathComponent("pair.sock")
-        let listener = try MCPHostServer.bind(path: path.path)
+        let listener = try UnixSocketBinding.listen(path: path.path)
         let writer = UnixSocket(try connectUnixSocket(at: path.path))
         let accepted = accept(listener, nil, nil)
         close(listener)
@@ -243,7 +336,11 @@ final class MCPHostServerTests: XCTestCase {
         let readInBackground = expectation(description: "unbounded read is blocked")
         let outcome = ReadOutcome()
         DispatchQueue.global(qos: .userInitiated).async {
-            outcome.record(reader.read(into: &chunk, timeout: .infinity))
+            // Its own buffer: `chunk` belongs to the read above, and sharing one
+            // `var` across a suspension point and into an escaping closure is two
+            // threads writing the same memory.
+            var backgroundChunk = [UInt8](repeating: 0, count: 16)
+            outcome.record(reader.read(into: &backgroundChunk, timeout: .infinity))
             readInBackground.fulfill()
         }
         try await Task.sleep(for: .milliseconds(400))
@@ -257,6 +354,53 @@ final class MCPHostServerTests: XCTestCase {
             return XCTFail("the unbounded read must deliver the byte, got \(outcome.value)")
         }
         XCTAssertEqual(count, 1)
+    }
+
+    /// Every connection this host serves costs a reader thread, and a reader thread
+    /// that does not exit is a thread spinning at a core for the life of the process.
+    ///
+    /// Nothing else would show it: no crash, no log line, no failed assertion — the
+    /// session drains and the socket closes perfectly while the thread behind it keeps
+    /// calling `read` on a descriptor that returns zero immediately. So the count of
+    /// live readers is the assertion, and it has to reach zero after `stop()`.
+    func testStopLeavesNoReaderThreadRunning() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+        XCTAssertEqual(harness.host.liveReaderCount, 0, "a host with no clients has no readers")
+
+        let session = try await harness.connectClient()
+        try await Self.eventually(timeout: 5) { harness.host.liveReaderCount == 1 }
+        // Prove the reader really is the thing being counted: a live session, not a
+        // counter that happens to be zero.
+        XCTAssertEqual(harness.host.connectedClients().count, 1)
+
+        await harness.host.stop()
+
+        try await Self.eventually(timeout: 5) { harness.host.liveReaderCount == 0 }
+        XCTAssertEqual(
+            harness.host.liveReaderCount, 0,
+            "stop() must end every reader thread, not just close the descriptors"
+        )
+        session.cancel()
+    }
+
+    /// The same leak by the other exit: a client that goes away on its own, without
+    /// anyone calling `stop()`.
+    func testAClientDisconnectingEndsItsReaderThread() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+
+        let session = try await harness.connectClient()
+        try await Self.eventually(timeout: 5) { harness.host.liveReaderCount == 1 }
+
+        session.cancel()
+
+        try await Self.eventually(timeout: 5) { harness.host.liveReaderCount == 0 }
+        XCTAssertEqual(
+            harness.host.liveReaderCount, 0,
+            "a client hanging up must end its reader thread; nothing else will"
+        )
+        try await Self.eventually(timeout: 5) { harness.host.connectedClients().isEmpty }
     }
 
     // MARK: - Permissions
@@ -314,10 +458,17 @@ final class MCPHostServerTests: XCTestCase {
             let count = chunk.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, 4096) }
             if count > 0 {
                 received.append(contentsOf: chunk[0..<count])
-                return Reply(
-                    bytes: received, sawEndOfFile: false,
-                    elapsed: Date().timeIntervalSince(started)
-                )
+                // Keep reading until there is a whole line. A reply can arrive in
+                // pieces, and a half-parsed JSON-RPC frame would be this helper's bug
+                // rather than the host's. Nothing to wait for in the rejection cases:
+                // those never send a byte, so this only ever triggers on EOF.
+                if received.contains(0x0A) {
+                    return Reply(
+                        bytes: received, sawEndOfFile: false,
+                        elapsed: Date().timeIntervalSince(started)
+                    )
+                }
+                continue
             }
             if count == 0 {
                 return Reply(
@@ -505,7 +656,7 @@ private func connectUnixSocket(at path: String) throws -> Int32 {
             userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))]
         )
     }
-    guard var address = try? MCPHostServer.socketAddress(path: path) else {
+    guard var address = try? UnixSocketBinding.socketAddress(path: path) else {
         close(descriptor)
         throw NSError(
             domain: "MCPHostServerTests", code: 0,

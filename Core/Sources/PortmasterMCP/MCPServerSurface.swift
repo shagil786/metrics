@@ -221,11 +221,60 @@ public enum MCPDispatch {
 
 /// Registers the tool surface on an MCP `Server`.
 public enum MCPServerSurface {
+
+    /// The server both transports serve: the same name, version, instructions and
+    /// capabilities, so a client cannot tell from `initialize` whether it reached
+    /// `portmaster-mcp` on stdio or a running app on a socket.
+    ///
+    /// Built here, next to `configure`, rather than in either caller. The socket
+    /// surface arrived with its own copy, and two copies of a value a client reads
+    /// are two values: the day someone changes the instructions on one side, the two
+    /// surfaces quietly disagree and nothing fails.
+    public static func makeServer() -> Server {
+        Server(
+            name: MCPStdioRunner.serverName,
+            version: MCPStdioRunner.serverVersion,
+            instructions: MCPStdioRunner.instructions,
+            // The catalog is fixed for the life of the process, so there is
+            // nothing to announce.
+            capabilities: .init(tools: .init(listChanged: false))
+        )
+    }
+
+    /// Serves one session on `transport` and returns when the client's input ends.
+    ///
+    /// The whole session, for both transports: build, configure, run, and — the part
+    /// that is easy to get wrong — drain before stopping. The SDK's receive loop ends
+    /// the moment its input does and does not wait for the handler tasks it spawned on
+    /// the way there, so a tool call it read just before EOF can still be running.
+    /// Stopping without the drain throws away a reply the caller is waiting for,
+    /// which is exactly what happens to `echo '{…}' | portmaster-mcp`.
+    ///
+    /// Every wait here is bounded. A handler that hangs costs the deadline and
+    /// nothing more: no client can keep the server alive by work it will not finish.
+    public static func serveSession(
+        context: any MCPCallContext,
+        transport: any Transport
+    ) async throws {
+        let server = makeServer()
+        // Handlers are registered before `start` so the server is complete the
+        // moment it can see a byte.
+        let tracker = await configure(server, context: context)
+        try await server.start(transport: transport)
+        // Returns when the SDK's message loop ends, which is EOF.
+        await server.waitUntilCompleted()
+        await tracker.waitUntilIdle(
+            quiet: MCPStdioRunner.eofQuietPeriod,
+            timeout: MCPStdioRunner.eofDrainTimeout
+        )
+        await server.stop()
+    }
+
     /// Adds `tools/list` and `tools/call` to `server`, and returns the tracker
     /// that knows which calls are outstanding.
     ///
     /// The tracker is returned rather than hidden because the caller has to wait
-    /// on it before shutting down — see `MCPStdioRunner`.
+    /// on it before shutting down — see `serveSession`.
     @discardableResult
     public static func configure(_ server: Server, context: any MCPCallContext) async
         -> CallTracker
