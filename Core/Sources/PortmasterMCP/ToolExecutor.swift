@@ -222,6 +222,128 @@ private struct AppRollupPayload: Encodable {
     }
 }
 
+private struct ContainerPayload: Encodable {
+    let id: String
+    let name: String
+    let image: String
+    let statusText: String
+    let isRunning: Bool
+    let ports: [Int]
+    let cpuPercent: Double?
+    let memoryBytes: UInt64?
+    let networkInBytesPerSec: Double?
+    let networkOutBytesPerSec: Double?
+    let diskReadBytesPerSec: Double?
+    let diskWriteBytesPerSec: Double?
+
+    init(_ container: DockerContainer) {
+        id = container.id
+        name = container.name
+        image = container.image
+        statusText = container.statusText
+        isRunning = container.isRunning
+        ports = container.ports.map(Int.init)
+        cpuPercent = container.cpuPercent
+        memoryBytes = container.memoryBytes
+        networkInBytesPerSec = container.networkInBytesPerSec
+        networkOutBytesPerSec = container.networkOutBytesPerSec
+        diskReadBytesPerSec = container.diskReadBytesPerSec
+        diskWriteBytesPerSec = container.diskWriteBytesPerSec
+    }
+}
+
+/// Docker availability travels as a plain string beside the container list, so
+/// "Docker is not installed", "the daemon is down", and "here are zero
+/// containers" are three answers a caller can tell apart. The first two are
+/// states of the machine, not failures of the call — hence no error flag.
+private struct ContainersPayload: Encodable {
+    let at: Date
+    let availability: String
+    let containers: [ContainerPayload]
+
+    init(_ sample: DockerSample) {
+        at = sample.at
+        switch sample.availability {
+        case .notInstalled: availability = "notInstalled"
+        case .daemonDown: availability = "daemonDown"
+        case .running: availability = "running"
+        }
+        containers = sample.containers.map(ContainerPayload.init)
+    }
+}
+
+/// One recorded app's totals over the requested window. `averageCPU` is nil
+/// whenever no time was actually observed — an unobserved app must not read as
+/// an idle one.
+private struct HistoryTrendPayload: Encodable {
+    let id: String
+    let displayName: String
+    let cpuSeconds: Double
+    let observedSeconds: Double
+    let averageCPU: Double?
+    let peakMemory: Int64
+    let lastSeen: Date
+
+    init(_ trend: AppHistoryTrend) {
+        id = trend.id
+        displayName = trend.displayName
+        cpuSeconds = trend.cpuSeconds
+        observedSeconds = trend.observedSeconds
+        averageCPU = trend.averageCPU
+        peakMemory = trend.peakMemory
+        lastSeen = trend.lastSeen
+    }
+}
+
+/// Uniform shape for sensors: `available` false means "this machine reports no
+/// SMC sensor", and every reading is then null rather than a fabricated zero.
+private struct TemperaturesPayload: Encodable {
+    let available: Bool
+    let cpuTempC: Double?
+    let gpuTempC: Double?
+    let hottestTempC: Double?
+    let fans: [FanPayload]
+
+    init(_ thermal: ThermalSample?) {
+        available = thermal != nil
+        cpuTempC = thermal?.cpuTempC
+        gpuTempC = thermal?.gpuTempC
+        hottestTempC = thermal?.hottestTempC
+        fans = thermal?.fans.map(FanPayload.init) ?? []
+    }
+}
+
+/// One alert plus where it came from. `source` matters because a caller must not
+/// read an alert reconstructed from recorded samples as if the live engine had
+/// just raised it — the observation is real, its freshness is not.
+///
+/// Provenance is the provider's to know, and `ActingUpAlert` has no field for
+/// it, so it is read off the convention the provider marks history-derived
+/// alerts with: an id prefixed `"history:"`. The executor never invents the
+/// claim; it only reports which convention the id uses.
+private struct AlertPayload: Encodable {
+    /// Id prefix the provider uses for an alert reconstructed from history.
+    static let historyPrefix = "history:"
+
+    let id: String
+    let kind: String
+    let appName: String
+    let headline: String
+    let detail: String
+    let at: Date
+    let source: String
+
+    init(_ alert: ActingUpAlert) {
+        id = alert.id
+        kind = alert.kind.rawValue
+        appName = alert.appName
+        headline = alert.headline
+        detail = alert.detail
+        at = alert.at
+        source = alert.id.hasPrefix(Self.historyPrefix) ? "history-approximate" : "live"
+    }
+}
+
 // MARK: - Outcome
 
 /// What a tool call returns to the MCP host: text plus whether it failed.
@@ -475,6 +597,29 @@ public struct ToolExecutor: Sendable {
         case "get_app_detail":
             return AppRollupPayload(try await provider.appDetail(id: Self.id(arguments)))
 
+        case "get_containers":
+            return ContainersPayload(try await provider.containers())
+
+        case "get_projects":
+            return try await provider.projects()
+
+        case "get_history_rankings":
+            // Both arguments are checked before the provider is touched, so an
+            // unusable window or resource never reads history.
+            let window = try Self.requireWindow(arguments["range"])
+            let resource = try Self.optionalResource(arguments["resource"])
+            let trends = try await provider.historyRankings(window: window, resource: resource)
+            return trends.map(HistoryTrendPayload.init)
+
+        case "get_temperatures_fans":
+            return TemperaturesPayload(try await provider.temperaturesFans())
+
+        case "get_active_alerts":
+            return try await provider.activeAlerts().map(AlertPayload.init)
+
+        case "get_settings":
+            return provider.settingsSnapshot()
+
         case "quit_app":
             return try await provider.quitApp(id: Self.id(arguments), force: Self.flag(arguments))
 
@@ -484,7 +629,8 @@ public struct ToolExecutor: Sendable {
         case "stop_project":
             return try await provider.stopProject(id: Self.id(arguments))
 
-        // Declared in the catalog so `tools/list` is complete, but not yet wired.
+        // Declared in the catalog so `tools/list` is complete, but not yet wired:
+        // `set_preference` (Task 5).
         default:
             throw MCPToolError(message: "Tool not implemented yet")
         }
@@ -505,6 +651,25 @@ public struct ToolExecutor: Sendable {
             throw MCPToolError(message: "Invalid metric: \(raw ?? "")")
         }
         return metric
+    }
+
+    private static func requireWindow(_ raw: String?) throws -> HistoryWindow {
+        guard let raw, let window = HistoryWindow(rawValue: raw) else {
+            throw MCPToolError(message: "Invalid range: \(raw ?? "")")
+        }
+        return window
+    }
+
+    /// Absent means "no resource": the caller wants app trends. A value that is
+    /// present but unknown is rejected rather than quietly dropped, because
+    /// silently answering with app trends would look like the resource was
+    /// honoured.
+    private static func optionalResource(_ raw: String?) throws -> HistoryResource? {
+        guard let raw else { return nil }
+        guard let resource = HistoryResource(rawValue: raw) else {
+            throw MCPToolError(message: "Invalid resource: \(raw)")
+        }
+        return resource
     }
 
     private static func limit(_ raw: String?) throws -> Int {

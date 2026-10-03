@@ -17,6 +17,11 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var rollups: [AppRollup] = []
     var details: [String: AppRollup] = [:]
     var stopReport = StopReport(results: ["4321": "stopped"])
+    var dockerSample = DockerSample(availability: .running, containers: [])
+    var projectSummaries: [PortmasterMCP.ProjectSummary] = []
+    var trends: [AppHistoryTrend] = []
+    var thermal: ThermalSample? = nil
+    var alerts: [ActingUpAlert] = []
 
     static func makeSample() -> SystemSample {
         SystemSample(
@@ -75,6 +80,11 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     private(set) var lastQuitAppID: String?
     private(set) var lastQuitAppForce: Bool?
 
+    /// What `historyRankings` was asked for, so a test can pin the range string
+    /// a caller sent against the window the provider received.
+    private(set) var lastHistoryWindow: HistoryWindow?
+    private(set) var lastHistoryResource: HistoryResource?
+
     /// Counts the call, then throws the armed `MCPToolError` when there is one.
     private func enter(_ call: String) throws {
         let failure: MCPToolError? = lock.withLock {
@@ -104,29 +114,31 @@ final class StubProvider: DataProvider, @unchecked Sendable {
 
     func containers() async throws -> DockerSample {
         try enter("containers")
-        return DockerSample(availability: .running, containers: [])
+        return dockerSample
     }
 
     func projects() async throws -> [PortmasterMCP.ProjectSummary] {
         try enter("projects")
-        return []
+        return projectSummaries
     }
 
     func historyRankings(
         window: HistoryWindow, resource: HistoryResource?
     ) async throws -> [AppHistoryTrend] {
         try enter("historyRankings")
-        return []
+        lastHistoryWindow = window
+        lastHistoryResource = resource
+        return trends
     }
 
     func temperaturesFans() async throws -> ThermalSample? {
         try enter("temperaturesFans")
-        return nil
+        return thermal
     }
 
     func activeAlerts() async throws -> [ActingUpAlert] {
         try enter("activeAlerts")
-        return []
+        return alerts
     }
 
     func settingsSnapshot() -> SettingsSnapshot {
