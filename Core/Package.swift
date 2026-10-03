@@ -9,7 +9,11 @@ let package = Package(
         .library(name: "PortmasterCore", targets: ["PortmasterCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.12.1")
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.12.1"),
+        // Not a direct use of our own: the SDK's `Transport` protocol requires a
+        // `Logging.Logger`, so conforming a transport of ours means naming the type.
+        // Already pinned by swift-sdk, so this adds no new resolution.
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0")
     ],
     targets: [
         .target(
@@ -28,7 +32,11 @@ let package = Package(
         ),
         .target(
             name: "PortmasterMCP",
-            dependencies: ["PortmasterCore", .product(name: "MCP", package: "swift-sdk")],
+            dependencies: [
+                "PortmasterCore",
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .executableTarget(
