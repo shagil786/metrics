@@ -186,15 +186,20 @@ final class SnapshotAcquisition: @unchecked Sendable {
         return reading
     }
 
-    /// Asks the source for a real reading, retrying until the budget runs out.
+    /// Asks the source for a real reading, waiting while the answer is "not yet".
     ///
-    /// `.empty` is treated as "not yet" rather than as data, and the wait is
-    /// measured on the real clock: a caller that injects a fixed clock is
-    /// testing cache freshness, and a fake wait would either hang or skip the
+    /// Only *not yet* is waited on. A source that fails outright fails the call
+    /// straight away: retrying a broken collector for the whole budget would
+    /// turn a clear error into a slow one, and would leave the caller guessing
+    /// which subsystem is at fault. "Not yet" is the one failure worth waiting
+    /// out, and it has its own message, so it is recognised by that message
+    /// rather than by its type.
+    ///
+    /// The wait is measured on the real clock: a caller that injects a fixed clock
+    /// is testing cache freshness, and a fake wait would either hang or skip the
     /// very wait this exists to guarantee.
     private func firstReading() async throws -> ObservationSnapshot {
         let deadline = Date().addingTimeInterval(max(0, snapshotTimeout))
-        var lastFailure: Error?
         while true {
             // Outside the attempt below, so a cancelled caller stops here instead
             // of being caught and retried until the budget runs out.
@@ -204,23 +209,32 @@ final class SnapshotAcquisition: @unchecked Sendable {
                 attempt = .success(
                     try await source.currentSnapshot(maxWait: Self.boundedWait(until: deadline))
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                // A genuine failure: report it now, do not spend the budget on it.
+                if !Self.isNotReady(error) {
+                    throw MCPToolError.wrapping(error, subsystem: "sampling")
+                }
                 attempt = .failure(error)
             }
             switch attempt {
             case .success(let reading) where reading.at != .distantPast:
                 return reading
-            case .success:
-                // The source answered, but with nothing collected yet.
-                lastFailure = nil
-            case .failure(let failure):
-                lastFailure = failure
+            case .success, .failure:
+                // Either the source answered with nothing collected, or it said
+                // "not yet". Both mean the same thing: keep waiting.
+                break
             }
-            if Date() >= deadline { break }
+            if Date() >= deadline { throw MCPToolError(message: Self.notReadyMessage) }
             try await Task.sleep(nanoseconds: Self.pollIntervalNanos)
         }
-        if let lastFailure { throw MCPToolError.wrapping(lastFailure, subsystem: "sampling") }
-        throw MCPToolError(message: Self.notReadyMessage)
+    }
+
+    /// "Not yet" is the one failure a source may raise that is worth waiting out.
+    /// Anything else is a real fault in the collector.
+    private static func isNotReady(_ error: Error) -> Bool {
+        (error as? MCPToolError)?.message == notReadyMessage
     }
 
     /// Per-attempt wait: what is left of the budget, capped so one slow attempt

@@ -74,8 +74,9 @@ public struct OnDemandProvider: DataProvider {
     /// - Parameters:
     ///   - snapshotSource: where readings come from. Defaults to a live
     ///     `SamplingEngine`; tests pass a stub.
-    ///   - historyReader: history reads. Defaults to the store at the canonical
-    ///     location; tests pass a seeded or failing seam.
+    ///   - historyFactory: opens the store the first time a history question is
+    ///     asked. Defaults to the canonical location; a test passes a seam here so
+    ///     it can count the opens and prove the non-history tools make none.
     ///   - preferencesDefaults: the app's preferences domain. Defaults to the
     ///     app's own suite.
     ///   - preferencesDomain: suite to open when `preferencesDefaults` is nil.
@@ -96,7 +97,9 @@ public struct OnDemandProvider: DataProvider {
     ///     server's own settings.
     public init(
         snapshotSource: any SnapshotSource = LiveSnapshotSource(),
-        historyReader: (any HistoryReading)? = nil,
+        historyFactory: @escaping @Sendable () -> any HistoryReading = {
+            OnDemandProvider.openDefaultHistory()
+        },
         preferencesDefaults: UserDefaults? = nil,
         preferencesDomain: String = AppLiveness.bundleIdentifier,
         appRunning: @escaping @Sendable () -> Bool = { AppLiveness.isPortmasterRunning() },
@@ -115,10 +118,7 @@ public struct OnDemandProvider: DataProvider {
         self.acquisition = SnapshotAcquisition(
             source: snapshotSource, cacheTTL: cacheTTL, snapshotTimeout: snapshotTimeout, now: now
         )
-        self.history = LazyHistory {
-            if let historyReader { return historyReader }
-            return Self.defaultHistory()
-        }
+        self.history = LazyHistory(historyFactory)
         self.preferences = PreferencesStore(
             defaults: preferencesDefaults ?? UserDefaults(suiteName: preferencesDomain) ?? .standard
         )
@@ -132,12 +132,31 @@ public struct OnDemandProvider: DataProvider {
         self.dockerExecutable = dockerExecutable
     }
 
-    private static func defaultHistory() -> any HistoryReading {
+    /// Opens the canonical store, or a reading that refuses with the reason.
+    ///
+    /// Called on the first history question, not at construction: most tool calls
+    /// never ask one, and opening a database — which also creates the directory
+    /// it lives in — to answer a process question would be a write to the user's
+    /// Application Support directory they did not ask for.
+    public static func openDefaultHistory() -> any HistoryReading {
         StoreHistoryReading.defaultStore()
             ?? UnavailableHistoryReading(
-                message: "Could not open the local history database at "
-                    + HistoryStore.defaultStoreURL().path + "."
+                message: "Could not open the local history database in "
+                    + historyLocationDescription() + "."
             )
+    }
+
+    /// Where history lives, written `~`-relative.
+    ///
+    /// `MCPToolError` is documented as safe to show a caller verbatim, and these
+    /// messages reach the audit log on disk. An absolute path would put the
+    /// account name in both.
+    static func historyLocationDescription() -> String {
+        let directory = HistoryStore.defaultStoreURL().deletingLastPathComponent()
+        let path = directory.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard path.hasPrefix(home) else { return path }
+        return "~" + path.dropFirst(home.count)
     }
 
     // MARK: Snapshot reads
@@ -279,7 +298,10 @@ public struct OnDemandProvider: DataProvider {
                 kind: .sustainedCPU,
                 appName: trend.displayName,
                 headline: "\(trend.displayName) is keeping the CPU busy",
-                detail: "\(Int(average))% average over the last 10 minutes, from recorded history.",
+                // The window comes from the same constant the threshold did, so
+                // changing one can never leave the sentence describing the other.
+                detail: "\(Int(average))% average over the last "
+                    + "\(Self.spanDescription(AlertEngine.cpuWindow)), from recorded history.",
                 at: trend.lastSeen
             ))
         }
@@ -290,7 +312,8 @@ public struct OnDemandProvider: DataProvider {
                 kind: .memoryGrowth,
                 appName: span.displayName,
                 headline: "\(span.displayName) keeps using more memory",
-                detail: "Up \(Fmt.bytes(span.growthBytes)) in the last hour, now "
+                detail: "Up \(Fmt.bytes(span.growthBytes)) in the last "
+                    + "\(Self.spanDescription(AlertEngine.memGrowthWindow)), now "
                     + "\(Fmt.bytes(span.lastBytes)), from recorded history.",
                 at: span.lastAt
             ))
@@ -299,6 +322,19 @@ public struct OnDemandProvider: DataProvider {
             source: .historyApproximate,
             alerts: alerts.sorted { $0.at == $1.at ? $0.id < $1.id : $0.at > $1.at }
         )
+    }
+
+    /// How long a window reads as in a sentence: "10 minutes", "1 hour".
+    /// Derived from the interval rather than written next to it, so a threshold
+    /// change cannot leave a message describing a window that is no longer used.
+    static func spanDescription(_ interval: TimeInterval) -> String {
+        let seconds = Int(interval.rounded())
+        func plural(_ count: Int, _ unit: String) -> String {
+            "\(count) \(unit)\(count == 1 ? "" : "s")"
+        }
+        if seconds % 3600 == 0 { return plural(seconds / 3600, "hour") }
+        if seconds % 60 == 0 { return plural(seconds / 60, "minute") }
+        return plural(seconds, "second")
     }
 
     // MARK: Settings
@@ -319,16 +355,26 @@ public struct OnDemandProvider: DataProvider {
 
     /// Changes one allowlisted preference.
     ///
-    /// Refused while the app is running: the app holds the decoded preferences
-    /// in memory and writes the whole blob on its next change, which would erase
-    /// whatever MCP just wrote. The app's Settings screen is the owner then.
+    /// The app's own preferences are refused while it is running: it holds the
+    /// decoded preferences in memory and writes the whole blob on its next
+    /// change, which would erase whatever MCP just wrote. The app's Settings
+    /// screen is the owner then.
+    ///
+    /// `mcpMode` is the exception, and it comes first on purpose. It is not the
+    /// app's preference at all — it is this server's own mutation policy, kept
+    /// beside the audit log — so a running app has nothing in memory to clobber
+    /// it. Refusing it would mean a user could not widen or narrow MCP's own
+    /// permissions while the app happened to be open, which is the one case where
+    /// they most want to. Reaching this method at all means the executor's
+    /// permission gate already allowed the call, so this branch never widens a
+    /// permission on its own.
     public func setPreference(key: String, value: String) throws {
-        guard !appRunning() else {
-            throw MCPToolError(message: Self.appRunningMessage)
-        }
         if key == "mcpMode" {
             try setMutationMode(value)
             return
+        }
+        guard !appRunning() else {
+            throw MCPToolError(message: Self.appRunningMessage)
         }
         try preferences.setAllowlisted(key: key, value: value)
     }

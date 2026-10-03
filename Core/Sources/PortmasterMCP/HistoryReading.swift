@@ -21,8 +21,13 @@ public protocol HistoryReading: Sendable {
 /// History reads over a `HistoryStore`: trends and memory endpoints through the
 /// store's reader actor (which keeps the stored models inside it), resource
 /// points through the store's own query.
+///
+/// One reader for the lifetime of the reading, as the app does, so an evaluation
+/// that needs both trends and memory endpoints — which is every alert
+/// evaluation — does not open a second context over the same store.
 public struct StoreHistoryReading: HistoryReading {
     private let store: HistoryStore
+    private let readers = ReaderBox()
 
     public init(storeURL: URL? = nil) throws {
         self.store = try HistoryStore(storeURL: storeURL)
@@ -34,7 +39,7 @@ public struct StoreHistoryReading: HistoryReading {
         self.store = store
     }
 
-    /// The store at the canonical Application Support location, or `nil` when it
+    /// The store at the canonical Application Support location, or nil when it
     /// cannot be opened — so the provider can report that instead of answering
     /// every history tool with "no data".
     public static func defaultStore() -> StoreHistoryReading? {
@@ -42,7 +47,7 @@ public struct StoreHistoryReading: HistoryReading {
     }
 
     public func appTrends(since: Date) async throws -> [AppHistoryTrend] {
-        try await store.makeReader().appTrends(since: since)
+        try await readers.get(store).appTrends(since: since)
     }
 
     public func resourceSamples(
@@ -52,21 +57,41 @@ public struct StoreHistoryReading: HistoryReading {
     }
 
     public func appMemorySpans(since: Date) async throws -> [AppMemorySpan] {
-        try await store.makeReader().appMemorySpans(since: since)
+        try await readers.get(store).appMemorySpans(since: since)
+    }
+
+    /// Creates the store's reader once. A box rather than a stored `let`,
+    /// because a reader cannot be built before the store it reads from.
+    private final class ReaderBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var reader: HistoryReader?
+
+        func get(_ store: HistoryStore) -> HistoryReader {
+            lock.lock()
+            defer { lock.unlock() }
+            if let reader { return reader }
+            let created = store.makeReader()
+            reader = created
+            return created
+        }
     }
 }
 
 /// Stands in when history cannot be opened at all. Every read fails with the
 /// reason, so an unreachable database reads as a failure rather than as a
 /// machine with no history.
-struct UnavailableHistoryReading: HistoryReading {
-    let message: String
+public struct UnavailableHistoryReading: HistoryReading {
+    public let message: String
 
-    func appTrends(since: Date) async throws -> [AppHistoryTrend] { throw MCPToolError(message: message) }
-    func resourceSamples(
+    public init(message: String) {
+        self.message = message
+    }
+
+    public func appTrends(since: Date) async throws -> [AppHistoryTrend] { throw MCPToolError(message: message) }
+    public func resourceSamples(
         _ resource: HistoryResource, since: Date
     ) async throws -> [ResourceHistoryPoint] { throw MCPToolError(message: message) }
-    func appMemorySpans(since: Date) async throws -> [AppMemorySpan] { throw MCPToolError(message: message) }
+    public func appMemorySpans(since: Date) async throws -> [AppMemorySpan] { throw MCPToolError(message: message) }
 }
 
 /// Opens the store on the first history question and keeps it.

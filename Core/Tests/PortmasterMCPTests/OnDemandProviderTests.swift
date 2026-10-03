@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import PortmasterCore
-import PortmasterMCP
+@testable import PortmasterMCP
 
 // MARK: - Stubs
 //
@@ -128,6 +128,58 @@ final class RecordingProcessRunner: ProcessRunning, @unchecked Sendable {
     }
 }
 
+/// Counts how many times a provider opened history, so a test can prove the
+/// non-history tools never touch the database.
+final class CountingHistoryFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opens = 0
+    private let reading: @Sendable () -> any HistoryReading
+
+    init(reading: @escaping @Sendable () -> any HistoryReading = {
+        FailingHistoryReading(message: "database is locked")
+    }) {
+        self.reading = reading
+    }
+
+    var openCount: Int { lock.withLock { opens } }
+    var factory: @Sendable () -> any HistoryReading {
+        { [self] in
+            lock.withLock { opens += 1 }
+            return reading()
+        }
+    }
+}
+
+/// A source that fails outright, to tell a real collector fault apart from
+/// "not ready yet".
+final class FailingSnapshotSource: SnapshotSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    let error: Error
+
+    init(error: Error) { self.error = error }
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func currentSnapshot(maxWait: TimeInterval) async throws -> ObservationSnapshot {
+        lock.withLock { calls += 1 }
+        throw error
+    }
+}
+
+/// A source that reports "not ready" the way a live sampler does.
+final class NotReadySnapshotSource: SnapshotSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func currentSnapshot(maxWait: TimeInterval) async throws -> ObservationSnapshot {
+        lock.withLock { calls += 1 }
+        throw MCPToolError(message: SnapshotAcquisition.notReadyMessage)
+    }
+}
+
 /// A history seam that always fails, so the provider's error wrapping is
 /// observable without breaking a real database.
 struct FailingHistoryReading: HistoryReading {
@@ -173,6 +225,141 @@ final class OnDemandProviderTests: XCTestCase {
             source.callCount, 1,
             "the provider must keep asking within its wait budget rather than give up after one try"
         )
+    }
+
+    /// Opening the history database is a write to the user's Application Support
+    /// directory, and most tool calls never ask a history question. So the store
+    /// must stay shut for snapshot, stop and container calls — which also means a
+    /// unit-test run cannot touch the developer's real database.
+    func testOnlyHistoryQuestionsOpenTheHistoryStore() async throws {
+        let history = CountingHistoryFactory()
+        let startedAt = Date(timeIntervalSince1970: 1_600_000_000)
+        let identity = StubIdentity(start: startedAt)
+        let snapshot = Self.makeSnapshot(
+            cpuPercent: 10,
+            processes: [Self.makeProcess(pid: 4242, name: "app", startedAt: startedAt)],
+            rollups: [Self.makeRollup(name: "app", pids: [4242], startedAt: startedAt)],
+            docker: DockerSample(
+                availability: .running,
+                containers: [Self.makeContainer(id: "abc123", name: "api")],
+                at: Self.sampleTime
+            )
+        )
+        let provider = OnDemandProvider(
+            snapshotSource: StubSnapshotSource([snapshot]),
+            historyFactory: history.factory,
+            preferencesDefaults: try makePreferencesDefaults(),
+            appRunning: { false },
+            stopController: RecordingProcessController(identity: identity),
+            stopIdentity: { identity.state($0) },
+            stopVerifyDelay: 0,
+            processRunner: RecordingProcessRunner(
+                outcome: CommandOutcome(exitCode: 0, standardError: "")
+            ),
+            dockerExecutable: { "/test/docker" }
+        )
+
+        _ = try await provider.systemOverview()
+        _ = try await provider.projects()
+        _ = try await provider.containers()
+        _ = try await provider.quitApp(id: "app:app", force: false)
+        _ = try await provider.stopContainer(id: "abc123")
+        XCTAssertEqual(
+            history.openCount, 0,
+            "no snapshot, stop or container call may open the history database"
+        )
+
+        // A history question opens it — once, and then it is reused.
+        _ = try? await provider.activeAlerts()
+        XCTAssertEqual(history.openCount, 1)
+        _ = try? await provider.historyRankings(window: .h1, resource: nil)
+        XCTAssertEqual(
+            history.openCount, 1,
+            "the store is opened once and kept, not reopened per question"
+        )
+    }
+
+    /// Item 12: the refusing reading is what an unreachable database looks like,
+    /// and the location it names must not carry the account name into the audit
+    /// log.
+    func testUnavailableHistorySaysWhyItCannotAnswer() async throws {
+        let location = OnDemandProvider.historyLocationDescription()
+        XCTAssertTrue(location.hasPrefix("~"), "the path must be home-relative: \(location)")
+        XCTAssertFalse(
+            location.contains(FileManager.default.homeDirectoryForCurrentUser.lastPathComponent),
+            "an MCPToolError message is shown verbatim and logged; it must not name the account"
+        )
+        let provider = OnDemandProvider(
+            snapshotSource: stubSnapshotSourceWithoutReading(),
+            historyFactory: {
+                UnavailableHistoryReading(
+                    message: "Could not open the local history database in \(location)."
+                )
+            },
+            preferencesDefaults: try makePreferencesDefaults(),
+            appRunning: { false },
+            snapshotTimeout: 0.1
+        )
+
+        do {
+            _ = try await provider.historyRankings(window: .h1, resource: nil)
+            XCTFail("An unreachable database must not read as a machine with no history")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(
+                error.message, "Could not open the local history database in \(location)."
+            )
+        }
+    }
+
+    /// A genuine collector failure is reported at once. Waiting out the whole
+    /// budget for an error that will not fix itself would only make a clear fault
+    /// slow and vague about its cause.
+    func testSourceFailureIsReportedWithoutRetrying() async throws {
+        let source = FailingSnapshotSource(
+            error: MCPToolError(message: "Could not read sampling data: libproc denied")
+        )
+        let provider = OnDemandProvider(
+            snapshotSource: source,
+            historyFactory: { FailingHistoryReading(message: "unused") },
+            preferencesDefaults: try makePreferencesDefaults(),
+            appRunning: { false },
+            snapshotTimeout: 5
+        )
+
+        do {
+            _ = try await provider.systemOverview()
+            XCTFail("A broken collector must fail the call")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(
+                error.message, "Could not read sampling data: libproc denied",
+                "the provider's own wording must survive the wrap"
+            )
+        }
+        XCTAssertEqual(
+            source.callCount, 1,
+            "a real fault must not be retried for the rest of the budget"
+        )
+    }
+
+    /// "Not yet" is the one failure worth waiting out, so it is the one the
+    /// budget applies to.
+    func testNotReadySourceIsWaitedOutUntilTheBudgetEnds() async throws {
+        let source = NotReadySnapshotSource()
+        let provider = OnDemandProvider(
+            snapshotSource: source,
+            historyFactory: { FailingHistoryReading(message: "unused") },
+            preferencesDefaults: try makePreferencesDefaults(),
+            appRunning: { false },
+            snapshotTimeout: 0.3
+        )
+
+        do {
+            _ = try await provider.systemOverview()
+            XCTFail("A sampler that never produces a reading must not answer")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(error.message, SnapshotAcquisition.notReadyMessage)
+        }
+        XCTAssertGreaterThan(source.callCount, 1, "not-ready must be polled, not failed")
     }
 
     /// Two reads inside the TTL cost one collection; a read after the TTL
@@ -350,7 +537,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: reading,
+            historyFactory: { reading },
             appRunning: { false },
             snapshotTimeout: 0.1
         )
@@ -372,7 +559,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: reading,
+            historyFactory: { reading },
             appRunning: { false },
             now: { now }
         )
@@ -389,7 +576,7 @@ final class OnDemandProviderTests: XCTestCase {
     func testHistoryFailureIsWrappedAsMCPToolError() async throws {
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: FailingHistoryReading(message: "database is locked"),
+            historyFactory: { FailingHistoryReading(message: "database is locked") },
             appRunning: { false },
             snapshotTimeout: 0.1
         )
@@ -427,7 +614,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: reading,
+            historyFactory: { reading },
             appRunning: { false },
             now: { clock.now }
         )
@@ -455,7 +642,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: reading,
+            historyFactory: { reading },
             appRunning: { false },
             now: { clock.now }
         )
@@ -473,6 +660,13 @@ final class OnDemandProviderTests: XCTestCase {
         XCTAssertEqual(alert.appName, "Chrome")
         XCTAssertTrue(
             alert.detail.contains("recorded"), alert.detail
+        )
+        XCTAssertTrue(
+            alert.detail.contains(
+                OnDemandProvider.spanDescription(AlertEngine.cpuWindow)
+            ),
+            "the window in the sentence must come from the constant that produced "
+                + "the threshold: \(alert.detail)"
         )
     }
 
@@ -495,7 +689,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
-            historyReader: reading,
+            historyFactory: { reading },
             appRunning: { false },
             now: { clock.now }
         )
@@ -504,7 +698,12 @@ final class OnDemandProviderTests: XCTestCase {
 
         let growth = alerts.alerts.filter { $0.kind == .memoryGrowth }
         XCTAssertEqual(growth.count, 1)
-        XCTAssertTrue(try XCTUnwrap(growth.first).id.hasPrefix("history:"))
+        let alert = try XCTUnwrap(growth.first)
+        XCTAssertTrue(alert.id.hasPrefix("history:"))
+        XCTAssertTrue(
+            alert.detail.contains(OnDemandProvider.spanDescription(AlertEngine.memGrowthWindow)),
+            alert.detail
+        )
     }
 
     // MARK: Settings
@@ -629,7 +828,38 @@ final class OnDemandProviderTests: XCTestCase {
             XCTFail("Only allowlisted preferences may be changed")
         } catch let error as MCPToolError {
             XCTAssertTrue(error.message.contains("retention"), error.message)
+            // The rejection quotes what *is* allowed, and the catalog lists
+            // `mcpMode`, so leaving it out would send a client looking for a key
+            // it was just told does not exist.
+            for key in ["compact", "cpuScale", "mcpMode", "networkUnit", "temperatureSource", "temperatureUnit"] {
+                XCTAssertTrue(error.message.contains(key), "\(key) missing from: \(error.message)")
+            }
         }
+    }
+
+    /// One rule for every key: trimmed, then matched without regard to case.
+    /// A client echoing a label back must not fail for a reason a user can see,
+    /// and a value that is not on the list must still be refused.
+    func testSetPreferenceValuesAreCaseInsensitiveAndTrimmed() throws {
+        let defaults = try makePreferencesDefaults()
+        let provider = OnDemandProvider(
+            snapshotSource: stubSnapshotSourceWithoutReading(),
+            preferencesDefaults: defaults,
+            appRunning: { false }
+        )
+
+        try provider.setPreference(key: "temperatureUnit", value: "  Fahrenheit ")
+        try provider.setPreference(key: "networkUnit", value: "BITS")
+        try provider.setPreference(key: "cpuScale", value: "PerMac")
+        try provider.setPreference(key: "temperatureSource", value: "GPU")
+        try provider.setPreference(key: "compact", value: " TRUE ")
+
+        let reloaded = AppPreferences.load(from: defaults)
+        XCTAssertEqual(reloaded.presentation.temperatureUnit, .fahrenheit)
+        XCTAssertEqual(reloaded.presentation.networkUnit, .bits)
+        XCTAssertEqual(reloaded.presentation.cpuScale, .perMac)
+        XCTAssertEqual(reloaded.presentation.temperatureSource, .gpu)
+        XCTAssertTrue(reloaded.presentation.compact)
     }
 
     /// `mcpMode` is the MCP server's own policy, not an app preference, so it
@@ -637,16 +867,22 @@ final class OnDemandProviderTests: XCTestCase {
     func testSetPreferenceMcpModeWritesServerSettings() throws {
         let defaults = try makePreferencesDefaults()
         let directory = try makeTemporaryDirectory(prefix: name)
-        let provider = OnDemandProvider(
-            snapshotSource: stubSnapshotSourceWithoutReading(),
-            preferencesDefaults: defaults,
-            appRunning: { false },
-            settingsDirectory: directory
-        )
+        // The server's own mode is writable with the app open: it is not one of
+        // the app's in-memory preferences, so there is nothing to clobber. (The
+        // executor's permission gate still decides whether the call gets here at
+        // all — a client in mode `off` cannot reach this.)
+        for appRunning in [false, true] {
+            let provider = OnDemandProvider(
+                snapshotSource: stubSnapshotSourceWithoutReading(),
+                preferencesDefaults: defaults,
+                appRunning: { appRunning },
+                settingsDirectory: directory
+            )
 
-        try provider.setPreference(key: "mcpMode", value: "allowSession")
+            try provider.setPreference(key: "mcpMode", value: "allowSession")
 
-        XCTAssertEqual(MCPSettings.load(directory: directory).mode, .allowSession)
+            XCTAssertEqual(MCPSettings.load(directory: directory).mode, .allowSession)
+        }
         XCTAssertNil(
             defaults.data(forKey: AppPreferences.defaultsKey),
             "the MCP server's own mode must not be written into the app's preferences blob"
