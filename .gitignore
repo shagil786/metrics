@@ -1,4 +1,16 @@
-.superpowers/
-.build/
-.codebase-memory/
+# Xcode and macOS noise
+.DS_Store
+xcuserdata/
+DerivedData/
+*.o
+*.dSYM
+
+# The Xcode project is generated from the tracked project.yml by xcodegen, so the
+# project directory is ignored rather than the tracked manifest.
 Portmaster.xcodeproj/
+
+# Build output and tooling state
+.build/
+.swiftpm/
+.codebase-memory/
+.superpowers/

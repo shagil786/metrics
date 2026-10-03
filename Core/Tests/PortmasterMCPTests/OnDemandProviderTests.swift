@@ -202,8 +202,8 @@ final class OnDemandProviderTests: XCTestCase {
 
     // MARK: Snapshot acquisition
 
-    /// Review Focus #1: the first tick may not have landed. The honest answer is
-    /// "not yet", never `.empty` handed back as if it were a reading.
+    /// The first tick may not have landed. The honest answer is "not yet",
+    /// never `.empty` handed back as if it were a reading.
     func testSnapshotTimeoutThrowsHonestError() async throws {
         let source = stubSnapshotSourceWithoutReading()
         let provider = OnDemandProvider(
@@ -279,9 +279,8 @@ final class OnDemandProviderTests: XCTestCase {
         )
     }
 
-    /// Item 12: the refusing reading is what an unreachable database looks like,
-    /// and the location it names must not carry the account name into the audit
-    /// log.
+    /// A refusing reading is what an unreachable database looks like, and the
+    /// location it names must not carry the account name into the audit log.
     func testUnavailableHistorySaysWhyItCannotAnswer() async throws {
         let location = OnDemandProvider.historyLocationDescription()
         XCTAssertTrue(location.hasPrefix("~"), "the path must be home-relative: \(location)")
@@ -774,8 +773,7 @@ final class OnDemandProviderTests: XCTestCase {
         }
     }
 
-    /// Review Focus #2: a read-modify-write of the app's blob must leave every
-    /// sibling field alone.
+    /// A read-modify-write of the app's blob must leave every sibling field alone.
     func testSetPreferenceWritesAllowlistedFieldOnly() throws {
         let defaults = try makePreferencesDefaults()
         var seeded = AppPreferences(menuBarMetric: .networkDown)

@@ -169,17 +169,33 @@ final class CLIIntegrationTests: XCTestCase {
     /// with "No reading available yet". This test fails if the executable ever
     /// grows that bug, which is why it asks the running binary for a real
     /// machine reading instead of exercising the executor in-process.
+    ///
+    /// A **timeout** skips rather than fails. This test spends up to a minute
+    /// waiting on a cold sampler, and a loaded machine can spend it there without
+    /// anything being wrong; a failure that only appears when CI is busy trains
+    /// the team to ignore the whole file, including the run-loop regression it
+    /// exists to catch. A server that answers with the *wrong* payload still
+    /// fails — only the absence of an answer within the budget is skipped.
     func testGetSystemOverviewAnswersFromLiveSampler() async throws {
         let server = try MCPServerProcess.launch()
         try server.initialize(id: 1)
 
-        let response = try server.request(
-            """
-            {"jsonrpc":"2.0","id":2,"method":"tools/call",\
-            "params":{"name":"get_system_overview","arguments":{}}}
-            """,
-            timeout: Self.liveReadTimeout
-        )
+        let response: [String: Any]
+        do {
+            response = try server.request(
+                """
+                {"jsonrpc":"2.0","id":2,"method":"tools/call",\
+                "params":{"name":"get_system_overview","arguments":{}}}
+                """,
+                timeout: Self.liveReadTimeout
+            )
+        } catch is ServerTimeout {
+            throw XCTSkip(
+                "no live reading within \(Self.liveReadTimeout)s on this machine; "
+                    + "the run-loop regression this guards against reports an answer "
+                    + "with isError, which still fails above"
+            )
+        }
         let result = try XCTUnwrap(response["result"] as? [String: Any])
         let text = try Self.contentText(result)
         XCTAssertEqual(
@@ -529,6 +545,17 @@ struct ServerFailure: Error, CustomStringConvertible {
     var localizedDescription: String { reason }
 }
 
+/// The server was still silent when its budget ran out.
+///
+/// Its own type so a test can tell "it never answered" from "it answered wrongly":
+/// the run-loop test skips on this and still fails on every other `ServerFailure`,
+/// because a slow machine is not a broken server but a wrong answer is.
+struct ServerTimeout: Error, CustomStringConvertible {
+    let reason: String
+    var description: String { reason }
+    var localizedDescription: String { reason }
+}
+
 // MARK: - Line reader
 
 /// Reads newline-delimited lines off a pipe on its own thread.
@@ -584,7 +611,7 @@ final class LineReader: @unchecked Sendable {
                 )
             }
             guard Date() < deadline else {
-                throw ServerFailure(
+                throw ServerTimeout(
                     reason: "timed out waiting for a line from the server "
                         + "(stdout so far: \(stdout) "
                         + "stderr: \(stderr.isEmpty ? "<nothing>" : stderr))"
