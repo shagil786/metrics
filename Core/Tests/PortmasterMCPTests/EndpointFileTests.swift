@@ -21,7 +21,7 @@ final class EndpointFileTests: XCTestCase {
         let directory = try makeTemporaryDirectory(prefix: name)
         let endpoint = EndpointFile(
             socket: directory.appendingPathComponent("mcp.sock"),
-            token: EndpointFileStore.newToken(),
+            token: try EndpointFileStore.newToken(),
             pid: ProcessInfo.processInfo.processIdentifier
         )
 
@@ -39,6 +39,44 @@ final class EndpointFileTests: XCTestCase {
         XCTAssertEqual(object["socket"] as? String, endpoint.socket.path)
         XCTAssertEqual(object["token"] as? String, endpoint.token)
         XCTAssertEqual((object["pid"] as? NSNumber)?.int32Value, endpoint.pid)
+
+        // The write builds the endpoint in a sibling temp file and renames it in, so
+        // the temp must not survive: a leftover one would sit beside the real
+        // endpoint holding an older token, and `read` only ever looks at the name.
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path),
+            ["mcp-endpoint.json"],
+            "write must leave the endpoint file and nothing else"
+        )
+    }
+
+    /// The token is a secret, and `EndpointFile` ends up in logs, assertion messages
+    /// and error text by reflection alone. Its own description must not be the way it
+    /// escapes: the socket path and pid are diagnostics worth keeping, the token is not.
+    func testDescriptionRedactsTheTokenButKeepsTheDiagnosableFields() throws {
+        let directory = try makeTemporaryDirectory(prefix: name)
+        let endpoint = EndpointFile(
+            socket: directory.appendingPathComponent("mcp.sock"),
+            token: try EndpointFileStore.newToken(),
+            pid: 4242
+        )
+
+        for rendered in [endpoint.description, endpoint.debugDescription, "\(endpoint)"] {
+            XCTAssertFalse(
+                rendered.contains(endpoint.token),
+                "the token must not survive being printed: \(rendered)"
+            )
+            XCTAssertTrue(rendered.contains("<redacted>"), "and must say it was withheld: \(rendered)")
+            XCTAssertTrue(rendered.contains(endpoint.socket.path), "the socket is not secret: \(rendered)")
+            XCTAssertTrue(rendered.contains("4242"), "the pid is not secret: \(rendered)")
+        }
+
+        // Interpolating into a message is the path that actually leaks, so check the
+        // reflected form a logger would produce, not just the property.
+        XCTAssertFalse(
+            "endpoint=\(endpoint)".contains(endpoint.token),
+            "string interpolation must not carry the token either"
+        )
     }
 
     func testDefaultURLIsExactlyEndpointFileUnderPortmasterDirectory() throws {
@@ -66,7 +104,7 @@ final class EndpointFileTests: XCTestCase {
         let pid = ProcessInfo.processInfo.processIdentifier
 
         try EndpointFileStore.write(
-            EndpointFile(socket: socket, token: EndpointFileStore.newToken(), pid: pid),
+            EndpointFile(socket: socket, token: try EndpointFileStore.newToken(), pid: pid),
             directory: directory
         )
 
@@ -80,7 +118,7 @@ final class EndpointFileTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fileURL.path)
 
         try EndpointFileStore.write(
-            EndpointFile(socket: socket, token: EndpointFileStore.newToken(), pid: pid),
+            EndpointFile(socket: socket, token: try EndpointFileStore.newToken(), pid: pid),
             directory: directory
         )
 
@@ -99,7 +137,7 @@ final class EndpointFileTests: XCTestCase {
         try EndpointFileStore.write(
             EndpointFile(
                 socket: directory.appendingPathComponent("mcp.sock"),
-                token: EndpointFileStore.newToken(),
+                token: try EndpointFileStore.newToken(),
                 pid: ProcessInfo.processInfo.processIdentifier
             ),
             directory: directory
@@ -113,8 +151,11 @@ final class EndpointFileTests: XCTestCase {
         let directory = try makeTemporaryDirectory(prefix: name)
         let fileURL = EndpointFileStore.defaultURL(directory: directory)
         let socket = directory.appendingPathComponent("mcp.sock").path
-        let token = EndpointFileStore.newToken()
         let alive = ProcessInfo.processInfo.processIdentifier
+        // A fixed well-formed token, not a minted one: these cases are about the
+        // *other* field being wrong, and a failure message that echoes the file
+        // should not carry a real-shaped secret into the test log to say so.
+        let token = String(repeating: "a", count: 64)
 
         // Each of these is a real way the file can be wrong: a half-written
         // update, a version that changed the shape, a hand edit. All of them
@@ -136,6 +177,13 @@ final class EndpointFileTests: XCTestCase {
             ("non-hex token", #"{"socket":"\#(socket)","token":"\#(String(repeating: "z", count: 64))","pid":\#(alive)}"#),
             ("pid zero", #"{"socket":"\#(socket)","token":"\#(token)","pid":0}"#),
             ("negative pid", #"{"socket":"\#(socket)","token":"\#(token)","pid":-1}"#),
+            // Otherwise entirely valid — a live pid, a well-formed token — and
+            // rejected only for its size, which is what stops a file this code did
+            // not write from being read in full.
+            (
+                "too large",
+                #"{"socket":"\#(socket)","token":"\#(token)","pid":\#(alive),"pad":"\#(String(repeating: "x", count: 8_192))"}"#
+            ),
         ]
 
         for testCase in cases {
@@ -152,7 +200,7 @@ final class EndpointFileTests: XCTestCase {
         let socket = directory.appendingPathComponent("mcp.sock")
 
         try EndpointFileStore.write(
-            EndpointFile(socket: socket, token: EndpointFileStore.newToken(), pid: Self.deadPID),
+            EndpointFile(socket: socket, token: try EndpointFileStore.newToken(), pid: Self.deadPID),
             directory: directory
         )
 
@@ -168,7 +216,7 @@ final class EndpointFileTests: XCTestCase {
         // pid 1 (launchd) is root-owned, so an unprivileged test process gets
         // exactly EPERM here.
         try EndpointFileStore.write(
-            EndpointFile(socket: socket, token: EndpointFileStore.newToken(), pid: Self.rootOwnedPID),
+            EndpointFile(socket: socket, token: try EndpointFileStore.newToken(), pid: Self.rootOwnedPID),
             directory: directory
         )
 
@@ -181,9 +229,9 @@ final class EndpointFileTests: XCTestCase {
 
     // MARK: - Token
 
-    func testTokenIs64HexCharactersAndTwoCallsDiffer() {
-        let first = EndpointFileStore.newToken()
-        let second = EndpointFileStore.newToken()
+    func testTokenIs64HexCharactersAndTwoCallsDiffer() throws {
+        let first = try EndpointFileStore.newToken()
+        let second = try EndpointFileStore.newToken()
 
         XCTAssertEqual(first.count, 64, "32 bytes must be hex-encoded, not truncated or padded")
         XCTAssertTrue(
@@ -193,8 +241,8 @@ final class EndpointFileTests: XCTestCase {
         XCTAssertNotEqual(first, second, "a token that repeats is not a token")
     }
 
-    func testTokenMatchesAcceptsOnlyTheExactToken() {
-        let token = EndpointFileStore.newToken()
+    func testTokenMatchesAcceptsOnlyTheExactToken() throws {
+        let token = try EndpointFileStore.newToken()
 
         XCTAssertTrue(EndpointFileStore.tokenMatches(token, expected: token))
         XCTAssertTrue(
@@ -220,13 +268,27 @@ final class EndpointFileTests: XCTestCase {
             "an extended token is not the token"
         )
 
-        // Same length, one byte different: the case a constant-time compare
-        // exists for, and the one an early-returning compare gets visibly wrong.
+        // Same length, one byte different: the case a branch-free compare exists
+        // for, and the one an early-returning compare gets visibly wrong.
         var oneByteOff = Array(token)
         oneByteOff[30] = oneByteOff[30] == "0" ? "1" : "0"
         XCTAssertFalse(
             EndpointFileStore.tokenMatches(String(oneByteOff), expected: token),
             "a token differing in one byte must be rejected"
+        )
+
+        // 64 emoji is 64 *characters* and 256 UTF-8 bytes, which is what pins which
+        // of the two the length check counts: a check written against `count` would
+        // wave this past a 64-character token and then walk 256 bytes against 64. No
+        // emoji byte equals a hex digit, so the strings are rejected on content as
+        // well — this assertion is deliberately redundant with that, and states the
+        // contract instead of leaving it to be inferred from a rejection.
+        let multiByte = String(repeating: "\u{1F600}", count: 64)
+        XCTAssertEqual(multiByte.count, 64)
+        XCTAssertEqual(multiByte.utf8.count, 256)
+        XCTAssertFalse(
+            EndpointFileStore.tokenMatches(multiByte, expected: token),
+            "the comparison is over UTF-8 bytes, not characters"
         )
     }
 
@@ -239,7 +301,7 @@ final class EndpointFileTests: XCTestCase {
         try EndpointFileStore.write(
             EndpointFile(
                 socket: directory.appendingPathComponent("mcp.sock"),
-                token: EndpointFileStore.newToken(),
+                token: try EndpointFileStore.newToken(),
                 pid: ProcessInfo.processInfo.processIdentifier
             ),
             directory: directory
