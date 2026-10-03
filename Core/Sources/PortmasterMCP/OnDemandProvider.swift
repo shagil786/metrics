@@ -13,6 +13,7 @@
 //     probe are all parameters, so a test never signals a real process, writes
 //     real preferences, or opens the real history database.
 import AppKit
+import Darwin
 import Foundation
 import PortmasterCore
 
@@ -318,6 +319,99 @@ final class SnapshotCache: @unchecked Sendable {
     }
 }
 
+// MARK: - Subprocess seam
+
+/// What one command left behind: the status it exited with, and what it said on
+/// stderr.
+public struct CommandOutcome: Sendable {
+    /// Exit status, or -1 when the process was terminated instead of exiting on
+    /// its own. `-1` never comes from a program; it means the timeout stopped it,
+    /// and `standardError` then explains that rather than quoting docker.
+    public let exitCode: Int32
+    public let standardError: String
+
+    public init(exitCode: Int32, standardError: String) {
+        self.exitCode = exitCode
+        self.standardError = standardError
+    }
+}
+
+/// Runs one command with an argument list, never a command string.
+///
+/// The argument type is the whole safety property: a container id goes in as
+/// one element, so nothing in it can be read as a flag, a path, or a command.
+/// There is no shell anywhere in this path, so shell metacharacters in an id are
+/// just characters.
+public protocol ProcessRunning: Sendable {
+    /// - Throws: `MCPToolError` when the process could not be started at all.
+    ///   A non-zero exit is an outcome, not an error: the caller reports what the
+    ///   command said.
+    func run(executable: String, arguments: [String], timeout: TimeInterval) async throws -> CommandOutcome
+}
+
+/// The real runner: `Process` with `executableURL` and `arguments` set
+/// separately, exactly as `DockerCollector` runs its sampling passes.
+public struct SystemProcessRunner: ProcessRunning {
+    public init() {}
+
+    public func run(
+        executable: String, arguments: [String], timeout: TimeInterval
+    ) async throws -> CommandOutcome {
+        // `Process` blocks, so it runs off the cooperative pool: a blocked tool
+        // call must not take a thread a sibling tool call needs.
+        try await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            // stdout is docker echoing the id back, which we already know.
+            let errorPipe = Pipe()
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = errorPipe
+            process.standardInput = FileHandle.nullDevice
+            process.qualityOfService = .utility
+
+            do {
+                try process.run()
+            } catch {
+                throw MCPToolError(
+                    message: "Could not start \(executable): \(error.localizedDescription)"
+                )
+            }
+
+            // A stopped-but-unresponsive daemon makes `docker stop` hang, and a
+            // tool call must not hang with it.
+            let terminate = DispatchWorkItem {
+                if process.isRunning { process.terminate() }
+            }
+            let kill = DispatchWorkItem {
+                if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeout, execute: terminate
+            )
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeout + 2, execute: kill
+            )
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            terminate.cancel()
+            kill.cancel()
+
+            guard process.terminationReason != .uncaughtSignal else {
+                return CommandOutcome(
+                    exitCode: -1,
+                    standardError: "\(URL(fileURLWithPath: executable).lastPathComponent) was "
+                        + "terminated after \(Int(timeout))s without answering."
+                )
+            }
+            return CommandOutcome(
+                exitCode: process.terminationStatus,
+                standardError: String(data: data, encoding: .utf8) ?? ""
+            )
+        }.value
+    }
+}
+
 // MARK: - Provider
 
 /// `DataProvider` over the machine itself, for an MCP server running without
@@ -341,6 +435,9 @@ public struct OnDemandProvider: DataProvider {
     public static let defaultSnapshotTimeout: TimeInterval = 10
     /// How often to ask the source again while waiting.
     static let pollIntervalNanos: UInt64 = 50_000_000
+    /// `docker stop` waits for the container's own grace period, so this is
+    /// generous; it exists to stop a call hanging forever, not to hurry docker.
+    static let dockerStopTimeout: TimeInterval = 20
 
     private let source: any SnapshotSource
     private let history: any HistoryReading
@@ -354,6 +451,8 @@ public struct OnDemandProvider: DataProvider {
     private let stopController: any ProcessControlling
     private let stopIdentity: @Sendable (pid_t) -> StopCoordinator.IdentityState
     private let stopVerifyDelay: TimeInterval
+    private let processRunner: any ProcessRunning
+    private let dockerExecutable: @Sendable () -> String?
 
     /// - Parameters:
     ///   - snapshotSource: where readings come from. Defaults to a live
@@ -372,6 +471,9 @@ public struct OnDemandProvider: DataProvider {
     ///     signalling it.
     ///   - stopVerifyDelay: grace period after a signal before a pid is
     ///     reported as still running.
+    ///   - processRunner: how `stop_container` runs the docker CLI.
+    ///   - dockerExecutable: where the docker CLI is, resolved through the
+    ///     collector's own candidate list unless a caller supplies it.
     ///   - now: the clock that decides cache freshness.
     ///   - settingsDirectory: where `mcpMode` and `get_settings` read the MCP
     ///     server's own settings.
@@ -388,6 +490,8 @@ public struct OnDemandProvider: DataProvider {
             StopCoordinator.liveIdentity($0)
         },
         stopVerifyDelay: TimeInterval = 3.0,
+        processRunner: any ProcessRunning = SystemProcessRunner(),
+        dockerExecutable: @escaping @Sendable () -> String? = { DockerCollector.locate() },
         now: @escaping @Sendable () -> Date = { Date() },
         settingsDirectory: URL? = nil
     ) {
@@ -405,6 +509,8 @@ public struct OnDemandProvider: DataProvider {
         self.stopController = stopController
         self.stopIdentity = stopIdentity
         self.stopVerifyDelay = stopVerifyDelay
+        self.processRunner = processRunner
+        self.dockerExecutable = dockerExecutable
     }
 
     private static func defaultHistory() -> any HistoryReading {
@@ -713,13 +819,19 @@ public struct OnDemandProvider: DataProvider {
         return await stop(targets, force: false)
     }
 
-    /// Reports that nothing was signalled rather than guessing a process.
+    /// Stops a container through the docker CLI.
     ///
-    /// A snapshot has no container-to-pid attribution: `docker ps` names
-    /// containers, and the sampler never learned which of the user's processes
-    /// belong to one. Matching a container to a same-named process would be a
-    /// guess about something a caller would then act on, so the honest answer is
-    /// to say what is missing and how to stop the container instead.
+    /// Not through the process list: a snapshot has no container-to-pid
+    /// attribution, and matching a container to a same-named process would be a
+    /// guess about something the caller then acts on. So this runs the one
+    /// command that stops a container — `docker stop -- <id>`, fixed argv, the id
+    /// as exactly one element and after `--` so an id that starts with `-` cannot
+    /// be read as a flag. No shell is involved, so shell metacharacters in an id
+    /// are characters, not commands.
+    ///
+    /// The outcome is docker's own: exit 0 is a stop, a non-zero exit is reported
+    /// with what docker said. An id that is not in the snapshot is reported as not
+    /// found rather than passed on as a stop that was never attempted.
     public func stopContainer(id: String) async throws -> StopReport {
         let snapshot = try await snapshot(forceRefresh: true)
         guard let docker = snapshot.docker else {
@@ -727,13 +839,59 @@ public struct OnDemandProvider: DataProvider {
                 message: "Docker status is not known yet; the first container scan has not finished."
             )
         }
-        guard let container = docker.containers.first(where: { $0.id == id || $0.name == id }) else {
+        // Availability first: with the daemon down or docker absent there is no
+        // container list to match against, and no stop to attempt.
+        switch docker.availability {
+        case .notInstalled:
+            throw MCPToolError(
+                message: "Docker is not installed, so container '\(id)' was not stopped."
+            )
+        case .daemonDown:
+            throw MCPToolError(
+                message: "The Docker daemon is not running, so container '\(id)' was not stopped."
+            )
+        case .running:
+            break
+        }
+        guard docker.containers.contains(where: { $0.id == id || $0.name == id }) else {
             throw MCPToolError(message: "Container not found: \(id)")
         }
-        throw MCPToolError(
-            message: "Container '\(container.name)' has no process list Portmaster can attribute "
-                + "to pids, so no process was signalled. Stop it with `docker stop \(container.id)`."
-        )
+        guard let executable = dockerExecutable() else {
+            // The sample said docker was there; it is not now.
+            throw MCPToolError(
+                message: "The docker command is not available, so container '\(id)' was not stopped."
+            )
+        }
+
+        let outcome: CommandOutcome
+        do {
+            outcome = try await processRunner.run(
+                executable: executable,
+                arguments: ["stop", "--", id],
+                timeout: Self.dockerStopTimeout
+            )
+        } catch {
+            throw Self.wrap(error, subsystem: "docker")
+        }
+        // Formatted through `StopReport` so a container stop and a pid stop read
+        // the same way in the payload.
+        let status: StopCoordinator.Outcome.Status = outcome.exitCode == 0
+            ? .stopped
+            : .failed(message: Self.dockerFailureMessage(outcome))
+        return StopReport(results: [id: StopReport.value(for: status)])
+    }
+
+    /// Docker's own explanation, first line, or the exit status when docker said
+    /// nothing. Never replaced with a guess about what went wrong.
+    private static func dockerFailureMessage(_ outcome: CommandOutcome) -> String {
+        let firstLine = outcome.standardError
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let firstLine, !firstLine.isEmpty else {
+            return "docker exited with status \(outcome.exitCode) and said nothing."
+        }
+        return firstLine
     }
 
     /// Signals the confirmed targets and reports each pid's outcome.

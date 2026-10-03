@@ -117,7 +117,10 @@ public final class DockerCollector: DockerProviding, @unchecked Sendable {
         clock = now
     }
 
-    static func locate() -> String? {
+    /// The docker CLI on this machine, or nil when there is none.
+    /// Public so a caller that has to *run* docker (not just sample it) resolves
+    /// the same paths this collector does rather than keeping a second list.
+    public static func locate() -> String? {
         candidatePaths.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 

@@ -93,6 +93,41 @@ final class StubIdentity: @unchecked Sendable {
     func markSignalled(_ pid: pid_t) { lock.withLock { _ = signalled.insert(pid) } }
 }
 
+/// Records how a command would have been run and returns a canned outcome,
+/// so a test can assert the argv — and prove a hostile id is one element —
+/// without a docker binary existing on the machine.
+final class RecordingProcessRunner: ProcessRunning, @unchecked Sendable {
+    struct Invocation: Equatable {
+        let executable: String
+        let arguments: [String]
+        let timeout: TimeInterval
+    }
+
+    private let lock = NSLock()
+    private var recorded: [Invocation] = []
+    private let outcome: CommandOutcome
+    private let failure: Error?
+
+    init(outcome: CommandOutcome, failure: Error? = nil) {
+        self.outcome = outcome
+        self.failure = failure
+    }
+
+    var invocations: [Invocation] { lock.withLock { recorded } }
+
+    func run(
+        executable: String, arguments: [String], timeout: TimeInterval
+    ) async throws -> CommandOutcome {
+        lock.withLock {
+            recorded.append(Invocation(
+                executable: executable, arguments: arguments, timeout: timeout
+            ))
+        }
+        if let failure { throw failure }
+        return outcome
+    }
+}
+
 /// A history seam that always fails, so the provider's error wrapping is
 /// observable without breaking a real database.
 struct FailingHistoryReading: HistoryReading {
@@ -724,36 +759,190 @@ final class OnDemandProviderTests: XCTestCase {
         }
     }
 
-    /// A container has no pid list anywhere in a snapshot, so the honest answer
-    /// is to say that and signalled nothing — not to invent a process to kill.
-    func testStopContainerExplainsItCannotAttributePids() async throws {
-        let identity = StubIdentity(start: Date())
-        let controller = RecordingProcessController(identity: identity)
+    // MARK: Container stops
+    //
+    // `stop_container` runs the docker CLI through an injected runner, so these
+    // tests assert the argv and the reported outcome without a container, a
+    // daemon, or a docker binary ever being involved.
+
+    func testStopContainerReportsStoppedWhenDockerExitsZero() async throws {
+        let runner = RecordingProcessRunner(
+            outcome: CommandOutcome(exitCode: 0, standardError: "")
+        )
+        let provider = try makeContainerProvider(runner: runner)
+
+        let report = try await provider.stopContainer(id: "abc123")
+
+        XCTAssertEqual(report.results, ["abc123": "stopped"])
+        XCTAssertEqual(runner.invocations.count, 1)
+        XCTAssertEqual(
+            runner.invocations.first?.arguments, ["stop", "--", "abc123"],
+            "one fixed command, the id after `--` so it cannot be read as a flag"
+        )
+        XCTAssertEqual(runner.invocations.first?.executable, "/test/docker")
+    }
+
+    /// A non-zero exit is reported with docker's own words, not a paraphrase of
+    /// them: the caller needs the reason the daemon gave.
+    func testStopContainerReportsFailedWithDockersOwnMessage() async throws {
+        let runner = RecordingProcessRunner(
+            outcome: CommandOutcome(
+                exitCode: 1,
+                standardError: "Error response from daemon: No such container: abc123\n"
+            )
+        )
+        let provider = try makeContainerProvider(runner: runner)
+
+        let report = try await provider.stopContainer(id: "abc123")
+
+        XCTAssertEqual(
+            report.results,
+            ["abc123": "failed: Error response from daemon: No such container: abc123"]
+        )
+    }
+
+    func testStopContainerThrowsWhenDockerIsUnavailable() async throws {
+        for (availability, expected) in [
+            (DockerAvailability.notInstalled, "Docker is not installed"),
+            (DockerAvailability.daemonDown, "Docker daemon is not running"),
+        ] {
+            let runner = RecordingProcessRunner(
+                outcome: CommandOutcome(exitCode: 0, standardError: "")
+            )
+            let provider = try makeContainerProvider(
+                runner: runner, availability: availability
+            )
+
+            do {
+                _ = try await provider.stopContainer(id: "abc123")
+                XCTFail("Docker being unavailable must not be reported as a stop")
+            } catch let error as MCPToolError {
+                XCTAssertTrue(error.message.contains(expected), error.message)
+            }
+            XCTAssertEqual(
+                runner.invocations, [],
+                "nothing is run when docker cannot answer"
+            )
+        }
+    }
+
+    /// The safety property, stated as a test: an id full of shell metacharacters
+    /// reaches docker as one argument and nothing is interpreted. Docker would
+    /// never mint such an id, which is exactly why the provider must not be the
+    /// thing that trusts the string.
+    func testStopContainerPassesTheIDAsOneArgvElement() async throws {
+        let hostile = "; rm -rf ~"
+        let runner = RecordingProcessRunner(
+            outcome: CommandOutcome(exitCode: 0, standardError: "")
+        )
         let docker = DockerSample(
             availability: .running,
-            containers: [Self.makeContainer(id: "abc123", name: "api")],
+            containers: [Self.makeContainer(id: hostile, name: hostile)],
             at: Self.sampleTime
         )
-        let provider = OnDemandProvider(
-            snapshotSource: StubSnapshotSource([Self.makeSnapshot(cpuPercent: 10, docker: docker)]),
-            preferencesDefaults: try makePreferencesDefaults(),
-            appRunning: { false },
-            stopController: controller,
-            stopIdentity: { identity.state($0) },
-            stopVerifyDelay: 0
+        let provider = try makeContainerProvider(runner: runner, docker: docker)
+
+        let report = try await provider.stopContainer(id: hostile)
+
+        XCTAssertEqual(report.results, [hostile: "stopped"])
+        let invocation = try XCTUnwrap(runner.invocations.first)
+        XCTAssertEqual(
+            invocation.arguments, ["stop", "--", hostile],
+            "the id must be one argument, never split on whitespace or punctuation"
         )
+        XCTAssertEqual(
+            invocation.arguments.filter { $0 == "--" }.count, 1,
+            "exactly one `--`, so the id cannot be read as an option"
+        )
+        XCTAssertFalse(
+            invocation.arguments.contains { $0 == "-rf" },
+            "no argument may be derived from the id's contents"
+        )
+    }
+
+    /// An id that is not in the snapshot is not stopped, and nothing is run on
+    /// docker's behalf for it.
+    func testStopContainerUnknownIDIsNotReportedAsAStop() async throws {
+        let runner = RecordingProcessRunner(
+            outcome: CommandOutcome(exitCode: 0, standardError: "")
+        )
+        let provider = try makeContainerProvider(runner: runner)
+
+        do {
+            _ = try await provider.stopContainer(id: "not-here")
+            XCTFail("An unknown id must not be reported as stopped")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(error.message, "Container not found: not-here")
+        }
+        XCTAssertEqual(runner.invocations, [])
+    }
+
+    func testStopContainerWrapsARunnerFailure() async throws {
+        let runner = RecordingProcessRunner(
+            outcome: CommandOutcome(exitCode: 0, standardError: ""),
+            failure: StubError(message: "no such file")
+        )
+        let provider = try makeContainerProvider(runner: runner)
 
         do {
             _ = try await provider.stopContainer(id: "abc123")
-            XCTFail("Stopping a container must not report success it cannot have had")
+            XCTFail("A docker that could not be started must not be reported as a stop")
         } catch let error as MCPToolError {
-            XCTAssertTrue(error.message.contains("api"), error.message)
-            XCTAssertTrue(error.message.contains("no process"), error.message.lowercased())
+            XCTAssertTrue(error.message.contains("docker"), error.message)
+            XCTAssertTrue(error.message.contains("no such file"), error.message)
         }
-        XCTAssertEqual(controller.gracefullySignalled, [])
+    }
+
+    /// The production runner, exercised with something that is definitely not
+    /// docker. The seam tests prove what the provider *asks* for; this proves the
+    /// thing that actually executes does what it claims — a non-zero exit arrives
+    /// as an exit status rather than a thrown error, and a missing executable
+    /// arrives as an error rather than silence.
+    func testSystemProcessRunnerReportsExitStatusAndStartFailure() async throws {
+        let runner = SystemProcessRunner()
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/false") else {
+            throw XCTSkip("no /usr/bin/false on this machine")
+        }
+
+        let failed = try await runner.run(
+            executable: "/usr/bin/false", arguments: ["stop", "--", "abc"], timeout: 5
+        )
+        XCTAssertEqual(failed.exitCode, 1, "a failing command is an outcome, not a thrown error")
+
+        do {
+            _ = try await runner.run(
+                executable: "/nonexistent/docker", arguments: ["stop"], timeout: 5
+            )
+            XCTFail("A missing executable must not read as a successful stop")
+        } catch let error as MCPToolError {
+            XCTAssertTrue(error.message.contains("Could not start"), error.message)
+        }
     }
 
     // MARK: Helpers
+
+    /// A provider whose snapshot reports `docker` as the caller asks, with the
+    /// subprocess runner injected so no test reaches a real docker.
+    private func makeContainerProvider(
+        runner: RecordingProcessRunner,
+        availability: DockerAvailability = .running,
+        docker: DockerSample? = nil
+    ) throws -> OnDemandProvider {
+        let sample = docker ?? DockerSample(
+            availability: availability,
+            containers: [Self.makeContainer(id: "abc123", name: "api")],
+            at: Self.sampleTime
+        )
+        return OnDemandProvider(
+            snapshotSource: StubSnapshotSource([
+                Self.makeSnapshot(cpuPercent: 10, docker: sample)
+            ]),
+            preferencesDefaults: try makePreferencesDefaults(),
+            appRunning: { false },
+            processRunner: runner,
+            dockerExecutable: { "/test/docker" }
+        )
+    }
 
     /// A seeded history store in a temporary directory, plus the reading seam
     /// over it. The directory is removed by the shared teardown.
