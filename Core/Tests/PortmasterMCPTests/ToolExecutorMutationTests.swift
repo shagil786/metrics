@@ -106,6 +106,51 @@ final class ToolExecutorMutationTests: XCTestCase {
         )
     }
 
+    /// The allowlist is defined once and every layer reads that one definition.
+    ///
+    /// Three written-out copies of a security-relevant list is three chances for
+    /// the surface to contradict itself, and the bad case is specific: a key the
+    /// executor accepts, refused further down with a message naming a key the
+    /// client was just told was allowed. So the catalog's description, the
+    /// executor's refusal and the provider's own refusal are all built from
+    /// `ToolExecutor.allowedPreferenceKeys`, and this pins that they are.
+    func testEveryLayerNamesTheSameAllowlist() async throws {
+        let expected = ToolExecutor.allowedPreferenceKeys.sorted().joined(separator: ", ")
+        let refusal = "Preference 'retention' cannot be changed via MCP. Allowed: \(expected)."
+
+        // The catalog advertises exactly those keys — so a client cannot be told
+        // a key is allowed by one surface and refused by another.
+        let description = try XCTUnwrap(
+            ToolExecutor.catalog.first { $0.name == "set_preference" }?.description
+        )
+        XCTAssertTrue(
+            description.contains("Allowed keys: \(expected)."),
+            "the catalog must advertise the executor's own list: \(description)"
+        )
+
+        let stub = StubProvider()
+        let tool = try makeExecutor(provider: stub, mode: .allowSession, appRunning: true)
+        let refused = await tool.execute(
+            name: "set_preference", arguments: ["key": "retention", "value": "days30"]
+        )
+        XCTAssertTrue(refused.isError)
+        XCTAssertEqual(refused.text, refusal)
+
+        // And the provider, reached directly: two lists that had drifted apart
+        // would fail exactly here.
+        let suite = "dev.portmaster.mcp.tests.\(name).\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let provider = OnDemandProvider(preferencesDefaults: defaults, appRunning: { false })
+        do {
+            try provider.setPreference(key: "retention", value: "days30")
+            XCTFail("Only allowlisted preferences may be changed")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(error.message, refusal)
+        }
+    }
+
     func testSetPreferenceRejectsUnknownKey() async throws {
         let stub = StubProvider()
         let tool = try makeExecutor(provider: stub, mode: .allowSession, appRunning: true)

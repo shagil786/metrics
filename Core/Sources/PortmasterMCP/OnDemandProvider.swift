@@ -98,8 +98,11 @@ public struct OnDemandProvider: DataProvider {
     ///   - dockerExecutable: where the docker CLI is, resolved through the
     ///     collector's own candidate list unless a caller supplies it.
     ///   - now: the clock that decides cache freshness.
-    ///   - settingsDirectory: where `mcpMode` and `get_settings` read the MCP
-    ///     server's own settings.
+    ///   - settingsDirectory: where `get_settings` reads the MCP server's own
+    ///     settings from. `set_preference` does not write `mcpMode` here — the
+    ///     executor owns that key — so this directory decides what
+    ///     `settingsSnapshot()` reports as `mutationMode`, and a test points it at
+    ///     a disposable one.
     public init(
         snapshotSource: any SnapshotSource = LiveSnapshotSource(),
         historyFactory: @escaping @Sendable () -> any HistoryReading = {
@@ -382,41 +385,19 @@ public struct OnDemandProvider: DataProvider {
     /// change, which would erase whatever MCP just wrote. The app's Settings
     /// screen is the owner then.
     ///
-    /// `mcpMode` is the exception, and it comes first on purpose. It is not the
-    /// app's preference at all — it is this server's own mutation policy, kept
-    /// beside the audit log — so a running app has nothing in memory to clobber
-    /// it. Refusing it would mean a user could not widen or narrow MCP's own
-    /// permissions while the app happened to be open, which is the one case where
-    /// they most want to. Reaching this method at all means the executor's
-    /// permission gate already allowed the call, so this branch never widens a
-    /// permission on its own.
+    /// `mcpMode` is deliberately *not* handled here. It is not an app preference at
+    /// all — it is this server's own mutation policy, kept in `MCPSettings` beside
+    /// the audit log — so it must not be refused while the app runs, and it must
+    /// not be written into a blob the app owns. The executor owns that key
+    /// end to end, intercepting it before the provider is touched, and it is the
+    /// only place that writes it. A second implementation here would be reachable
+    /// only by a caller that bypassed the tool surface, and its two copies of the
+    /// invalid-value message had already begun to disagree.
     public func setPreference(key: String, value: String) throws {
-        if key == "mcpMode" {
-            try setMutationMode(value)
-            return
-        }
         guard !appRunning() else {
             throw MCPToolError(message: Self.appRunningMessage)
         }
         try preferences.setAllowlisted(key: key, value: value)
-    }
-
-    /// `mcpMode` is the MCP server's own mutation policy, kept in `MCPSettings`
-    /// rather than the app's preferences blob, because the server must be able to
-    /// read and write it whether or not the UI is running.
-    private func setMutationMode(_ value: String) throws {
-        guard let mode = MCPMutationMode(rawValue: value) else {
-            throw MCPToolError(message: "Invalid value '\(value)' for 'mcpMode'.")
-        }
-        var settings = MCPSettings.load(directory: settingsDirectory)
-        settings.mode = mode
-        do {
-            try settings.save(directory: settingsDirectory)
-        } catch {
-            throw MCPToolError(
-                message: "Could not save MCP settings: \(error.localizedDescription)"
-            )
-        }
     }
 
     // MARK: Stops

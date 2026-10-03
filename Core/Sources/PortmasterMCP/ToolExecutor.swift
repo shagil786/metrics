@@ -393,8 +393,8 @@ public struct ToolExecutor: Sendable {
         ),
         ToolDefinition(
             name: "set_preference",
-            description: "Change one allowlisted preference. Allowed keys: compact, "
-                + "cpuScale, mcpMode, networkUnit, temperatureSource, temperatureUnit. "
+            description: "Change one allowlisted preference. Allowed keys: "
+                + allowedPreferenceKeysDescription() + ". "
                 + "Any other key is rejected, not ignored. Two keys are not named "
                 + "after what they change: mcpMode sets this MCP server's own mutation "
                 + "policy rather than an app preference, and get_settings reports the "
@@ -574,10 +574,21 @@ public struct ToolExecutor: Sendable {
     /// An allowlist rather than a denylist, because the surface being protected is
     /// the app's whole preferences blob: a denylist only stays exhaustive while
     /// nobody adds a preference, and this file does not own that list.
+    ///
+    /// This is the one definition of the list. The catalog description, the
+    /// rejection message here, and `PreferencesStore`'s rejection message are all
+    /// built from it rather than written out, so a key cannot be accepted at one
+    /// layer and reported as refused — or advertised as allowed — at another.
     public static let allowedPreferenceKeys: Set<String> = [
         "temperatureUnit", "networkUnit", "cpuScale", "temperatureSource",
         "compact", "mcpMode",
     ]
+
+    /// The allowlist as one sentence, sorted so the text is stable. The single
+    /// place a rejection names the keys, wherever that rejection is raised.
+    public static func allowedPreferenceKeysDescription() -> String {
+        allowedPreferenceKeys.sorted().joined(separator: ", ")
+    }
 
     /// Applies one allowlisted preference.
     ///
@@ -593,7 +604,7 @@ public struct ToolExecutor: Sendable {
             // which of its keys was the problem.
             throw MCPToolError(
                 message: "Preference '\(key)' cannot be changed via MCP. Allowed: "
-                    + Self.allowedPreferenceKeys.sorted().joined(separator: ", ") + "."
+                    + Self.allowedPreferenceKeysDescription() + "."
             )
         }
 

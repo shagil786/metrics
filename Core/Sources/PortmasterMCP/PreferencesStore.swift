@@ -16,15 +16,6 @@ import PortmasterCore
 /// calls setting two different preferences concurrently would otherwise each
 /// read the same blob and the second write would erase the first one's field.
 final class PreferencesStore: @unchecked Sendable {
-    /// Every preference key MCP may change, as `ToolExecutor`'s catalog lists
-    /// them — the message below quotes this, so a client that guessed a key
-    /// learns what it may try instead. `mcpMode` is in the list because the
-    /// provider accepts it, but it is written to `MCPSettings` and never reaches
-    /// the blob writer below.
-    static let mcpAllowedKeys = [
-        "compact", "cpuScale", "mcpMode", "networkUnit", "temperatureSource", "temperatureUnit",
-    ]
-
     private let defaults: UserDefaults
     private let lock = NSLock()
 
@@ -108,9 +99,15 @@ final class PreferencesStore: @unchecked Sendable {
             guard let unit = Self.matching(TemperatureUnit.self, value) else { throw invalid() }
             preferences.presentation.temperatureUnit = unit
         default:
+            // Unreachable through the tool surface, which refuses a key outside
+            // the allowlist before the provider is touched — and `mcpMode`, which
+            // the executor handles itself, is the one allowed key this switch has
+            // no case for. Quoting the executor's list rather than a second copy of
+            // it means a rejection can never name a key as allowed that the
+            // executor would have let through, or hide one it would have refused.
             throw MCPToolError(
                 message: "Preference '\(key)' cannot be changed via MCP. Allowed: "
-                    + mcpAllowedKeys.joined(separator: ", ") + "."
+                    + ToolExecutor.allowedPreferenceKeysDescription() + "."
             )
         }
     }

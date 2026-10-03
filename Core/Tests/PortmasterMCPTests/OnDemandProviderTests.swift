@@ -873,26 +873,33 @@ final class OnDemandProviderTests: XCTestCase {
         XCTAssertTrue(reloaded.presentation.compact)
     }
 
-    /// `mcpMode` is the MCP server's own policy, not an app preference, so it
-    /// goes to `MCPSettings` rather than the app's blob.
-    func testSetPreferenceMcpModeWritesServerSettings() throws {
+    /// `mcpMode` is the MCP server's own policy, not an app preference, so it does
+    /// not go through the provider's preferences blob at all — the executor
+    /// intercepts it before the provider is touched, and it stays writable with the
+    /// app open because the app never holds it.
+    ///
+    /// The provider therefore has no `mcpMode` branch to reach, and reaching it
+    /// directly gets the ordinary not-a-preference refusal. The write itself is
+    /// pinned where it happens, in `ToolExecutorMutationTests`.
+    func testSetPreferenceMcpModeIsNotTheProvidersToWrite() throws {
         let defaults = try makePreferencesDefaults()
-        let directory = try makeTemporaryDirectory(prefix: name)
-        // The server's own mode is writable with the app open: it is not one of
-        // the app's in-memory preferences, so there is nothing to clobber. (The
-        // executor's permission gate still decides whether the call gets here at
-        // all — a client in mode `off` cannot reach this.)
-        for appRunning in [false, true] {
-            let provider = OnDemandProvider(
-                snapshotSource: stubSnapshotSourceWithoutReading(),
-                preferencesDefaults: defaults,
-                appRunning: { appRunning },
-                settingsDirectory: directory
-            )
+        let provider = OnDemandProvider(
+            snapshotSource: stubSnapshotSourceWithoutReading(),
+            preferencesDefaults: defaults,
+            appRunning: { false }
+        )
 
+        do {
             try provider.setPreference(key: "mcpMode", value: "allowSession")
-
-            XCTAssertEqual(MCPSettings.load(directory: directory).mode, .allowSession)
+            XCTFail("The provider must not write the MCP server's own mutation policy")
+        } catch let error as MCPToolError {
+            // One message, not two: the refusal is the executor's own sentence,
+            // because the store quotes the executor's allowlist.
+            XCTAssertEqual(
+                error.message,
+                "Preference 'mcpMode' cannot be changed via MCP. Allowed: "
+                    + ToolExecutor.allowedPreferenceKeysDescription() + "."
+            )
         }
         XCTAssertNil(
             defaults.data(forKey: AppPreferences.defaultsKey),
