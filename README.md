@@ -52,6 +52,90 @@ cd Core && swift test
 
 Graceful stop sends SIGTERM; force quit sends SIGKILL and is offered after an unsuccessful graceful attempt, with another confirmation. Project quit includes every currently attributed process, including non-listeners. The confirmation freezes the exact names/PIDs and affected ports. Start times are rechecked before each signal; reused or unknown identities are skipped, newly spawned processes require a new confirmation, and outcomes cover the whole confirmed set. No process is stopped automatically.
 
+## MCP server (for AI assistants)
+
+Portmaster ships a local [MCP](https://modelcontextprotocol.io) server, `portmaster-mcp`, so an AI assistant can read the same machine telemetry the menu bar shows — CPU, memory, apps, containers, projects, history, temperatures, alerts, settings — and, only if you say so, act on it. It speaks MCP over stdio, runs entirely on this Mac, and answers straight from the machine with **no Portmaster app running**: each read spins up a short-lived sampler of its own and tears it down again, so nothing is left sweeping the machine between calls. Nothing is uploaded, and there is no network listener.
+
+Build it from the same package as the core:
+
+```sh
+cd Core && swift build -c release --product portmaster-mcp
+```
+
+The binary lands in SwiftPM's release bin directory; ask SwiftPM where that is rather than assuming a path, because it varies per machine and per toolchain:
+
+```sh
+cd Core && swift build -c release --show-bin-path   # e.g. .build/out/Products/Release
+```
+
+Register it with an MCP client. For Claude Code:
+
+```sh
+claude mcp add portmaster -- "$(cd Core && swift build -c release --show-bin-path)/portmaster-mcp"
+```
+
+`claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same binary path. The executable takes no arguments and needs no environment; stdout carries JSON-RPC and nothing else.
+
+### Tools
+
+Nine read tools and four mutations. A read never changes anything; a mutation is default-deny until you choose a mode (below).
+
+| Tool | What it does | Arguments |
+| --- | --- | --- |
+| `get_system_overview` | CPU, memory, network, disk, battery, GPU, temperatures in one snapshot | — |
+| `get_top_apps` | Apps ranked by one metric, highest first | `metric` (required: `cpu`/`memory`/`network`/`disk`), `limit` (1–100, default 10) |
+| `get_app_detail` | One app's totals plus a per-process breakdown | `id` (required, from `get_top_apps`) |
+| `get_containers` | Docker containers, and whether Docker is installed / daemon up / down | — |
+| `get_projects` | Detected repositories with process counts and listening ports | — |
+| `get_history_rankings` | Apps ranked by recorded CPU time over a window | `range` (required: `1h`/`12h`/`24h`/`7d`/`30d`), `resource` (optional) |
+| `get_temperatures_fans` | Sensor temperatures and fan RPMs, or "unavailable" | — |
+| `get_active_alerts` | "This app is acting up" observations, with provenance | — |
+| `get_settings` | Current preferences, including the MCP mutation mode | — |
+| `quit_app` | **Mutation** — quit an app's processes | `id` (required), `force` (optional, default false) |
+| `stop_container` | **Mutation** — stop a running Docker container | `id` (required) |
+| `stop_project` | **Mutation** — stop every process in a detected project | `id` (required) |
+| `set_preference` | **Mutation** — change one allowlisted preference | `key`, `value` (both required) |
+
+A value that has not been measured is **left out** of the payload (and `get_temperatures_fans` says so with `available: false`) rather than filled with a plausible zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
+
+### Mutation modes
+
+Mode lives in `~/.portmaster/mcp-settings.json` as one key:
+
+```json
+{ "mode": "off" }
+```
+
+| Mode | Effect |
+| --- | --- |
+| `off` (default) | Every mutation is refused: *"MCP mutations are disabled in Portmaster settings."* |
+| `confirmEach` | Asks Portmaster to approve each action. **Always refuses in this release** — see limitations. |
+| `allowSession` | Mutations are permitted while the Portmaster app is running, and refused when it is not. |
+
+**`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: edit that file, or use Settings once the in-app MCP panel lands. That is deliberate — an assistant cannot widen its own permissions.
+
+`set_preference` accepts only allowlisted keys: `compact`, `cpuScale`, `mcpMode`, `networkUnit`, `temperatureSource`, `temperatureUnit`. Anything else is rejected rather than ignored. Note the naming asymmetry: the key you *write* is `compact`, while `get_settings` *reports* that same preference as `compactMenuBar`.
+
+### Audit log
+
+Every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log` (owner-readable only, `0600`, inside a `0700` directory):
+
+```json
+{"arguments":{"id":"nonexistent-app-id-for-gate-check"},"tool":"quit_app","pid":60663,"ts":"2026-10-03T17:02:13Z","reason":"MCP mutations are disabled in Portmaster settings.","outcome":"denied"}
+```
+
+`outcome` is `denied` (the gate refused; nothing was touched), `allowed` (it succeeded), or `failed` (permitted but did not work). `reason` carries the explanation, or is `null` when there is nothing to add. Reads are never logged — they change nothing, and logging them would bury the entries that matter.
+
+### Limitations in this release
+
+- **`confirmEach` cannot work yet.** It refuses with *"Portmaster must be open to approve this action."* because the in-app confirmation prompt does not exist in this slice — the server has no channel to ask the app anything. This is the expected behavior, not a fault. Until it lands, **`allowSession` with the app open is the working mutation mode.**
+- **Preference writes need the app closed.** With Portmaster running, it holds preferences in memory and rewrites the whole blob on its next change, which would erase what MCP just wrote, so `set_preference` refuses (except `mcpMode`, which the app never holds). Use the app's own Settings while it is open.
+- **Alerts are history-approximate.** `get_active_alerts` reports `source: "history-approximate"` and reconstructs sustained-CPU and memory-growth alerts from recorded history: the observation is real, its freshness is not. Per-app disk and network hammering is live-only and is therefore *not* fabricated — those alert kinds simply do not appear from history.
+- **`get_settings` can report defaults it did not read.** When the preferences blob cannot be decoded, the read falls back to default values while writes refuse over the same blob. Reading back defaults right after a successful write means this, not a lost write.
+- **Reads have a ~10 s budget.** The first read on a cold sampler waits for a full process sweep, port scan and `nettop` pass. If that budget expires the tool says *"No reading available yet; the sampler is still starting."* instead of returning zeros — retry a moment later.
+- **`stop_container` shells out to Docker.** It runs `docker stop -- <id>` with fixed argv (no shell), so Docker must be installed with the daemon up.
+- **No app-driven provider, no in-app confirmation, no live alert engine.** Slice 1 is stdio + on-demand sampling only.
+
 ## Permissions and distribution
 
 - The read-only dashboard needs **no permissions** — it reads your own user's processes and socket tables.
@@ -96,6 +180,10 @@ Core/                    PortmasterCore package (no UI deps)
     Stop/                SIGTERM/SIGKILL coordinator with verification
     History/             SwiftData store, retention, clear-all
     Fixtures/            preview data (opt-in, labeled)
+  Sources/PortmasterMCP/ MCP tool catalog, permission gate, audit log,
+                         on-demand provider (no UI, no app required)
+  Sources/portmaster-mcp/ stdio executable serving MCP on stdin/stdout
   Tests/                 parser/attribution/breakdown unit tests + live smoke tests
+                         (+ PortmasterMCPTests for the tool layer)
 design-reference/        captured frames of the Vitals 1.2 reference video
 ```
