@@ -82,14 +82,17 @@ public actor HistoryReader {
     /// First and last recorded memory per app over the window, for apps seen at
     /// least twice.
     ///
-    /// Apps with a single reading are omitted: growth is the difference between
-    /// two observations, and reporting a peak as growth would invent the missing
-    /// half of the measurement.
+    /// An app seen once has no span: growth is a difference between two
+    /// observations, and reporting a lone reading's peak as growth would invent
+    /// the missing half of the measurement. Two readings that share a timestamp
+    /// are one observation too, so the endpoints must differ in time as well as
+    /// in bytes.
     public func appMemorySpans(since: Date) throws -> [AppMemorySpan] {
         try Task.checkCancellation()
         let context = ModelContext(container)
         var first: [String: (bytes: UInt64, at: Date, name: String)] = [:]
         var last: [String: (bytes: UInt64, at: Date)] = [:]
+        var readings: [String: Int] = [:]
         try context.enumerate(FetchDescriptor<AppHistoryPoint>(predicate: #Predicate { $0.at >= since }, sortBy: [SortDescriptor(\.at)]), batchSize: 500) { point in
             try Task.checkCancellation()
             // nil memory is "not measured", so it is not an endpoint either.
@@ -98,11 +101,14 @@ public actor HistoryReader {
                 first[point.appID] = (UInt64(bytes), point.at, point.displayName)
             }
             last[point.appID] = (UInt64(bytes), point.at)
+            readings[point.appID, default: 0] += 1
         }
         var spans: [AppMemorySpan] = []
         spans.reserveCapacity(first.count)
         for (appID, start) in first {
-            guard let end = last[appID] else { continue }
+            guard readings[appID, default: 0] >= 2, let end = last[appID], end.at != start.at else {
+                continue
+            }
             spans.append(AppMemorySpan(
                 appID: appID, displayName: start.name,
                 firstBytes: start.bytes, lastBytes: end.bytes,

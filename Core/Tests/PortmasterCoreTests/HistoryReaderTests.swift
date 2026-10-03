@@ -87,4 +87,61 @@ final class HistoryReaderTests: XCTestCase {
         let memory = try await reader.dayStats(metric: "memory", now: at.addingTimeInterval(90))
         XCTAssertEqual(memory.sampleCount, 2); XCTAssertEqual(memory.averageTodayPercent, 0)
     }
+
+    /// A span is a difference between two observations, so an app seen once has
+    /// none: its peak is not growth, and emitting a zero-growth span would put a
+    /// made-up measurement behind an API that promises a real one.
+    @MainActor func testMemorySpansNeedTwoReadingsAndCarryTheRealDelta() async throws {
+        let (store, dir) = try fixture(); defer { try? FileManager.default.removeItem(at: dir) }
+        func app(id: String, name: String, pid: Int32, memory: UInt64) -> AppRollup {
+            var rollup = AppRollup(id: id, displayName: name, isAppBundle: true)
+            rollup.processes = [ProcessRow(pid: pid, name: name, parentPid: nil, cpuPercent: 1, memoryBytes: memory)]
+            return rollup
+        }
+        let reader = store.makeReader()
+
+        store.recordExtended(
+            system: .init(at: at, cpu: .unknown, memory: .unknown),
+            apps: [app(id: "once", name: "Once", pid: 710, memory: 200_000_000)], interval: 30
+        )
+        let single = try await reader.appMemorySpans(since: at.addingTimeInterval(-5))
+        XCTAssertEqual(
+            single.map(\.appID), [],
+            "one recorded reading is a peak, not a growth measurement"
+        )
+
+        for (offset, memory) in [(30.0, UInt64(200_000_000)), (60.0, UInt64(1_500_000_000))] {
+            store.recordExtended(
+                system: .init(at: at.addingTimeInterval(offset), cpu: .unknown, memory: .unknown),
+                apps: [app(id: "twice", name: "Twice", pid: 720, memory: memory)], interval: 30
+            )
+        }
+        let spans = try await reader.appMemorySpans(since: at.addingTimeInterval(-5))
+        XCTAssertEqual(spans.map(\.appID), ["twice"], "the single-reading app still has no span")
+        let span = try XCTUnwrap(spans.first)
+        XCTAssertEqual(span.displayName, "Twice")
+        XCTAssertEqual(span.firstBytes, 200_000_000)
+        XCTAssertEqual(span.lastBytes, 1_500_000_000)
+        XCTAssertEqual(span.growthBytes, 1_300_000_000)
+        XCTAssertEqual(span.firstAt, at.addingTimeInterval(30))
+        XCTAssertEqual(span.lastAt, at.addingTimeInterval(60))
+
+        // A release is not growth.
+        store.recordExtended(
+            system: .init(at: at.addingTimeInterval(90), cpu: .unknown, memory: .unknown),
+            apps: [app(id: "shrink", name: "Shrink", pid: 730, memory: 900_000_000)], interval: 30
+        )
+        for (offset, memory) in [(120.0, UInt64(2_000_000_000)), (150.0, UInt64(500_000_000))] {
+            store.recordExtended(
+                system: .init(at: at.addingTimeInterval(offset), cpu: .unknown, memory: .unknown),
+                apps: [app(id: "shrink", name: "Shrink", pid: 730, memory: memory)], interval: 30
+            )
+        }
+        let shrinking = try await reader.appMemorySpans(since: at.addingTimeInterval(-5))
+        XCTAssertEqual(shrinking.first { $0.appID == "shrink" }?.growthBytes, 0)
+
+        // Outside the window there is nothing to compare.
+        let outside = try await reader.appMemorySpans(since: at.addingTimeInterval(200))
+        XCTAssertTrue(outside.isEmpty)
+    }
 }
