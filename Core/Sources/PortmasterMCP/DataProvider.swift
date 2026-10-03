@@ -147,6 +147,9 @@ public protocol DataProvider: Sendable {
     func appDetail(id: String) async throws -> AppRollup
     func containers() async throws -> DockerSample
     func projects() async throws -> [ProjectSummary]
+    /// App CPU/memory totals over the window. The executor never fills `resource`
+    /// here — it always passes nil and sends resource reads to
+    /// `historyResources` — so do not write a non-nil branch for it.
     func historyRankings(
         window: HistoryWindow, resource: HistoryResource?
     ) async throws -> [AppHistoryTrend]
