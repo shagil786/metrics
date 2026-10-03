@@ -22,9 +22,13 @@ final class CLIIntegrationTests: XCTestCase {
     /// different deadlines and use them separately.
     static let handshakeTimeout: TimeInterval = 20
     static let liveReadTimeout: TimeInterval = 60
-    /// Long enough for the server's bounded drain on EOF plus the work itself.
-    /// The drain is capped at two seconds, so this is slack, not a budget.
-    static let eofExitTimeout: TimeInterval = 20
+    /// Long enough for whatever work the session still has outstanding, plus the
+    /// server's drain on EOF, plus slack. The drain's cap is derived from the
+    /// provider's own read budget (`OnDemandProvider.defaultSnapshotTimeout` plus
+    /// the quiet period), so it is not a fixed number to quote here — this has to
+    /// outlast it, and a comment naming the wrong cap would rot the moment that
+    /// expression changed, which is exactly what happened last round.
+    static let eofExitTimeout: TimeInterval = 30
 
     // MARK: Handshake, catalog, and a real tool call
 
@@ -612,7 +616,7 @@ final class LineReader: @unchecked Sendable {
     /// Takes every line read so far and empties the queue.
     func drain() -> [String] { lock.withLock { defer { pending.removeAll() }; return pending } }
 
-private func readLoop() {
+    private func readLoop() {
         var buffer = Data()
         while true {
             let chunk: Data?
