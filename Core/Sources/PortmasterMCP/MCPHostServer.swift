@@ -184,8 +184,23 @@ public final class MCPHostServer: @unchecked Sendable {
             return
         }
 
-        // Wake the accept loop first: it is parked in `poll`, and closing the listener
-        // out from under it is not something to rely on.
+        // Stops accepting and takes every admitted session, atomically. Done before the
+        // accept-thread join rather than after, so no session starts during the wait —
+        // and it is the *atomicity* that matters, not the ordering: a connection
+        // accepted moments before `running` went false can still be inside its ten-second
+        // handshake read, and will call `add` after this line. That call returns
+        // `.hostClosed` and the connection closes its own socket. Checking `running` in
+        // the host and then adding under a second lock would leave a window for exactly
+        // that connection to start a session nothing would ever close.
+        let live = registry.closeAndTakeAll()
+
+        // Closing each descriptor is what ends the connections: the blocking read
+        // returns, the transport finishes its stream, and the SDK's message loop ends
+        // with it.
+        for connection in live { connection.socket.close() }
+
+        // Wake the accept loop: it is parked in `poll`, and closing the listener out
+        // from under it is not something to rely on.
         UnixSocketBinding.signal(wakeWrite)
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -197,12 +212,6 @@ public final class MCPHostServer: @unchecked Sendable {
                 continuation.resume()
             }
         }
-
-        // Closing each descriptor is what ends the connections: the blocking read
-        // returns, the transport finishes its stream, and the SDK's message loop ends
-        // with it.
-        for socket in registry.allSockets() { socket.close() }
-        registry.removeAll()
 
         if UnixSocketBinding.isOurs(path: boundSocketURL.path, identity: identity) {
             UnixSocketBinding.unlink(path: boundSocketURL.path)
@@ -300,7 +309,9 @@ public final class MCPHostServer: @unchecked Sendable {
         let handshake = await withCheckedContinuation { continuation in
             blockingQueue.async {
                 continuation.resume(
-                    returning: Self.readHandshake(from: socket, timeout: Self.handshakeTimeout)
+                    returning: Self.readHandshake(
+                        from: socket, timeout: Self.handshakeTimeout, pid: pid
+                    )
                 )
             }
         }
@@ -322,7 +333,25 @@ public final class MCPHostServer: @unchecked Sendable {
 
         let identifier = UUID()
         let connection = ClientConnection(id: identifier, pid: pid, socket: socket)
-        guard registry.add(connection, ifUnder: SessionLimit.maximum) else {
+
+        // Re-checked here, under the host lock, because the check at the top of this
+        // function can be ten seconds stale: it happened before the handshake read, and
+        // `stop()` may have run since. This narrows the window; `registry.add` is what
+        // actually closes it, because that decision and shutdown's are made under one
+        // lock.
+        guard lock.withLock({ running }) else {
+            socket.close()
+            MCPDiagnostics.clientRefused(.notRunning, pid: pid)
+            return
+        }
+        switch registry.add(connection, ifUnder: SessionLimit.maximum) {
+        case .admitted:
+            break
+        case .hostClosed:
+            socket.close()
+            MCPDiagnostics.clientRefused(.notRunning, pid: pid)
+            return
+        case .atCapacity:
             socket.close()
             MCPDiagnostics.clientRefused(.tooManySessions, pid: pid)
             return
@@ -382,7 +411,11 @@ public final class MCPHostServer: @unchecked Sendable {
     ///
     /// Returns the remainder rather than dropping it: one `read` routinely returns the
     /// handshake *and* the first MCP frame, because they were written together.
-    static func readHandshake(from socket: UnixSocket, timeout: TimeInterval) -> HandshakeOutcome {
+    static func readHandshake(
+        from socket: UnixSocket,
+        timeout: TimeInterval,
+        pid: pid_t
+    ) -> HandshakeOutcome {
         /// A handshake is one short line. Anything longer is not one, and reading it
         /// would let a client that never sends a newline choose how much memory this
         /// host holds.
@@ -408,8 +441,18 @@ public final class MCPHostServer: @unchecked Sendable {
                 // A signal, not a refusal. Treating it as one would silently drop a
                 // legitimate client that happened to be interrupted while typing.
                 continue readLoop
-            case .timedOut, .failed:
+            case .timedOut:
                 return .refused(.handshakeTimedOut)
+            case .failed(let code):
+                // Distinct from a timeout, and it has to be: a descriptor error during a
+                // handshake is a fault to look at, while a timeout is a client that went
+                // quiet, and reporting one as the other sends whoever reads the log
+                // looking in the wrong place.
+                MCPDiagnostics.hostFailure(
+                    "a handshake read failed",
+                    detail: "pid \(pid): \(String(cString: strerror(code)))"
+                )
+                return .refused(.handshakeFailed)
             }
         }
         // Reachable, and the reason the loop cannot simply give up here: the last read

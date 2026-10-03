@@ -195,7 +195,7 @@ enum UnixSocketBinding {
     static func failure(_ message: String, code: Int32) -> NSError {
         let description = code == 0 ? message : "\(message): \(String(cString: strerror(code)))"
         return NSError(
-            domain: "PortmasterMCP.MCPHostServer",
+            domain: "PortmasterMCP.UnixSocketBinding",
             code: Int(code),
             userInfo: [NSLocalizedDescriptionKey: description]
         )

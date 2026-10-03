@@ -45,6 +45,7 @@ enum MCPDiagnostics {
         case wrongToken = "presented the wrong token"
         case malformedHandshake = "sent a handshake that is not a handshake"
         case handshakeTimedOut = "did not present a handshake in time"
+        case handshakeFailed = "had its handshake read fail"
         case handshakeTooLarge = "sent a handshake larger than a handshake can be"
         case tooManySessions = "was refused because too many sessions are open"
         case notRunning = "connected to a host that was shutting down"

@@ -263,6 +263,70 @@ final class MCPHostServerTests: XCTestCase {
         )
     }
 
+    /// A connection must not be able to become a session *after* `stop()` has finished.
+    ///
+    /// The window this closes is real and it is ten seconds wide. A client can connect
+    /// and then sit silent — the host has no reason to hurry it, and the handshake
+    /// timeout is what ends an abandoned connection. If it connects at the wrong moment,
+    /// `stop()` runs to completion while it is still in that read: the listener is
+    /// closed, the files are unlinked, and the registry has been emptied. The handshake
+    /// then completes against the token captured before, and unless admission and
+    /// shutdown contend on one lock, the session starts on a descriptor nothing will ever
+    /// close — surviving until the client hangs up on its own, with a row in
+    /// `connectedClients()` and a reader thread on a host that has stopped.
+    ///
+    /// Driven deliberately: the raw socket connects first, `stop()` is awaited, and only
+    /// then is the handshake written. The host is not accepting anything by then, so the
+    /// handshake must get silence and a closed connection.
+    func testAHandshakeArrivingAfterStopIsRefused() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+
+        // Read the token up front, as a real client does. `stop()` takes the endpoint
+        // file away with it, so afterwards there is nothing left to read — which is
+        // itself part of why a late handshake cannot be a late *session*.
+        let token = try harness.token
+
+        // Connected while the host is running, but saying nothing — so it is inside the
+        // handshake read when `stop()` begins.
+        let descriptor = try harness.connectRawSocket()
+        addTeardownBlock { close(descriptor) }
+        try await Task.sleep(for: .milliseconds(100))
+
+        await harness.host.stop()
+
+        // The handshake only now. It must not be authenticated into a stopped host.
+        try Self.writeAll(
+            Data(#"{"token":"\#(token)"}"# .utf8) + Data([0x0A]),
+            to: descriptor
+        )
+
+        let reply = try Self.readUntilClose(from: descriptor, timeout: 10)
+        XCTAssertEqual(
+            reply.bytes.count, 0,
+            "a handshake that arrives after stop() must get silence, got \(reply.bytes.count) bytes"
+        )
+        XCTAssertTrue(
+            reply.sawEndOfFile,
+            """
+            a connection that completes its handshake after stop() must be closed, \
+            not left holding a session — this read gave up after \
+            \(Int(reply.elapsed))ms
+            """
+        )
+
+        // And nothing survived: no session, no row, no reader thread.
+        XCTAssertEqual(
+            harness.host.connectedClients().count, 0,
+            "a stopped host must not end up serving a client"
+        )
+        try await Self.eventually(timeout: 5) { harness.host.liveReaderCount == 0 }
+        XCTAssertEqual(
+            harness.host.liveReaderCount, 0,
+            "a session started after stop() would leave a reader thread running forever"
+        )
+    }
+
     // MARK: - Bookkeeping for Settings
 
     /// Settings has to be able to say "something is connected" without the host

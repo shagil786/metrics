@@ -63,11 +63,6 @@ final class ClientConnection: @unchecked Sendable {
     func recordCall() { lock.withLock { stored.lastCallAt = Date() } }
 }
 
-/// The authenticated connections a host is currently serving.
-///
-/// Owns its own lock so the host's lock is never held while a connection's lock is
-/// taken in the other order; `ClientConnection` is a leaf and this is not, which is the
-/// only ordering that cannot deadlock.
 /// How many sessions may be open at once, and why that is the bound.
 ///
 /// `listen(16)` bounds the backlog of connections waiting to be accepted, not the
@@ -84,24 +79,49 @@ enum SessionLimit {
     static let maximum = 32
 }
 
+/// The authenticated connections a host is currently serving, and whether it is still
+/// willing to accept any.
+///
+/// **Admission and shutdown contend on this one lock**, which is the whole reason the
+/// registry holds a `closed` flag rather than the host checking its own `running` and
+/// then calling in. Those are two locks, and between them sits a window: a connection
+/// accepted before `stop()` can be sitting in a ten-second handshake read, so
+/// `stop()` finishes its snapshot, returns, and *then* the handshake completes and the
+/// session starts on a descriptor nothing will ever close. Checking a flag and then
+/// adding under a different lock cannot close that window; deciding both under one lock
+/// can.
+///
+/// Lock order: the host's lock may be held while this one is taken, never the reverse —
+/// nothing reachable from here takes the host's lock. `ClientConnection` is a leaf
+/// beneath both, which is why its own lock can never deadlock against either.
 final class ClientRegistry: @unchecked Sendable {
+
+    /// Why a connection was not admitted, so the caller can log which it was. A single
+    /// boolean would conflate "the host is shutting down" with "the host is full", and
+    /// those need different words: one is expected during quit, the other is a bug
+    /// report.
+    enum Admission {
+        case admitted
+        case hostClosed
+        case atCapacity
+    }
+
     private let lock = NSLock()
     private var connections: [UUID: ClientConnection] = [:]
+    private var closed = false
 
-    /// Live sessions. Doubles as the shutdown's work list.
-    var count: Int { lock.withLock { connections.count } }
-
-    /// Admits `connection` if there is room, and records it.
+    /// Admits `connection` if the host is still accepting and there is room.
     ///
-    /// Checked and taken in one step on purpose. As two calls it would be a race: two
-    /// connections accepted at the same moment could both see 31 sessions and both be
-    /// admitted, so the limit would be a suggestion. The limit is not security — the
-    /// token is — but a bound that is only usually true is not a bound.
-    func add(_ connection: ClientConnection, ifUnder limit: Int) -> Bool {
+    /// Checked and taken in one step, for the same reason as the `closed` flag above,
+    /// and for the ordinary one too: as two calls it is a race, two connections accepted
+    /// at the same moment both see 31 sessions and both are admitted, and a bound that
+    /// is only usually true is not a bound.
+    func add(_ connection: ClientConnection, ifUnder limit: Int) -> Admission {
         lock.withLock {
-            guard connections.count < limit else { return false }
+            guard !closed else { return .hostClosed }
+            guard connections.count < limit else { return .atCapacity }
             connections[connection.client.id] = connection
-            return true
+            return .admitted
         }
     }
 
@@ -116,13 +136,21 @@ final class ClientRegistry: @unchecked Sendable {
         }
     }
 
-    /// Every live connection's descriptor, for shutdown to close.
-    func allSockets() -> [UnixSocket] {
-        lock.withLock { connections.values.map(\.socket) }
-    }
-
-    func removeAll() {
-        lock.withLock { connections.removeAll() }
+    /// Stops accepting, and takes out everything admitted so far, in one step.
+    ///
+    /// Atomic with `add` on purpose. Because the flag and the snapshot are taken under
+    /// the same lock, there is no point at which a session can be admitted into a
+    /// registry whose contents shutdown has already taken: a connection is either in
+    /// what this returns, or its `add` returns `.hostClosed` and it closes its own
+    /// socket. A re-snapshot-until-empty loop cannot promise that, because "empty" and
+    /// "nothing more can arrive" are two different observations.
+    func closeAndTakeAll() -> [ClientConnection] {
+        lock.withLock {
+            closed = true
+            let live = Array(connections.values)
+            connections.removeAll()
+            return live
+        }
     }
 }
 

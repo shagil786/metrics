@@ -201,7 +201,7 @@ actor UnixSocketTransport: Transport {
 
     static func frameTooLarge(_ limit: Int) -> NSError {
         NSError(
-            domain: "PortmasterMCP.MCPHostServer", code: Int(EMSGSIZE),
+            domain: "PortmasterMCP.UnixSocketTransport", code: Int(EMSGSIZE),
             userInfo: [
                 NSLocalizedDescriptionKey: "a client sent a frame larger than \(limit) bytes"
             ]
