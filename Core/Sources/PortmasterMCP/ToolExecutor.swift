@@ -389,8 +389,13 @@ public struct ToolExecutor: Sendable {
         ),
         ToolDefinition(
             name: "set_preference",
-            description: "Change one allowlisted preference. Keys outside the "
-                + "allowlist are rejected, not ignored.",
+            description: "Change one allowlisted preference. Allowed keys: compact, "
+                + "cpuScale, mcpMode, networkUnit, temperatureSource, temperatureUnit. "
+                + "Any other key is rejected, not ignored. Two keys are not named "
+                + "after what they change: mcpMode sets this MCP server's own mutation "
+                + "policy rather than an app preference, and get_settings reports the "
+                + "compact preference as 'compactMenuBar', but the key to write is "
+                + "'compact'.",
             arguments: [
                 (name: "key", required: true, help: "Allowlisted preference key"),
                 (name: "value", required: true, help: "New value for that key")
@@ -538,9 +543,18 @@ public struct ToolExecutor: Sendable {
             return try await provider.stopProject(id: Self.id(arguments))
 
         case "set_preference":
-            return try setPreference(
-                key: arguments["key"] ?? "", value: arguments["value"] ?? ""
-            )
+            // Both arguments are required, and `execute` has already refused a
+            // missing or blank one, so neither can be absent here. Unwrapped
+            // rather than defaulted to "" on purpose: an empty key reaching the
+            // allowlist check would report "Preference '' cannot be changed via
+            // MCP", which points at the allowlist instead of at the argument the
+            // caller actually got wrong.
+            guard let key = arguments["key"], let value = arguments["value"] else {
+                throw MCPToolError(
+                    message: "Missing argument: \(arguments["key"] == nil ? "key" : "value")"
+                )
+            }
+            return try setPreference(key: key, value: value)
 
         // Unreachable while the catalog and this switch stay in step: `execute`
         // refuses any name the catalog does not declare, and every declared name

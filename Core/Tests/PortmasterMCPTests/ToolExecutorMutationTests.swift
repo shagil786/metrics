@@ -76,6 +76,36 @@ final class ToolExecutorMutationTests: XCTestCase {
 
     // MARK: set_preference allowlist
 
+    /// `tools/list` is the only place a client learns what it may write. A
+    /// description that says "allowlisted" without naming the keys leaves the
+    /// caller to guess, and one that omits the `compact` / `compactMenuBar`
+    /// asymmetry makes it guess wrong using a name it just read from
+    /// `get_settings`.
+    func testCatalogDescriptionNamesEveryAllowedKeyAndBothNamingTraps() throws {
+        let description = try XCTUnwrap(
+            ToolExecutor.catalog.first { $0.name == "set_preference" }?.description
+        )
+
+        for key in ToolExecutor.allowedPreferenceKeys.sorted() {
+            XCTAssertTrue(
+                description.contains(key),
+                "tools/list must name the allowed key '\(key)': \(description)"
+            )
+        }
+        XCTAssertTrue(
+            description.contains("rejected, not ignored"),
+            "the client must learn that a rejected key is an error, not a silent no-op"
+        )
+        XCTAssertTrue(
+            description.contains("compactMenuBar"),
+            "get_settings reports the compact preference under another name: \(description)"
+        )
+        XCTAssertTrue(
+            description.contains("mutation policy"),
+            "mcpMode is the server's own policy, not an app preference: \(description)"
+        )
+    }
+
     func testSetPreferenceRejectsUnknownKey() async throws {
         let stub = StubProvider()
         let tool = try makeExecutor(provider: stub, mode: .allowSession, appRunning: true)
@@ -102,7 +132,10 @@ final class ToolExecutorMutationTests: XCTestCase {
 
     func testSetPreferenceAllowlistsUnits() async throws {
         let stub = StubProvider()
-        let tool = try makeExecutor(provider: stub, mode: .allowSession, appRunning: true)
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
 
         let outcome = await tool.execute(
             name: "set_preference", arguments: ["key": "temperatureUnit", "value": "fahrenheit"]
@@ -119,6 +152,39 @@ final class ToolExecutorMutationTests: XCTestCase {
         let json = try jsonObject(outcome.text)
         XCTAssertEqual(json["key"] as? String, "temperatureUnit")
         XCTAssertEqual(json["value"] as? String, "fahrenheit")
+
+        let entry = try XCTUnwrap(
+            auditEntries(in: dir).first { $0["tool"] as? String == "set_preference" }
+        )
+        XCTAssertEqual(
+            entry["outcome"] as? String, "allowed",
+            "a preference change that took effect must be on the record as allowed"
+        )
+    }
+
+    /// `mcpMode` is the key that could widen the gate, so it is the one that most
+    /// needs to be proven gated: a client that can set it while mutations are off
+    /// owns the permission decision for every later call.
+    func testSetPreferenceCannotWidenItsOwnGate() async throws {
+        let stub = StubProvider()
+        let settingsDirectory = try makeTemporaryDirectory(prefix: "\(name)-settings")
+        try MCPSettings(mode: .off).save(directory: settingsDirectory)
+        let tool = try makeExecutor(
+            provider: stub, mode: .off, appRunning: true,
+            settingsDirectory: settingsDirectory
+        )
+
+        let outcome = await tool.execute(
+            name: "set_preference", arguments: ["key": "mcpMode", "value": "allowSession"]
+        )
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(stub.count(of: "setPreference"), 0)
+        XCTAssertEqual(
+            MCPSettings.load(directory: settingsDirectory).mode, .off,
+            "the stored mode must be untouched: a granted mutation policy is something "
+                + "the user does in the app, not something a client grants itself"
+        )
     }
 
     func testSetPreferenceMcpModeWritesSettingsFile() async throws {
