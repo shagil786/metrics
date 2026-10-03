@@ -135,6 +135,21 @@ public struct MCPToolError: Error, Equatable, Sendable {
     public init(message: String) {
         self.message = message
     }
+
+    /// A failure whose message is safe to show the caller verbatim, naming the
+    /// subsystem it came from.
+    ///
+    /// Providers throw errors from collectors, databases and subprocesses; left
+    /// alone those render as `localizedDescription`'s "The operation couldn't be
+    /// completed. (Module.Error error 1.)", which tells a caller — and the audit
+    /// log — nothing about what actually failed. An `MCPToolError` is passed
+    /// through unchanged, so a provider's own careful wording survives.
+    static func wrapping(_ error: Error, subsystem: String) -> MCPToolError {
+        if let error = error as? MCPToolError { return error }
+        return MCPToolError(
+            message: "Could not read \(subsystem) data: \(error.localizedDescription)"
+        )
+    }
 }
 
 /// Everything the tool layer can ask the machine for.
