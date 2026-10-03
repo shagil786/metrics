@@ -83,6 +83,31 @@ public struct SettingsSnapshot: Codable, Sendable {
     }
 }
 
+/// Where a set of alerts came from. Provenance belongs to whoever evaluated
+/// them: a caller must not read an alert reconstructed from recorded samples as
+/// one the live engine has just raised.
+public enum AlertSource: String, Sendable {
+    /// Raised by the live `AlertEngine` from the current sampling.
+    case live
+    /// Reconstructed from recorded history — the observation is real, its
+    /// freshness is not.
+    case historyApproximate = "history-approximate"
+}
+
+/// Alerts plus how they were produced. The two travel together so that an
+/// *empty* result still says which evaluation produced it; an array on its own
+/// cannot carry that, and "no alerts" is exactly when a caller wonders whether
+/// the alert path is working at all.
+public struct AlertsSnapshot: Sendable {
+    public let source: AlertSource
+    public let alerts: [ActingUpAlert]
+
+    public init(source: AlertSource, alerts: [ActingUpAlert]) {
+        self.source = source
+        self.alerts = alerts
+    }
+}
+
 /// Result of a stop action, keyed by pid: `"stopped"` or `"failed: <reason>"`.
 /// Mirrors `StopCoordinator.Outcome.Status`, which has no separate unsupported
 /// case — an unsupported host arrives as `.failed(reason:)`.
@@ -125,8 +150,15 @@ public protocol DataProvider: Sendable {
     func historyRankings(
         window: HistoryWindow, resource: HistoryResource?
     ) async throws -> [AppHistoryTrend]
+    /// Recorded readings of a single resource over the window. A separate method
+    /// rather than an overload of `historyRankings`: a resource reading belongs
+    /// to no app, so folding it into `AppHistoryTrend` would invent the app it
+    /// was never attributed to.
+    func historyResources(
+        window: HistoryWindow, resource: HistoryResource
+    ) async throws -> [ResourceHistoryPoint]
     func temperaturesFans() async throws -> ThermalSample?
-    func activeAlerts() async throws -> [ActingUpAlert]
+    func activeAlerts() async throws -> AlertsSnapshot
     func settingsSnapshot() -> SettingsSnapshot
     func quitApp(id: String, force: Bool) async throws -> StopReport
     func stopContainer(id: String) async throws -> StopReport

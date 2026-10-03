@@ -145,11 +145,59 @@ final class ToolExecutorReadMoreTests: XCTestCase {
             "the window the provider receives must already be the lookback start"
         )
         XCTAssertNil(stub.lastHistoryResource, "an absent resource means app trends")
+        XCTAssertEqual(
+            stub.count(of: "historyResources"), 0,
+            "without a resource there is nothing for the resource path to read"
+        )
         let trends = try jsonArray(outcome.text)
         XCTAssertEqual(trends.count, 1)
-        XCTAssertEqual(trends[0]["displayName"] as? String, "Chrome")
-        XCTAssertEqual(trends[0]["averageCPU"] as? Double ?? 0, 70, accuracy: 0.001)
-        XCTAssertEqual(trends[0]["cpuSeconds"] as? Double ?? 0, 42, accuracy: 0.001)
+        let trend = try XCTUnwrap(trends.first)
+        XCTAssertEqual(trend["displayName"] as? String, "Chrome")
+        XCTAssertEqual(trend["averageCPU"] as? Double ?? 0, 70, accuracy: 0.001)
+        XCTAssertEqual(trend["cpuSeconds"] as? Double ?? 0, 42, accuracy: 0.001)
+    }
+
+    /// A resource reading belongs to no app, so resource mode must return the
+    /// recorded points themselves. Decoding them as `AppHistoryTrend` would
+    /// invent an app to hang a GPU temperature on.
+    func testHistoryRankingsWithResourceReadsResourcePoints() async throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = StubProvider()
+        stub.resourcePoints = [
+            ResourceHistoryPoint(at: Date(), metric: "gpuTemperature", value: 61.5),
+            // An unavailable reading stays null; it is not a zero.
+            ResourceHistoryPoint(at: Date(), metric: "gpuTemperature", value: nil)
+        ]
+        let tool = executor(stub, directory: dir)
+
+        let outcome = await tool.execute(
+            name: "get_history_rankings",
+            arguments: ["range": "24h", "resource": "gpuTemperature"]
+        )
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertEqual(
+            stub.count(of: "historyResources"), 1,
+            "a resource request must reach the resource reader"
+        )
+        XCTAssertEqual(
+            stub.count(of: "historyRankings"), 0,
+            "app trends are a different question and must not be read as a stand-in"
+        )
+        XCTAssertEqual(stub.lastResourceWindow, .h24)
+        XCTAssertEqual(stub.lastRequestedResource, .gpuTemperature)
+
+        let points = try jsonArray(outcome.text)
+        XCTAssertEqual(points.count, 2)
+        let reading = try XCTUnwrap(points.first)
+        XCTAssertEqual(reading["metric"] as? String, "gpuTemperature")
+        XCTAssertEqual(try XCTUnwrap(reading["value"] as? Double), 61.5, accuracy: 0.001)
+        XCTAssertNotNil(reading["at"], "a reading carries when it was taken")
+        XCTAssertNil(
+            points.last?["value"],
+            "a missing reading must not be reported as a number"
+        )
     }
 
     func testHistoryRankingsInvalidResourceIsError() async throws {
@@ -166,6 +214,10 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertTrue(outcome.isError)
         XCTAssertEqual(outcome.text, "Invalid resource: temperatures")
         XCTAssertEqual(stub.count(of: "historyRankings"), 0)
+        XCTAssertEqual(
+            stub.count(of: "historyResources"), 0,
+            "an unknown resource must be rejected before any history is read"
+        )
     }
 
     // MARK: get_temperatures_fans
@@ -203,6 +255,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
+        stub.alertSource = .historyApproximate
         stub.alerts = [
             ActingUpAlert(
                 id: "history:app:Chrome:sustainedCPU",
@@ -213,7 +266,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
                 at: Date(timeIntervalSince1970: 1_700_000_000)
             ),
             ActingUpAlert(
-                id: "app:Slack:diskHammering",
+                id: "history:app:Slack:diskHammering",
                 kind: .diskHammering,
                 appName: "Slack",
                 headline: "Slack is hammering the disk",
@@ -226,7 +279,12 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         let outcome = await tool.execute(name: "get_active_alerts", arguments: [:])
 
         XCTAssertFalse(outcome.isError, outcome.text)
-        let alerts = try jsonArray(outcome.text)
+        let json = try jsonObject(outcome.text)
+        XCTAssertEqual(
+            json["source"] as? String, "history-approximate",
+            "a caller must be able to tell a history approximation from a live observation"
+        )
+        let alerts = try XCTUnwrap(json["alerts"] as? [[String: Any]])
         XCTAssertEqual(alerts.count, 2)
         let alert = try XCTUnwrap(alerts.first)
         XCTAssertEqual(alert["id"] as? String, "history:app:Chrome:sustainedCPU")
@@ -235,18 +293,30 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertEqual(alert["headline"] as? String, "Chrome is keeping the CPU busy")
         XCTAssertEqual(alert["detail"] as? String, "70% average over 10 minutes.")
         XCTAssertNotNil(alert["at"], "an alert carries when it was observed")
+    }
 
-        // Provenance, so a caller can tell an alert the live engine just raised
-        // from one reconstructed out of recorded samples. The provider marks the
-        // second kind with a `"history:"` id prefix; the executor only reads it.
-        XCTAssertEqual(
-            alert["source"] as? String, "history-approximate",
-            "a history-derived alert must not read as a live observation"
-        )
-        XCTAssertEqual(
-            alerts[1]["source"] as? String, "live",
-            "an unprefixed id means the live engine raised it"
-        )
+    /// Provenance is exactly what a caller cannot infer from an empty array, so
+    /// it has to survive the empty case — "no alerts" and "the alert path never
+    /// ran" must not look the same.
+    func testGetActiveAlertsEmptyStillReportsSource() async throws {
+        for source in [AlertSource.historyApproximate, .live] {
+            let dir = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let stub = StubProvider()
+            stub.alertSource = source
+            stub.alerts = []
+            let tool = executor(stub, directory: dir)
+
+            let outcome = await tool.execute(name: "get_active_alerts", arguments: [:])
+
+            XCTAssertFalse(outcome.isError, outcome.text)
+            let json = try jsonObject(outcome.text)
+            XCTAssertEqual(
+                json["source"] as? String, source.rawValue,
+                "an empty result must still name the evaluation that produced it"
+            )
+            XCTAssertEqual((json["alerts"] as? [Any])?.count, 0)
+        }
     }
 
     // MARK: get_settings

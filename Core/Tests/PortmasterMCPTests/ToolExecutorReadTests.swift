@@ -20,8 +20,10 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var dockerSample = DockerSample(availability: .running, containers: [])
     var projectSummaries: [PortmasterMCP.ProjectSummary] = []
     var trends: [AppHistoryTrend] = []
+    var resourcePoints: [ResourceHistoryPoint] = []
     var thermal: ThermalSample? = nil
     var alerts: [ActingUpAlert] = []
+    var alertSource: AlertSource = .historyApproximate
 
     static func makeSample() -> SystemSample {
         SystemSample(
@@ -84,6 +86,10 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     /// a caller sent against the window the provider received.
     private(set) var lastHistoryWindow: HistoryWindow?
     private(set) var lastHistoryResource: HistoryResource?
+    /// What `historyResources` was asked for, so a test can tell the resource
+    /// path apart from the app-trend path.
+    private(set) var lastResourceWindow: HistoryWindow?
+    private(set) var lastRequestedResource: HistoryResource?
 
     /// Counts the call, then throws the armed `MCPToolError` when there is one.
     private func enter(_ call: String) throws {
@@ -131,14 +137,23 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return trends
     }
 
+    func historyResources(
+        window: HistoryWindow, resource: HistoryResource
+    ) async throws -> [ResourceHistoryPoint] {
+        try enter("historyResources")
+        lastResourceWindow = window
+        lastRequestedResource = resource
+        return resourcePoints
+    }
+
     func temperaturesFans() async throws -> ThermalSample? {
         try enter("temperaturesFans")
         return thermal
     }
 
-    func activeAlerts() async throws -> [ActingUpAlert] {
+    func activeAlerts() async throws -> AlertsSnapshot {
         try enter("activeAlerts")
-        return alerts
+        return AlertsSnapshot(source: alertSource, alerts: alerts)
     }
 
     func settingsSnapshot() -> SettingsSnapshot {

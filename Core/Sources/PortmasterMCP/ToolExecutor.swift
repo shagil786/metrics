@@ -313,25 +313,15 @@ private struct TemperaturesPayload: Encodable {
     }
 }
 
-/// One alert plus where it came from. `source` matters because a caller must not
-/// read an alert reconstructed from recorded samples as if the live engine had
-/// just raised it — the observation is real, its freshness is not.
-///
-/// Provenance is the provider's to know, and `ActingUpAlert` has no field for
-/// it, so it is read off the convention the provider marks history-derived
-/// alerts with: an id prefixed `"history:"`. The executor never invents the
-/// claim; it only reports which convention the id uses.
+/// One alert. Provenance is not per alert but per call, so it rides on
+/// `AlertsPayload` beside the list rather than being repeated on each entry.
 private struct AlertPayload: Encodable {
-    /// Id prefix the provider uses for an alert reconstructed from history.
-    static let historyPrefix = "history:"
-
     let id: String
     let kind: String
     let appName: String
     let headline: String
     let detail: String
     let at: Date
-    let source: String
 
     init(_ alert: ActingUpAlert) {
         id = alert.id
@@ -340,7 +330,34 @@ private struct AlertPayload: Encodable {
         headline = alert.headline
         detail = alert.detail
         at = alert.at
-        source = alert.id.hasPrefix(Self.historyPrefix) ? "history-approximate" : "live"
+    }
+}
+
+/// Alerts plus where they came from, and the source is present even when the
+/// list is empty. That is the whole reason this is an object and not a bare
+/// array: an empty array cannot tell a caller that the live engine ran and found
+/// nothing from one that has not been able to answer at all.
+private struct AlertsPayload: Encodable {
+    let source: String
+    let alerts: [AlertPayload]
+
+    init(_ snapshot: AlertsSnapshot) {
+        source = snapshot.source.rawValue
+        alerts = snapshot.alerts.map(AlertPayload.init)
+    }
+}
+
+/// One recorded reading of a single resource. `value` stays null when the sensor
+/// had nothing to report: the line breaks there rather than drawing a zero.
+private struct ResourceHistoryPointPayload: Encodable {
+    let at: Date
+    let metric: String
+    let value: Double?
+
+    init(_ point: ResourceHistoryPoint) {
+        at = point.at
+        metric = point.metric
+        value = point.value
     }
 }
 
@@ -508,10 +525,11 @@ public struct ToolExecutor: Sendable {
     /// `ToolOutcome` with `isError` set, so the MCP host never has to guess.
     ///
     /// Audit vocabulary, one line per mutation attempt: `denied` (the gate
-    /// refused, so no provider call happened), `allowed` (the provider
-    /// succeeded), `failed` (the provider threw). The line is written after the
-    /// provider call, so the log answers "did the stop actually work?" — not
-    /// merely "was it permitted?".
+    /// refused, so no provider call happened and the line is written before any
+    /// provider call), `allowed` / `failed` (written after the provider call
+    /// returns). For an attempt that reached the provider the log therefore
+    /// answers "did the stop actually work?" — not merely "was it permitted?".
+    /// It cannot answer that for a denial, which never reached the action.
     public func execute(name: String, arguments: [String: String]) async -> ToolOutcome {
         guard let tool = Self.catalog.first(where: { $0.name == name }) else {
             return ToolOutcome(text: "Unknown tool: \(name)", isError: true)
@@ -607,15 +625,21 @@ public struct ToolExecutor: Sendable {
             // Both arguments are checked before the provider is touched, so an
             // unusable window or resource never reads history.
             let window = try Self.requireWindow(arguments["range"])
-            let resource = try Self.optionalResource(arguments["resource"])
-            let trends = try await provider.historyRankings(window: window, resource: resource)
-            return trends.map(HistoryTrendPayload.init)
+            if let resource = try Self.optionalResource(arguments["resource"]) {
+                // A resource reading belongs to no app, so it is returned as the
+                // recorded point it is. Reusing `AppHistoryTrend` here would
+                // invent the app the reading was never attributed to.
+                return try await provider.historyResources(window: window, resource: resource)
+                    .map(ResourceHistoryPointPayload.init)
+            }
+            return try await provider.historyRankings(window: window, resource: nil)
+                .map(HistoryTrendPayload.init)
 
         case "get_temperatures_fans":
             return TemperaturesPayload(try await provider.temperaturesFans())
 
         case "get_active_alerts":
-            return try await provider.activeAlerts().map(AlertPayload.init)
+            return AlertsPayload(try await provider.activeAlerts())
 
         case "get_settings":
             return provider.settingsSnapshot()
