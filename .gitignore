@@ -1,2 +1,4 @@
 .superpowers/
 .build/
+.codebase-memory/
+Portmaster.xcodeproj/
