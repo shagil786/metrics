@@ -126,6 +126,52 @@ final class EndpointFileTests: XCTestCase {
         XCTAssertEqual(try posixPermissions(of: fileURL), 0o600, "a wider file must be tightened")
     }
 
+    /// The write names its temp file after this pid and creates it `O_EXCL`, so a
+    /// file already at that name used to mean every later launch with the same pid
+    /// failed forever — and macOS reuses pids routinely, so one crash between
+    /// creating the temp and renaming it could disable the feature until the user
+    /// found and deleted a file they have no reason to know about. The write must
+    /// clear the stale file and carry on.
+    func testWriteRecoversFromALeftoverTempFileAtTheSamePath() throws {
+        let directory = try makeTemporaryDirectory(prefix: name)
+        let fileURL = EndpointFileStore.defaultURL(directory: directory)
+        let socket = directory.appendingPathComponent("mcp.sock")
+        // The temp name the write builds the endpoint in. Reproducing it here is the
+        // point: the collision has to be created at the exact path that will collide.
+        let staleURL = directory.appendingPathComponent(
+            "mcp-endpoint.json.\(ProcessInfo.processInfo.processIdentifier).tmp"
+        )
+        try Data("a half-written token from a launch that died".utf8).write(to: staleURL)
+        // Left wider than the write would ever use, to show the replacement is not
+        // built on the stale inode and so does not inherit its mode.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: staleURL.path)
+
+        try EndpointFileStore.write(
+            EndpointFile(
+                socket: socket,
+                token: try EndpointFileStore.newToken(),
+                pid: ProcessInfo.processInfo.processIdentifier
+            ),
+            directory: directory
+        )
+
+        XCTAssertEqual(
+            EndpointFileStore.read(directory: directory)?.socket.path,
+            socket.path,
+            "the endpoint must land despite the stale temp file"
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path),
+            ["mcp-endpoint.json"],
+            "the stale temp must be gone, not adopted or left beside the endpoint"
+        )
+        XCTAssertEqual(
+            try posixPermissions(of: fileURL),
+            0o600,
+            "the endpoint must be owner-only, not the stale file's 0644"
+        )
+    }
+
     // MARK: - Every unusable file reads as "no app"
 
     func testReadReturnsNilWhenFileAbsent() throws {

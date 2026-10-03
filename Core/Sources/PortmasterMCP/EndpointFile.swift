@@ -185,9 +185,9 @@ public enum EndpointFileStore {
     /// means hashing both first.
     ///
     /// Callers must never pass an empty `expected`. `tokenMatches("", "")` is `true`
-    /// by the definition above — two empty strings are equal, whatever their length —
-    /// and the only thing standing between a caller and an empty-token handshake is
-    /// `read`'s check that the file's token is well formed.
+    /// simply because two empty strings are equal, whatever their length — and the
+    /// only thing standing between a caller and an empty-token handshake is `read`'s
+    /// check that the file's token is well formed.
     public static func tokenMatches(_ candidate: String, expected: String) -> Bool {
         let candidateBytes = candidate.utf8
         let expectedBytes = expected.utf8
@@ -215,15 +215,10 @@ public enum EndpointFileStore {
     /// a CLI reading this mid-launch from seeing a half-written endpoint, or the old
     /// token advertised against the new socket.
     private static func replaceAtomically(_ data: Data, at url: URL) throws {
-        // The pid keeps two writers in one process from colliding; `O_EXCL` means a
-        // name someone else already holds is an error rather than something to adopt.
         let temporaryURL = url.deletingLastPathComponent().appendingPathComponent(
             "\(url.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).tmp"
         )
-        let descriptor = open(temporaryURL.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        guard descriptor >= 0 else {
-            throw failure("cannot create \(temporaryURL.path)", code: errno)
-        }
+        let descriptor = try createTemporaryFile(at: temporaryURL)
 
         var installed = false
         defer {
@@ -254,6 +249,38 @@ public enum EndpointFileStore {
             throw failure("cannot install \(url.path)", code: errno)
         }
         installed = true
+    }
+
+    /// Creates the temp file `0600`, or removes a stale one and tries once more.
+    ///
+    /// `O_EXCL` rather than a plain create, so this never adopts an inode somebody
+    /// else made — adopting one would also mean inheriting its mode, and the whole
+    /// point of creating the file here is that no token byte ever reaches an inode
+    /// another user can read.
+    ///
+    /// Which makes the collision case worth handling rather than throwing on: the
+    /// name carries this pid, and pids are unique among *live* processes, so a file
+    /// already sitting here can only belong to a launch that died between creating
+    /// its temp file and renaming it, or to an earlier failed attempt in this
+    /// process. Throwing there would turn one crash into a permanently broken
+    /// feature for every later launch that happens to be handed the same pid, and
+    /// the user's only remedy would be deleting a file by hand. Removing it is safe
+    /// — inside a `0700` directory, at a name no live process but this one can hold
+    /// — and happens before a single byte is written, so nothing is ever written
+    /// through the stale inode.
+    private static func createTemporaryFile(at url: URL) throws -> Int32 {
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        if descriptor >= 0 { return descriptor }
+        guard errno == EEXIST else {
+            throw failure("cannot create \(url.path)", code: errno)
+        }
+
+        try? FileManager.default.removeItem(at: url)
+        let retry = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard retry >= 0 else {
+            throw failure("cannot create \(url.path)", code: errno)
+        }
+        return retry
     }
 
     // MARK: - Reading
