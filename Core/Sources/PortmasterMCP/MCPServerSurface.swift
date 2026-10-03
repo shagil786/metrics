@@ -205,23 +205,35 @@ public enum MCPDispatch {
 
 /// Registers the tool surface on an MCP `Server`.
 public enum MCPServerSurface {
-    /// Adds `tools/list` and `tools/call` to `server`.
-    public static func configure(_ server: Server, context: any MCPCallContext) async {
+    /// Adds `tools/list` and `tools/call` to `server`, and returns the tracker
+    /// that knows which calls are outstanding.
+    ///
+    /// The tracker is returned rather than hidden because the caller has to wait
+    /// on it before shutting down — see `MCPStdioRunner`.
+    @discardableResult
+    public static func configure(_ server: Server, context: any MCPCallContext) async
+        -> CallTracker
+    {
+        let tracker = CallTracker()
         await server.withMethodHandler(ListTools.self) { _ in
             .init(tools: MCPCatalog.tools())
         }
 
         await server.withMethodHandler(CallTool.self) { parameters in
-            let outcome = await MCPDispatch.call(
-                name: parameters.name,
-                arguments: MCPArguments.strings(fromJSON: jsonObject(parameters.arguments)),
-                context: context
-            )
+            // Tracked, because this is the work a shutdown has to wait for.
+            let outcome = await tracker.track {
+                await MCPDispatch.call(
+                    name: parameters.name,
+                    arguments: MCPArguments.strings(fromJSON: jsonObject(parameters.arguments)),
+                    context: context
+                )
+            }
             return .init(
                 content: [.text(text: outcome.text, annotations: nil, _meta: nil)],
                 isError: outcome.isError
             )
         }
+        return tracker
     }
 
     /// The SDK's decoded arguments as plain JSON.
@@ -240,5 +252,62 @@ public enum MCPServerSurface {
             return nil
         }
         return object
+    }
+}
+
+// MARK: - Outstanding work
+
+/// Which tool calls are between the wire and a result right now.
+///
+/// This exists because the SDK's receive loop ends the moment its input does, and
+/// it does not wait for the handler tasks it spawned on the way there. Without a
+/// count, a server that exits on EOF discards replies it was already computing —
+/// which is exactly what happens to `echo '{…}' | portmaster-mcp`, the first
+/// thing anyone tries by hand.
+///
+/// The count is taken at the tool handler rather than at the transport because
+/// the handler is the last place this server still owns: reaching past it into
+/// the SDK's message loop would make shutdown depend on SDK internals.
+public actor CallTracker {
+    private var inFlight = 0
+
+    public init() {}
+
+    /// Calls started and not yet finished. Observable so a caller — and a test —
+    /// can tell "waiting" from "never started".
+    public var inFlightCount: Int { inFlight }
+
+    /// Runs `body` as a tracked call. The count falls even if `body` throws, so a
+    /// failure cannot leave the drain waiting on work that is already over.
+    public func track<T>(_ body: () async throws -> T) async rethrows -> T {
+        inFlight += 1
+        do {
+            let value = try await body()
+            inFlight -= 1
+            return value
+        } catch {
+            inFlight -= 1
+            throw error
+        }
+    }
+
+    /// Waits until no call has been in flight for `quiet`, or until `timeout` has
+    /// passed — whichever comes first.
+    ///
+    /// Always returns, and never sooner than `quiet`, so a handler that hangs
+    /// costs the timeout and nothing more: the server cannot be kept alive by
+    /// work it is waiting to finish.
+    public func waitUntilIdle(quiet: TimeInterval, timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(max(quiet, timeout))
+        var idleSince = Date()
+        while Date() < deadline {
+            if inFlight == 0 {
+                if Date().timeIntervalSince(idleSince) >= quiet { return }
+            } else {
+                // Something is running; the quiet period starts over from here.
+                idleSince = Date()
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 }

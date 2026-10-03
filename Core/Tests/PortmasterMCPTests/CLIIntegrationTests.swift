@@ -22,6 +22,9 @@ final class CLIIntegrationTests: XCTestCase {
     /// different deadlines and use them separately.
     static let handshakeTimeout: TimeInterval = 20
     static let liveReadTimeout: TimeInterval = 60
+    /// Long enough for the server's bounded drain on EOF plus the work itself.
+    /// The drain is capped at two seconds, so this is slack, not a budget.
+    static let eofExitTimeout: TimeInterval = 20
 
     // MARK: Handshake, catalog, and a real tool call
 
@@ -99,6 +102,58 @@ final class CLIIntegrationTests: XCTestCase {
             try Self.contentText(result).contains("nope"),
             "the error text must name the tool that was not found"
         )
+    }
+
+    // MARK: EOF, and the drain that has to happen before it
+
+    /// The `echo … | portmaster-mcp` shape, and the reason `MCPStdioRunner`
+    /// drains before it stops.
+    ///
+    /// A whole conversation is written and stdin is closed before the server has
+    /// answered anything — which is what a shell pipeline does, and what a person
+    /// trying the server by hand does. The SDK's message loop ends the moment its
+    /// input does, so without a drain the process exits having written nothing,
+    /// and the very first manual check anyone runs reports a broken server.
+    ///
+    /// Asserted against what the process actually wrote before it exited, so this
+    /// fails if the drain is removed or its cap is shortened below the work.
+    func testRepliesAreWrittenBeforeTheProcessExitsOnEOF() async throws {
+        let server = try MCPServerProcess.launch()
+        try server.writeAndClose([
+            """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":\
+            {"protocolVersion":"2025-06-18","capabilities":{},\
+            "clientInfo":{"name":"test","version":"0"}}}
+            """,
+            #"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            """
+            {"jsonrpc":"2.0","id":2,"method":"tools/call",\
+            "params":{"name":"get_settings","arguments":{}}}
+            """,
+        ])
+
+        let replies = try server.linesWrittenBeforeExit(timeout: Self.eofExitTimeout)
+        let byID = Dictionary(
+            uniqueKeysWithValues: replies.compactMap { line -> (Int, [String: Any])? in
+                guard let object = try? MCPServerProcess.jsonObject(line),
+                    let id = object["id"] as? Int
+                else { return nil }
+                return (id, object)
+            }
+        )
+
+        let initialized = try XCTUnwrap(byID[1], "the initialize reply was never written")
+        XCTAssertNotNil(
+            (initialized["result"] as? [String: Any])?["serverInfo"], "\(initialized)"
+        )
+
+        let called = try XCTUnwrap(
+            byID[2], "the tools/call reply was never written; stdout held: \(replies)"
+        )
+        let result = try XCTUnwrap(called["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false, "\(result)")
+        let text = try Self.contentText(result)
+        XCTAssertNotNil(try jsonObject(text)["mutationMode"], text)
     }
 
     // MARK: The live read, and the run loop it depends on
@@ -215,6 +270,34 @@ final class MCPServerProcess {
 
     /// Writes a notification, which has no id and must never be answered.
     func notify(_ line: String) throws { try send(line) }
+
+    /// Writes a whole conversation and closes stdin immediately — the shape
+    /// `echo '…' | portmaster-mcp` produces.
+    func writeAndClose(_ lines: [String]) throws {
+        for line in lines { try send(line) }
+        try toServer.fileHandleForWriting.close()
+    }
+
+    /// Waits for the server to exit after its stdin closed, then returns every
+    /// line it wrote before going. Throws if it is still running at the deadline,
+    /// because "it never exited" and "it exited having written nothing" are the
+    /// two ways this can be broken and they need different messages.
+    func linesWrittenBeforeExit(timeout: TimeInterval) throws -> [String] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline { usleep(20_000) }
+        guard !process.isRunning else {
+            process.terminate()
+            throw ServerFailure(
+                reason: "the server was still running \(timeout)s after its stdin closed"
+            )
+        }
+        process.waitUntilExit()
+        // stdout reaches EOF as soon as the child is gone, so the reader thread
+        // finishes on its own; give it a moment, then take what it collected.
+        let readDeadline = Date().addingTimeInterval(5)
+        while !fromServer.isClosed, Date() < readDeadline { usleep(20_000) }
+        return fromServer.drain()
+    }
 
     /// Sends a request and returns the reply carrying the same id. Any other line
     /// — a notification, or a reply to an earlier call — is passed over rather
@@ -443,6 +526,12 @@ final class LineReader: @unchecked Sendable {
     private var storedExit: String?
 
     func noteExit(_ description: String) { lock.withLock { storedExit = description } }
+
+    /// True once the pipe reached EOF and nothing more can arrive.
+    var isClosed: Bool { lock.withLock { closed } }
+
+    /// Takes every line read so far and empties the queue.
+    func drain() -> [String] { lock.withLock { defer { pending.removeAll() }; return pending } }
 
 private func readLoop() {
         var buffer = Data()

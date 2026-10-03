@@ -13,7 +13,8 @@ import XCTest
 final class MCPDispatchTests: XCTestCase {
 
     /// A context that hands out a fresh executor every time and counts them.
-    private final class CountingContext: MCPCallContext {
+    /// `@unchecked Sendable` because the count is guarded by a lock.
+    private final class CountingContext: MCPCallContext, @unchecked Sendable {
         private let lock = NSLock()
         private var made = 0
         private let executor: @Sendable () -> ToolExecutor
@@ -105,11 +106,11 @@ final class MCPDispatchTests: XCTestCase {
     func testModeChangeOnDiskAppliesToTheNextCall() async throws {
         let auditDirectory = try makeTemporaryDirectory(prefix: name)
         let settingsDirectory = try makeTemporaryDirectory(prefix: name)
-        var settings = MCPSettings(mode: .off)
+        let settings = SettingsStub(MCPSettings(mode: .off))
         let provider = StubProvider()
         let context = LiveMCPCallContext(
             provider: { provider },
-            loadSettings: { settings },
+            loadSettings: { settings.current },
             appRunning: { false },
             auditDirectory: auditDirectory,
             settingsDirectory: settingsDirectory
@@ -121,7 +122,7 @@ final class MCPDispatchTests: XCTestCase {
         XCTAssertTrue(denied.isError)
         XCTAssertEqual(denied.text, "MCP mutations are disabled in Portmaster settings.")
 
-        settings.mode = .allowSession
+        settings.current.mode = .allowSession
         let stillDenied = await MCPDispatch.call(
             name: "quit_app", arguments: ["id": "app:Somewhere"], context: context
         )
@@ -130,6 +131,17 @@ final class MCPDispatchTests: XCTestCase {
             "the app is not running, so allowSession must still deny"
         )
         XCTAssertEqual(stillDenied.text, "Session grants apply only while Portmaster is running.")
+    }
+
+    /// The mode on disk, changeable between two calls in one server's life.
+    private final class SettingsStub: @unchecked Sendable {
+        private let lock = NSLock()
+        private var settings: MCPSettings
+        init(_ settings: MCPSettings) { self.settings = settings }
+        var current: MCPSettings {
+            get { lock.withLock { settings } }
+            set { lock.withLock { settings = newValue } }
+        }
     }
 
     /// A flag a test can flip mid-run, standing in for the app being quit.
@@ -141,5 +153,63 @@ final class MCPDispatchTests: XCTestCase {
             get { lock.withLock { running } }
             set { lock.withLock { running = newValue } }
         }
+    }
+
+    // MARK: The EOF drain
+
+    /// The drain gives work that is already running time to finish.
+    func testDrainWaitsForACallThatIsStillRunning() async throws {
+        let tracker = CallTracker()
+        let started = expectation(description: "the tracked call began")
+        Task {
+            await tracker.track {
+                started.fulfill()
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        await fulfillment(of: [started], timeout: 5)
+        // Well past the quiet period, so only the in-flight count can hold the
+        // drain open.
+        await tracker.waitUntilIdle(quiet: 0.02, timeout: 5)
+        let finished = await tracker.inFlightCount
+        XCTAssertEqual(finished, 0, "the drain must return after the call completed")
+    }
+
+    /// The other half of the ruling: a call that never returns must not keep the
+    /// server alive. Bounded means the wait ends at the timeout, whatever the
+    /// handler is doing.
+    func testDrainIsBoundedWhenACallNeverReturns() async throws {
+        let tracker = CallTracker()
+        let started = expectation(description: "the tracked call began")
+        Task {
+            // Never completes within this test run.
+            await tracker.track {
+                started.fulfill()
+                try? await Task.sleep(for: .seconds(600))
+            }
+        }
+        await fulfillment(of: [started], timeout: 5)
+
+        let began = Date()
+        await tracker.waitUntilIdle(quiet: 0.02, timeout: 0.3)
+        let elapsed = Date().timeIntervalSince(began)
+
+        XCTAssertGreaterThan(elapsed, 0.02, "the quiet period is still respected")
+        XCTAssertLessThan(elapsed, 2, "a stuck call must cost the timeout and no more")
+        let outstanding = await tracker.inFlightCount
+        XCTAssertEqual(outstanding, 1, "the stuck call is still outstanding, and that is fine")
+    }
+
+    /// The quiet period is not zero: a request the SDK has read but not yet
+    /// started is invisible to the count, so returning the instant the count hits
+    /// zero would race it.
+    func testDrainWaitsOutTheQuietPeriod() async throws {
+        let tracker = CallTracker()
+        let began = Date()
+        await tracker.waitUntilIdle(quiet: 0.15, timeout: 5)
+        XCTAssertGreaterThan(
+            Date().timeIntervalSince(began), 0.1,
+            "an idle drain must still wait out the quiet period"
+        )
     }
 }

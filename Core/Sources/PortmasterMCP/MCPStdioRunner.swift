@@ -40,6 +40,27 @@ public enum MCPStdioRunner {
     /// client, long enough to cost nothing while idle.
     static let pumpInterval: TimeInterval = 0.02
 
+    /// Longest the server stays alive after stdin reaches EOF.
+    ///
+    /// A client that pipes its requests and closes stdin — `echo '{…}' |
+    /// portmaster-mcp`, the manual check in a README, a shell one-liner — must
+    /// still get its replies. A client that keeps the pipe open, which every
+    /// long-lived MCP client does, never reaches this at all.
+    public static let eofDrainTimeout: TimeInterval = 2
+
+    /// How long the drain waits with no call in flight before it believes the
+    /// outstanding work is finished.
+    ///
+    /// Not zero, because a count of zero is not proof of nothing left to do: the
+    /// SDK spawns a task per request from inside its receive loop and exposes no
+    /// hook for "this request has been read but its handler has not started yet",
+    /// so for a moment after EOF a queued call is invisible here. Requiring the
+    /// count to stay at zero for this long is what tells "still nothing running"
+    /// apart from "nothing started yet". Bounded on both ends — a quiet period
+    /// cannot be satisfied by a handler that never finishes, and the timeout ends
+    /// the wait regardless.
+    static let eofQuietPeriod: TimeInterval = 0.25
+
     /// Serves one session over `transport` and returns when the client is done —
     /// that is, when the transport's input reaches EOF.
     ///
@@ -57,15 +78,15 @@ public enum MCPStdioRunner {
         )
         // Handlers are registered before `start` so the server is complete the
         // moment it can see a byte.
-        await MCPServerSurface.configure(server, context: context)
+        let tracker = await MCPServerSurface.configure(server, context: context)
         try await server.start(transport: transport)
-        // EOF ends the session. The SDK's message loop finishes the moment its
-        // input does, and it does not wait for the handler tasks it spawned, so a
-        // call still running at EOF is not answered — no drain is invented here,
-        // because a fixed grace period would only paper over the short cases and
-        // still truncate a slow one. A client that wants an answer keeps the pipe
-        // open, which is what the stdio transport's own contract asks for.
+        // Returns when the SDK's message loop ends, which is EOF.
         await server.waitUntilCompleted()
+
+        // EOF. The loop is already over, but a tool call it read just before the
+        // input ended may still be running, and stopping now would throw away a
+        // reply the caller is waiting for. So: drain, bounded.
+        await tracker.waitUntilIdle(quiet: eofQuietPeriod, timeout: eofDrainTimeout)
         await server.stop()
     }
 
