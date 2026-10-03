@@ -100,6 +100,41 @@ public struct AppHistoryTrend: Identifiable, Sendable {
     }
 }
 
+/// One app's memory footprint at the first and last recorded reading of a
+/// window.
+///
+/// A trend is a difference between two observations, so a caller that needs
+/// "grew by X" cannot get it from `AppHistoryTrend`'s peak: a peak says how much
+/// was held at the busiest moment, not how much was added. Only immutable values
+/// leave the history reader, so this carries the two endpoints rather than the
+/// stored models.
+public struct AppMemorySpan: Sendable {
+    public let appID: String
+    public let displayName: String
+    public let firstBytes: UInt64
+    public let lastBytes: UInt64
+    public let firstAt: Date
+    public let lastAt: Date
+
+    public init(
+        appID: String, displayName: String,
+        firstBytes: UInt64, lastBytes: UInt64, firstAt: Date, lastAt: Date
+    ) {
+        self.appID = appID
+        self.displayName = displayName
+        self.firstBytes = firstBytes
+        self.lastBytes = lastBytes
+        self.firstAt = firstAt
+        self.lastAt = lastAt
+    }
+
+    /// Bytes added between the two observations. 0 when memory was released —
+    /// a shrink is not growth, and never a wrap-around.
+    public var growthBytes: UInt64 {
+        lastBytes >= firstBytes ? lastBytes - firstBytes : 0
+    }
+}
+
 public enum HistoryPlot {
     public struct Reading: Sendable {
         public let at: Date

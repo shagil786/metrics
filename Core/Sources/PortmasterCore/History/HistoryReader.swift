@@ -79,6 +79,39 @@ public actor HistoryReader {
         return grouped.values.sorted { $0.cpuSeconds == $1.cpuSeconds ? $0.id < $1.id : $0.cpuSeconds > $1.cpuSeconds }
     }
 
+    /// First and last recorded memory per app over the window, for apps seen at
+    /// least twice.
+    ///
+    /// Apps with a single reading are omitted: growth is the difference between
+    /// two observations, and reporting a peak as growth would invent the missing
+    /// half of the measurement.
+    public func appMemorySpans(since: Date) throws -> [AppMemorySpan] {
+        try Task.checkCancellation()
+        let context = ModelContext(container)
+        var first: [String: (bytes: UInt64, at: Date, name: String)] = [:]
+        var last: [String: (bytes: UInt64, at: Date)] = [:]
+        try context.enumerate(FetchDescriptor<AppHistoryPoint>(predicate: #Predicate { $0.at >= since }, sortBy: [SortDescriptor(\.at)]), batchSize: 500) { point in
+            try Task.checkCancellation()
+            // nil memory is "not measured", so it is not an endpoint either.
+            guard let bytes = point.memoryBytes, bytes >= 0 else { return }
+            if first[point.appID] == nil {
+                first[point.appID] = (UInt64(bytes), point.at, point.displayName)
+            }
+            last[point.appID] = (UInt64(bytes), point.at)
+        }
+        var spans: [AppMemorySpan] = []
+        spans.reserveCapacity(first.count)
+        for (appID, start) in first {
+            guard let end = last[appID] else { continue }
+            spans.append(AppMemorySpan(
+                appID: appID, displayName: start.name,
+                firstBytes: start.bytes, lastBytes: end.bytes,
+                firstAt: start.at, lastAt: end.at
+            ))
+        }
+        return spans.sorted { $0.lastAt == $1.lastAt ? $0.appID < $1.appID : $0.lastAt > $1.lastAt }
+    }
+
     public func legacyTrends(since: Date) throws -> [HistoryStore.ProcessTrend] {
         try Task.checkCancellation()
         let context = ModelContext(container)
