@@ -13,9 +13,14 @@ import PortmasterMCP
 /// would tell a caller "the call failed" when the machine simply answered.
 final class ToolExecutorReadMoreTests: XCTestCase {
 
-    private func temporaryDirectory() -> URL {
-        FileManager.default.temporaryDirectory
+    /// A fresh directory, created up front. Every test here is a read, so the
+    /// audit log is never written and the directory would otherwise not exist —
+    /// leaving the cleanup to fail on a path that was never made.
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("ToolExecutorReadMoreTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
     }
 
     private func executor(_ provider: DataProvider, directory: URL) -> ToolExecutor {
@@ -43,7 +48,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_containers
 
     func testContainersDaemonDownIsDataNotError() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.dockerSample = DockerSample(availability: .daemonDown, containers: [])
@@ -69,7 +74,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_projects
 
     func testProjectsDerivesSummaryFields() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.projectSummaries = [
@@ -95,7 +100,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_history_rankings
 
     func testHistoryRankingsInvalidRangeIsError() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         let tool = executor(stub, directory: dir)
@@ -114,7 +119,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     }
 
     func testHistoryRankingsValidRangeMapsSinceDate() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         // Built through the real aggregation so the payload is exercised with a
@@ -148,7 +153,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     }
 
     func testHistoryRankingsInvalidResourceIsError() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         let tool = executor(stub, directory: dir)
@@ -166,7 +171,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_temperatures_fans
 
     func testTemperaturesUnavailableIsDataNotError() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.thermal = nil
@@ -195,7 +200,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_active_alerts
 
     func testGetActiveAlertsReturnsAlertJSON() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         stub.alerts = [
@@ -247,7 +252,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     // MARK: get_settings
 
     func testGetSettingsReturnsSnapshotJSON() async throws {
-        let dir = temporaryDirectory()
+        let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stub = StubProvider()
         let tool = executor(stub, directory: dir)
