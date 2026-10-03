@@ -13,11 +13,15 @@ extension XCTestCase {
     /// to the failure output, and `defer` in an async test body is easy to place
     /// wrongly. A read-only tool never writes the log, so the directory would
     /// otherwise not exist at all.
+    ///
+    /// `settingsDirectory` is where `set_preference` writes `mcpMode`; passing
+    /// `nil` points it at the real per-user location, which a test must not do.
     func makeExecutor(
         provider: DataProvider,
         mode: MCPMutationMode = .off,
         appRunning: Bool = false,
-        directory: URL? = nil
+        directory: URL? = nil,
+        settingsDirectory: URL? = nil
     ) throws -> ToolExecutor {
         let url = try directory ?? makeTemporaryDirectory(prefix: name)
         addTeardownBlock {
@@ -26,7 +30,8 @@ extension XCTestCase {
         return ToolExecutor(
             provider: provider,
             gate: PermissionGate(settings: MCPSettings(mode: mode), appRunning: appRunning),
-            audit: AuditLog(directory: url)
+            audit: AuditLog(directory: url),
+            settingsDirectory: settingsDirectory
         )
     }
 
@@ -57,5 +62,18 @@ extension XCTestCase {
             JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]],
             "payload must be a JSON array: \(text)"
         )
+    }
+
+    /// Parsed audit lines, in write order. Throws when the log is absent, which
+    /// is itself the assertion for "nothing was logged".
+    func auditEntries(in directory: URL) throws -> [[String: Any]] {
+        let logURL = directory.appendingPathComponent("mcp-audit.log")
+        let contents = try String(contentsOf: logURL, encoding: .utf8)
+        return try contents.split(separator: "\n").map { line in
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                "every audit line must be a JSON object: \(line)"
+            )
+        }
     }
 }

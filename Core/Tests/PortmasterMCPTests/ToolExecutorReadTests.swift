@@ -82,6 +82,11 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     private(set) var lastQuitAppID: String?
     private(set) var lastQuitAppForce: Bool?
 
+    /// What `setPreference` was actually asked for, so a test can pin that the
+    /// key that passed the allowlist is the key the provider receives.
+    private(set) var lastPreferenceKey: String?
+    private(set) var lastPreferenceValue: String?
+
     /// What `historyRankings` was asked for, so a test can pin the range string
     /// a caller sent against the window the provider received.
     private(set) var lastHistoryWindow: HistoryWindow?
@@ -183,6 +188,8 @@ final class StubProvider: DataProvider, @unchecked Sendable {
 
     func setPreference(key: String, value: String) throws {
         try enter("setPreference")
+        lastPreferenceKey = key
+        lastPreferenceValue = value
     }
 }
 
@@ -459,20 +466,5 @@ final class ToolExecutorReadTests: XCTestCase {
         XCTAssertEqual(
             entry["reason"] as? String, "PID 4321: still running after the stop signal"
         )
-    }
-
-    // MARK: Audit reading
-
-    /// Parsed audit lines, in write order. Throws when the log is absent, which
-    /// is itself the assertion for "nothing was logged".
-    private func auditEntries(in directory: URL) throws -> [[String: Any]] {
-        let logURL = directory.appendingPathComponent("mcp-audit.log")
-        let contents = try String(contentsOf: logURL, encoding: .utf8)
-        return try contents.split(separator: "\n").map { line in
-            try XCTUnwrap(
-                JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                "every audit line must be a JSON object: \(line)"
-            )
-        }
     }
 }

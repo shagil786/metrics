@@ -128,6 +128,9 @@ struct FanPayload: Encodable {
     }
 }
 
+// `TemperaturesPayload` in `WirePayloads.swift` has a uniform "available or all
+// null" shape for the same sensors; this one is the overview's slice of the same
+// sample, where the surrounding sections are independently optional.
 private struct ThermalPayload: Encodable {
     let cpuTempC: Double?
     let gpuTempC: Double?
@@ -236,6 +239,15 @@ public struct ToolOutcome: Sendable {
     }
 }
 
+/// A change has nothing to list, so `set_preference` acknowledges what it
+/// applied rather than returning a collection that would be empty by
+/// construction. The echoed key matters: a caller setting several preferences in
+/// sequence needs to know which one this answer is about.
+private struct PreferencePayload: Encodable {
+    let key: String
+    let value: String
+}
+
 // MARK: - Catalog
 
 /// Whether a tool observes or changes the machine. The executor asks the
@@ -259,11 +271,21 @@ public struct ToolExecutor: Sendable {
     private let provider: DataProvider
     private let gate: PermissionGate
     private let audit: AuditLog
+    /// Where `set_preference` writes `mcpMode`. `nil` is the per-user default
+    /// (`~/.portmaster`); the parameter exists so a test can write somewhere
+    /// disposable instead.
+    private let settingsDirectory: URL?
 
-    public init(provider: DataProvider, gate: PermissionGate, audit: AuditLog) {
+    public init(
+        provider: DataProvider,
+        gate: PermissionGate,
+        audit: AuditLog,
+        settingsDirectory: URL? = nil
+    ) {
         self.provider = provider
         self.gate = gate
         self.audit = audit
+        self.settingsDirectory = settingsDirectory
     }
 
     /// All 13 tools the MCP server exposes. Names wired into dispatch stay in
@@ -515,11 +537,71 @@ public struct ToolExecutor: Sendable {
         case "stop_project":
             return try await provider.stopProject(id: Self.id(arguments))
 
-        // Declared in the catalog so `tools/list` is complete, but not yet wired:
-        // `set_preference` (Task 5).
+        case "set_preference":
+            return try setPreference(
+                key: arguments["key"] ?? "", value: arguments["value"] ?? ""
+            )
+
+        // Unreachable while the catalog and this switch stay in step: `execute`
+        // refuses any name the catalog does not declare, and every declared name
+        // is handled above. Kept so a tool added to the catalog without a
+        // dispatch case fails loudly instead of quietly doing nothing.
         default:
             throw MCPToolError(message: "Tool not implemented yet")
         }
+    }
+
+    /// The preference keys MCP may change.
+    ///
+    /// An allowlist rather than a denylist, because the surface being protected is
+    /// the app's whole preferences blob: a denylist only stays exhaustive while
+    /// nobody adds a preference, and this file does not own that list.
+    public static let allowedPreferenceKeys: Set<String> = [
+        "temperatureUnit", "networkUnit", "cpuScale", "temperatureSource",
+        "compact", "mcpMode",
+    ]
+
+    /// Applies one allowlisted preference.
+    ///
+    /// `mcpMode` is the exception: it is the MCP server's own mutation policy, kept
+    /// in `MCPSettings` beside the audit log rather than in the app's preferences
+    /// blob, because the server has to be able to read and write it whether or not
+    /// the UI is running. Everything else goes to the provider, which owns the
+    /// meaning of each value and rejects the ones it cannot apply.
+    private func setPreference(key: String, value: String) throws -> PreferencePayload {
+        guard Self.allowedPreferenceKeys.contains(key) else {
+            // Naming the rejected key and the allowlist back: a caller that guessed
+            // a key learns what it may try instead, and a caller that did not learn
+            // which of its keys was the problem.
+            throw MCPToolError(
+                message: "Preference '\(key)' cannot be changed via MCP. Allowed: "
+                    + Self.allowedPreferenceKeys.sorted().joined(separator: ", ") + "."
+            )
+        }
+
+        if key == "mcpMode" {
+            guard let mode = MCPMutationMode(rawValue: value) else {
+                throw MCPToolError(
+                    message: "Invalid mcpMode: \(value). Allowed: "
+                        + MCPMutationMode.allCases.map(\.rawValue).joined(separator: ", ") + "."
+                )
+            }
+            var settings = MCPSettings.load(directory: settingsDirectory)
+            settings.mode = mode
+            do {
+                try settings.save(directory: settingsDirectory)
+            } catch {
+                // Wrapped so the failure reads as a preference that did not change
+                // rather than as a Cocoa error code.
+                throw MCPToolError(
+                    message: "Could not save MCP settings: \(error.localizedDescription)"
+                )
+            }
+            return PreferencePayload(key: key, value: mode.rawValue)
+        }
+
+        try provider.setPreference(key: key, value: value)
+        return PreferencePayload(key: key, value: value)
     }
 
     // MARK: Argument parsing
