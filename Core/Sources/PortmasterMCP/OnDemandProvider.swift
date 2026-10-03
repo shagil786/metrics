@@ -339,6 +339,17 @@ public struct OnDemandProvider: DataProvider {
 
     // MARK: Settings
 
+    /// Current preferences.
+    ///
+    /// **Known asymmetry, deliberate.** `PreferencesStore.load()` falls back to
+    /// the defaults when the blob is missing *or undecodable*, while
+    /// `setPreference` refuses to write over an unreadable blob. That difference
+    /// is forced by the protocol: `settingsSnapshot()` cannot throw, so it must
+    /// answer something, and a default-valued snapshot is the least-wrong answer
+    /// available. The consequence is that `get_settings` can report defaults for a
+    /// preferences file this build cannot read — a caller who just wrote a
+    /// preference and reads back defaults is looking at this, not at a lost
+    /// write. Task 8's README limitations should say so.
     public func settingsSnapshot() -> SettingsSnapshot {
         let preferences = self.preferences.load()
         return SettingsSnapshot(
