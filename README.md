@@ -67,16 +67,16 @@ cd Core && swift build -c release --product portmaster-mcp
 The binary lands in SwiftPM's release bin directory; ask SwiftPM where that is rather than assuming a path, because it varies per machine and per toolchain:
 
 ```sh
-cd Core && swift build -c release --show-bin-path   # e.g. .build/out/Products/Release
+cd Core && swift build -c release --show-bin-path   # e.g. /Users/you/portmaster/Core/.build/out/Products/Release
 ```
 
-Register it with an MCP client once it is built. For Claude Code:
+Register it with an MCP client once it is built. For Claude Code, from the repository root:
 
 ```sh
-claude mcp add portmaster -- "$PWD/$(cd Core && swift build -c release --show-bin-path)/portmaster-mcp"
+claude mcp add portmaster -- "$(cd Core && swift build -c release --show-bin-path)/portmaster-mcp"
 ```
 
-Run that from the repository root. The registration stores the path **verbatim** and later spawns the binary with the client's own working directory, so a relative path would work only while launching from here — `$PWD` makes it absolute. This form registers in the default `--scope local`, meaning it is available in this project only; pass `--scope user` to make it available everywhere you use the client.
+Use the path exactly as `--show-bin-path` prints it — it is already absolute, so prefixing it with anything (`$PWD/`, say) yields a path that does not exist. It differs per machine and per toolchain, which is why the command asks rather than hardcodes; a toolchain that printed a relative path would need an absolute prefix before `claude mcp add` stores it, since the client spawns the binary with its own working directory rather than yours. This form registers in the default `--scope local`, meaning it is available in this project only; pass `--scope user` to make it available everywhere you use the client.
 
 `claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same absolute binary path. The executable takes no arguments and needs no environment; stdout carries JSON-RPC and nothing else.
 
