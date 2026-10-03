@@ -21,7 +21,7 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var projectSummaries: [PortmasterMCP.ProjectSummary] = []
     var trends: [AppHistoryTrend] = []
     var resourcePoints: [ResourceHistoryPoint] = []
-    var thermal: ThermalSample? = nil
+    var thermal: ThermalSample = .unknown
     var alerts: [ActingUpAlert] = []
     var alertSource: AlertSource = .historyApproximate
 
@@ -151,7 +151,7 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return resourcePoints
     }
 
-    func temperaturesFans() async throws -> ThermalSample? {
+    func temperaturesFans() async throws -> ThermalSample {
         try enter("temperaturesFans")
         return thermal
     }

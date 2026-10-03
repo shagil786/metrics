@@ -6,11 +6,14 @@ import PortmasterMCP
 /// temperatures/fans, active alerts, and settings.
 ///
 /// Most of these are about one distinction the payload has to keep honest: an
-/// *unavailable subsystem* (Docker daemon down, Docker absent, SMC sensors
-/// missing) is a state of the machine the caller asked about, so it comes back
-/// as data with `isError` false. Only genuinely bad input — an unknown range, an
-/// unknown resource — is an error. Collapsing the first case into the second
-/// would tell a caller "the call failed" when the machine simply answered.
+/// *unavailable subsystem* (Docker daemon down, Docker absent, sensors that
+/// answered with nothing) is a state of the machine the caller asked about, so it
+/// comes back as data with `isError` false. A subsystem that has not been observed
+/// yet is a different thing, and is an error. Only genuinely bad input — an
+/// unknown range, an unknown resource — is an error. Collapsing the first case
+/// into the second would tell a caller "the call failed" when the machine simply
+/// answered; collapsing the second into the first would assert a machine state
+/// nobody observed.
 final class ToolExecutorReadMoreTests: XCTestCase {
 
     // MARK: get_containers
@@ -264,20 +267,37 @@ final class ToolExecutorReadMoreTests: XCTestCase {
 
     // MARK: get_temperatures_fans
 
-    func testTemperaturesUnavailableIsDataNotError() async throws {
+    /// A provider that cannot answer refuses, and the refusal is the answer. The
+    /// payload's `available` flag describes sensors the machine reported, so a
+    /// sensor pass that has not reported anything must never be encoded as one.
+    func testTemperaturesRefusalIsAnErrorNotAnUnavailablePayload() async throws {
         let stub = StubProvider()
-        stub.thermal = nil
+        stub.fail("temperaturesFans", with: OnDemandProvider.thermalNotSampledMessage)
+        let tool = try makeExecutor(provider: stub)
+
+        let outcome = await tool.execute(name: "get_temperatures_fans", arguments: [:])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, OnDemandProvider.thermalNotSampledMessage)
+        XCTAssertFalse(
+            outcome.text.contains("available"),
+            "an unsampled sensor pass must not be dressed up as a payload: \(outcome.text)"
+        )
+    }
+
+    /// A sample that carries no reading is still a sample — it is what sensors
+    /// that answer with nothing look like — so it stays data, and the payload
+    /// says the readings are unavailable without sending a zero for any of them.
+    func testTemperaturesWithNoReadingsReportsUnavailable() async throws {
+        let stub = StubProvider()
+        stub.thermal = ThermalSample.unknown
         let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_temperatures_fans", arguments: [:])
 
         XCTAssertFalse(
             outcome.isError,
-            "absent SMC sensors are reported, not thrown: \(outcome.text)"
-        )
-        XCTAssertTrue(
-            outcome.text.contains("\"available\":false"),
-            "the payload must say so explicitly rather than send zeros: \(outcome.text)"
+            "a sampled-but-empty reading is data, not a refusal: \(outcome.text)"
         )
         let json = try jsonObject(outcome.text)
         XCTAssertEqual(json["available"] as? Bool, false)

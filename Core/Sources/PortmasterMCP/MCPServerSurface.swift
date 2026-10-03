@@ -16,6 +16,9 @@
 //     contradicting the very reason string it returns when liveness is false.
 //     Rebuilding it per call also re-reads the settings file, so a mode change
 //     takes effect without restarting the server.
+//
+// The provider is deliberately *not* per call: it owns the sampler, and the
+// sampler is expensive. `LiveMCPCallContext` builds it once and shares it.
 import Foundation
 import MCP
 
@@ -136,22 +139,32 @@ public protocol MCPCallContext: Sendable {
     func makeExecutor() -> ToolExecutor
 }
 
-/// The production context: the real provider, the real audit log, and a gate
+/// The production context: one real provider and the real audit log, plus a gate
 /// rebuilt from freshly observed state on every call.
 ///
 /// Slice 1 has no `MCPHost`, so `confirmEach` always denies with its documented
 /// message — the app has no way to be asked, and no path here pretends otherwise.
 public struct LiveMCPCallContext: MCPCallContext {
-    private let provider: @Sendable () -> any DataProvider
+    /// Built once, in `init`, and shared by every call. A provider owns a
+    /// `LiveSnapshotSource`, which owns a `SamplingEngine`, which owns the
+    /// snapshot cache — so a per-call provider means a per-call engine, and the
+    /// documented 5-second cache could never be hit in production. Two reads in
+    /// one agent turn would each pay a cold process sweep plus an `lsof` port
+    /// scan plus a `nettop` pass, and N concurrent calls would run N engines
+    /// over the same machine.
+    ///
+    /// The gate below is the opposite trade and stays per call; see
+    /// `makeExecutor()`.
+    private let provider: any DataProvider
     private let loadSettings: @Sendable () -> MCPSettings
     private let appRunning: @Sendable () -> Bool
     private let auditDirectory: URL?
     private let settingsDirectory: URL?
 
     /// - Parameters:
-    ///   - provider: builds the data provider. Defaults to a live
-    ///     `OnDemandProvider` over the same `settingsDirectory`; a test passes a
-    ///     stub so a call cannot touch the machine.
+    ///   - provider: the data provider. Defaults to a live `OnDemandProvider` over
+    ///     the same `settingsDirectory`; a test passes a stub so a call cannot
+    ///     touch the machine. Built once — see the note on `provider` above.
     ///   - loadSettings: re-reads the mutation policy. Called per call, so
     ///     changing the mode on disk takes effect without a restart.
     ///   - appRunning: probed per call, because the app can be launched or quit
@@ -159,13 +172,13 @@ public struct LiveMCPCallContext: MCPCallContext {
     ///   - auditDirectory: where mutation attempts are recorded.
     ///   - settingsDirectory: where `mcpMode` is written.
     public init(
-        provider: (@Sendable () -> any DataProvider)? = nil,
+        provider: (any DataProvider)? = nil,
         loadSettings: @escaping @Sendable () -> MCPSettings = { MCPSettings.load() },
         appRunning: @escaping @Sendable () -> Bool = { AppLiveness.isPortmasterRunning() },
         auditDirectory: URL? = nil,
         settingsDirectory: URL? = nil
     ) {
-        self.provider = provider ?? { OnDemandProvider(settingsDirectory: settingsDirectory) }
+        self.provider = provider ?? OnDemandProvider(settingsDirectory: settingsDirectory)
         self.loadSettings = loadSettings
         self.appRunning = appRunning
         self.auditDirectory = auditDirectory
@@ -174,9 +187,12 @@ public struct LiveMCPCallContext: MCPCallContext {
 
     public func makeExecutor() -> ToolExecutor {
         ToolExecutor(
-            provider: provider(),
-            // Both inputs are observed here rather than cached above: this is the
-            // whole reason the gate is constructed per call.
+            provider: provider,
+            // The gate is the one thing that must be observed per call, so both of
+            // its inputs are read here rather than captured above: a gate built
+            // once would keep permitting `allowSession` mutations after the user
+            // quit Portmaster, and re-reading the settings file is what makes a
+            // mode change take effect without a restart.
             gate: PermissionGate(settings: loadSettings(), appRunning: appRunning()),
             audit: AuditLog(directory: auditDirectory),
             settingsDirectory: settingsDirectory

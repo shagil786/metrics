@@ -466,26 +466,37 @@ final class OnDemandProviderTests: XCTestCase {
         }
     }
 
-    func testTemperaturesFansReportsAbsenceAsNil() async throws {
+    /// The sensor pass runs on the engine's slow lane, so the very first snapshot
+    /// after a cold start carries no thermal reading at all — and a nil reading in
+    /// that snapshot means "not sampled yet", not "this machine has no sensors".
+    /// The two must not look alike to a caller, so the unsampled snapshot refuses
+    /// and the sampled one answers.
+    func testTemperaturesDistinguishUnsampledFromSampled() async throws {
         let provider = OnDemandProvider(
             snapshotSource: StubSnapshotSource([
+                Self.makeSnapshot(cpuPercent: 10, thermal: nil),
                 Self.makeSnapshot(
                     cpuPercent: 10,
                     thermal: ThermalSample(
                         cpuTempC: 71.5, gpuTempC: nil, hottestTempC: 71.5, fans: []
                     )
-                ),
-                Self.makeSnapshot(cpuPercent: 10, thermal: nil)
+                )
             ]),
             appRunning: { false },
             cacheTTL: 0
         )
 
-        let present = try await provider.temperaturesFans()
-        XCTAssertEqual(present?.cpuTempC ?? 0, 71.5, accuracy: 0.001)
+        do {
+            _ = try await provider.temperaturesFans()
+            XCTFail("An unsampled sensor pass must not be reported as a machine with no sensors")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(error.message, OnDemandProvider.thermalNotSampledMessage)
+        }
 
-        let absent = try await provider.temperaturesFans()
-        XCTAssertNil(absent, "absent sensors stay absent; the payload reports that itself")
+        // The next snapshot does carry a sample, so the same tool now answers.
+        let sampled = try await provider.temperaturesFans()
+        XCTAssertEqual(sampled.cpuTempC ?? 0, 71.5, accuracy: 0.001)
+        XCTAssertEqual(sampled.hottestTempC ?? 0, 71.5, accuracy: 0.001)
     }
 
     // MARK: Projects

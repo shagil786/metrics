@@ -92,7 +92,7 @@ Nine read tools and four mutations. A read never changes anything; a mutation is
 | `get_containers` | Docker containers, and whether Docker is installed / daemon up / down | — |
 | `get_projects` | Detected repositories with process counts and listening ports | — |
 | `get_history_rankings` | Apps ranked by recorded CPU time over a window. **Passing `resource` switches the response shape**: you get that one resource's recorded readings as `{at, metric, value}` points, which belong to no app — not per-app rankings | `range` (required: `1h`/`12h`/`24h`/`7d`/`30d`), `resource` (optional; changes the response shape, see the note below) |
-| `get_temperatures_fans` | Sensor temperatures and fan RPMs, or "unavailable" | — |
+| `get_temperatures_fans` | Sensor temperatures and fan RPMs | — |
 | `get_active_alerts` | "This app is acting up" observations, with provenance | — |
 | `get_settings` | Current preferences, including the MCP mutation mode | — |
 | `quit_app` | **Mutation** — quit an app's processes | `id` (required), `force` (optional, default false) |
@@ -100,7 +100,7 @@ Nine read tools and four mutations. A read never changes anything; a mutation is
 | `stop_project` | **Mutation** — stop every process in a detected project | `id` (required) |
 | `set_preference` | **Mutation** — change one allowlisted preference | `key`, `value` (both required) |
 
-A value that has not been measured is **left out** of the payload rather than filled with a plausible zero. What "left out" looks like depends on the shape: an entire section of `get_system_overview` (say `battery`) is simply absent, and `get_temperatures_fans` adds `available: false`; but inside a *series* such as a `get_history_rankings` resource reading, each point is present and only its `value` is absent — so treat a missing `value` as a gap in the line, not as a zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
+A value that has not been measured is **left out** of the payload rather than filled with a plausible zero. What "left out" looks like depends on the shape: an entire section of `get_system_overview` (say `battery`) is simply absent, and inside a *series* such as a `get_history_rankings` resource reading, each point is present and only its `value` is absent — so treat a missing `value` as a gap in the line, not as a zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
 
 ### Mutation modes
 
@@ -136,6 +136,7 @@ Every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log
 - **Preference writes need the app closed.** With Portmaster running, it holds preferences in memory and rewrites the whole blob on its next change, which would erase what MCP just wrote, so `set_preference` refuses (except `mcpMode`, which the app never holds). Use the app's own Settings while it is open.
 - **Alerts are history-approximate.** `get_active_alerts` reports `source: "history-approximate"` and reconstructs sustained-CPU and memory-growth alerts from recorded history: the observation is real, its freshness is not. Per-app disk and network hammering is live-only and is therefore *not* fabricated — those alert kinds simply do not appear from history.
 - **`get_settings` can report defaults it did not read.** When the preferences blob cannot be decoded, the read falls back to default values while writes refuse over the same blob. Reading back defaults right after a successful write means this, not a lost write.
+- **`get_temperatures_fans` says "not known yet" rather than "no sensors".** The SMC pass runs on the sampler’s slow lane and lands a tick after it is kicked, so the first read on a cold sampler has no reading at all. Rather than answer `available: false` — which would be a claim about the hardware that nothing observed — the tool refuses with *“Temperature and fan readings are not known yet; the first sensor pass has not finished.”* A machine whose sensors genuinely answer with nothing produces the same refusal, because the two are indistinguishable from a single snapshot. Retry a moment later.
 - **Reads have a ~10 s budget.** The first read on a cold sampler waits for a full process sweep, port scan and `nettop` pass. If that budget expires the tool says *"No reading available yet; the sampler is still starting."* instead of returning zeros — retry a moment later.
 - **`stop_container` shells out to Docker.** It runs `docker stop -- <id>` with fixed argv (no shell), so Docker must be installed with the daemon up.
 - **No app-driven provider, no in-app confirmation, no live alert engine.** Slice 1 is stdio + on-demand sampling only.

@@ -84,11 +84,18 @@ struct HistoryTrendPayload: Encodable {
     }
 }
 
-/// Uniform shape for sensors: `available` false means "this machine reports no
-/// SMC sensor". The synthesized `Encodable` **omits** nil keys rather than
-/// emitting `null`, so on such a machine the readings are absent entirely
-/// (`{"available":false,"fans":[]}`) — never a fabricated zero. Anything reading
-/// these must treat a missing reading as unavailable rather than defaulting it.
+/// Uniform shape for sensors.
+///
+/// `available` is computed from the sample rather than hard-coded, so it reports
+/// what this sample actually carries: a reading, or a sensor group that answered
+/// with nothing. It is *not* a claim about whether the machine has sensors at
+/// all — the provider refuses a read whose sensor pass has not landed yet, so a
+/// payload always describes an observation.
+///
+/// The synthesized `Encodable` **omits** nil keys rather than emitting `null`, so
+/// a sensor that did not answer is absent entirely — never a fabricated zero.
+/// Anything reading these must treat a missing reading as unavailable rather
+/// than defaulting it.
 struct TemperaturesPayload: Encodable {
     let available: Bool
     let cpuTempC: Double?
@@ -96,12 +103,15 @@ struct TemperaturesPayload: Encodable {
     let hottestTempC: Double?
     let fans: [FanPayload]
 
-    init(_ thermal: ThermalSample?) {
-        available = thermal != nil
-        cpuTempC = thermal?.cpuTempC
-        gpuTempC = thermal?.gpuTempC
-        hottestTempC = thermal?.hottestTempC
-        fans = thermal?.fans.map(FanPayload.init) ?? []
+    init(_ thermal: ThermalSample) {
+        available = thermal.cpuTempC != nil
+            || thermal.gpuTempC != nil
+            || thermal.hottestTempC != nil
+            || !thermal.fans.isEmpty
+        cpuTempC = thermal.cpuTempC
+        gpuTempC = thermal.gpuTempC
+        hottestTempC = thermal.hottestTempC
+        fans = thermal.fans.map(FanPayload.init)
     }
 }
 

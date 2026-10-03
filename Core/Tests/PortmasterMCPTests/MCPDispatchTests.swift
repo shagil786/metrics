@@ -59,6 +59,47 @@ final class MCPDispatchTests: XCTestCase {
         XCTAssertEqual(first.text, second.text)
     }
 
+    /// The provider is the other half of the seam, and it must *not* be per call.
+    ///
+    /// A provider owns the sampler, and the sampler is expensive: a cold engine
+    /// pays a process sweep, an `lsof` port scan and a `nettop` pass before it has
+    /// anything to say. Building one per call would also make the documented 5 s
+    /// snapshot cache unreachable — a cache with no owner is not a cache — so two
+    /// reads in one agent turn would each pay a full sweep, and N concurrent reads
+    /// would run N engines over the same machine.
+    ///
+    /// The context is *given* the provider rather than a factory that makes one, so
+    /// the second read here is answered by the same cache the first one filled.
+    func testTwoReadsThroughTheLiveContextShareOneProvider() async throws {
+        let source = StubSnapshotSource([OnDemandProviderTests.makeSnapshot(cpuPercent: 42)])
+        let provider = OnDemandProvider(
+            snapshotSource: source,
+            appRunning: { false },
+            cacheTTL: 5
+        )
+        let context = LiveMCPCallContext(
+            provider: provider,
+            loadSettings: { MCPSettings(mode: .off) },
+            appRunning: { false },
+            auditDirectory: try makeTemporaryDirectory(prefix: name)
+        )
+
+        let first = await MCPDispatch.call(
+            name: "get_system_overview", arguments: [:], context: context
+        )
+        let second = await MCPDispatch.call(
+            name: "get_system_overview", arguments: [:], context: context
+        )
+
+        XCTAssertFalse(first.isError, first.text)
+        XCTAssertFalse(second.isError, second.text)
+        XCTAssertEqual(
+            source.callCount, 1,
+            "the second read must be answered by the snapshot the first one collected"
+        )
+        XCTAssertEqual(first.text, second.text)
+    }
+
     /// The reason this seam exists at all.
     ///
     /// `PermissionGate` takes `appRunning` as a construction-time snapshot, so a
@@ -70,7 +111,7 @@ final class MCPDispatchTests: XCTestCase {
         let provider = StubProvider()
         let running = LivenessStub(startsRunning: true)
         let context = LiveMCPCallContext(
-            provider: { provider },
+            provider: provider,
             loadSettings: { MCPSettings(mode: .allowSession) },
             appRunning: { running.isRunning },
             auditDirectory: auditDirectory
@@ -110,7 +151,7 @@ final class MCPDispatchTests: XCTestCase {
         let settings = SettingsStub(MCPSettings(mode: .off))
         let provider = StubProvider()
         let context = LiveMCPCallContext(
-            provider: { provider },
+            provider: provider,
             loadSettings: { settings.current },
             appRunning: { false },
             auditDirectory: auditDirectory,

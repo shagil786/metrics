@@ -31,11 +31,12 @@ public protocol SnapshotSource: Sendable {
 /// type's, and the two choices cost different things. A caller that holds one
 /// source across calls gets continuing sampling — which several readings need,
 /// since CPU and disk rates are differences between sweeps and per-process
-/// network needs a `nettop` pass. A caller that builds a source per call pays a
-/// cold sweep every time instead; slice 1's `LiveMCPCallContext` does exactly
-/// that, which is why a read carries a ~10 s budget for its first reading.
-/// Neither behavior should be assumed from the type — check how the source is
-/// owned.
+/// network needs a `nettop` pass — and the provider's snapshot cache is only
+/// reachable that way. A caller that builds a source per call pays a cold sweep
+/// every time instead; slice 1's `LiveMCPCallContext` therefore builds its
+/// provider once, in `init`, which is also why a read carries a ~10 s budget for
+/// its first reading. Neither behavior should be assumed from the type — check how
+/// the source is owned.
 public final class LiveSnapshotSource: SnapshotSource, @unchecked Sendable {
     /// The engine a live source collects from. Injected so a caller (or a test)
     /// can supply fixture collectors without this file knowing about them.

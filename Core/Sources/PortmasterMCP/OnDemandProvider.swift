@@ -49,6 +49,11 @@ public struct OnDemandProvider: DataProvider {
         "Portmaster is running; close it before changing preferences via MCP "
         + "(live writes arrive with the MCP host)."
 
+    /// Said when no thermal reading has been sampled yet. One string for the
+    /// refusal, so the payload can never be reached with nothing behind it.
+    public static let thermalNotSampledMessage =
+        "Temperature and fan readings are not known yet; the first sensor pass has not finished."
+
     /// How long to keep a collected snapshot before collecting again.
     public static let defaultCacheTTL: TimeInterval = 5
     /// Budget for the first reading of a call. Generous because a cold sampler
@@ -198,10 +203,16 @@ public struct OnDemandProvider: DataProvider {
         return docker
     }
 
-    public func temperaturesFans() async throws -> ThermalSample? {
-        // nil here is real information: the payload reports `available: false`
-        // with null readings, which is exactly what "no SMC sensors" means.
-        try await snapshot().system.thermal
+    public func temperaturesFans() async throws -> ThermalSample {
+        // nil here is not "no SMC sensor". The sensor pass runs on the engine's
+        // slow lane and lands a tick after it is kicked, so the first snapshot of
+        // a cold engine has no thermal sample in it at all — and answering
+        // `available: false` for that would be a claim about the user's hardware
+        // that nothing observed. Refuse the way `containers()` does instead.
+        guard let thermal = try await snapshot().system.thermal else {
+            throw MCPToolError(message: Self.thermalNotSampledMessage)
+        }
+        return thermal
     }
 
     public func projects() async throws -> [ProjectSummary] {
