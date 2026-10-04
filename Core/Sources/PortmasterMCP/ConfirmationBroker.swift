@@ -56,10 +56,16 @@ public enum ApprovalOutcome: Equatable, Sendable {
 ///   queues instead of stacking prompts, because a person who sees three dialogs
 ///   at once can approve the wrong one. Only the request at the head of the queue
 ///   is presented; the rest wait their turn.
-/// - **A stale answer is inert.** A decision that arrives after the timeout, for
-///   an unknown id, or for a request a later one already replaced, finds nothing
-///   to resume and does nothing. Resuming a `CheckedContinuation` twice traps, so
-///   this is the one path that is not allowed to be clever.
+/// - **A stale answer is inert — as long as ids are not reused.** A decision that
+///   arrives after the timeout, or for an id nobody asked about, finds nothing to
+///   resume and does nothing. Resuming a `CheckedContinuation` twice traps, so
+///   this is the one path that is not allowed to be clever. An answer to an id
+///   that a *later* request has since taken is the one exception: the broker
+///   matches by id because that is all a presenter holds, so it would resolve
+///   that new request instead. Budget tasks are immune — they act on their own
+///   entry by identity — so the rule is only ever about answers. Ids come from
+///   `UUID()` and nothing in the slice regenerates them; see the id-reuse rule
+///   in `request` for the whole of it.
 public actor ConfirmationBroker {
 
     public static let defaultTimeout: TimeInterval = 60
@@ -150,6 +156,11 @@ public actor ConfirmationBroker {
     /// caller knows. The reason is what reaches the AI client, so it should name
     /// what went wrong. There is deliberately no error case here: an outcome the
     /// model can read is worth more than a thrown error it has to translate.
+    ///
+    /// Ids are never reused: a request id identifies one request for as long as the
+    /// broker remembers it, so a late answer to a decided request cannot land on a
+    /// later one. `UUID()` is the default and nothing in the slice regenerates ids,
+    /// which is what makes that hold.
     public func request(_ request: MCPApprovalRequest) async -> ApprovalOutcome {
         // Two live entries sharing an id would make `decide` ambiguous — a
         // stale answer could be delivered to the wrong caller — so the second

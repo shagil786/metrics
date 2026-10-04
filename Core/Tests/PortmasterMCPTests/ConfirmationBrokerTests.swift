@@ -228,7 +228,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(pending, [])
     }
 
-        // MARK: - Answering a request that is not the one on screen
+    // MARK: - Answering a request that is not the one on screen
 
     /// A presenter may be holding a request that has been superseded, or a window
     /// that outlived the queue. `decide` answers by id wherever the request is, so
