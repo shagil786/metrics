@@ -755,11 +755,15 @@ private func XCTUnwrapHost<T>(_ value: T?, _ message: String = "unwrapped") thro
 
 /// A context over a stub provider, so a call over the socket cannot reach the
 /// machine it runs on.
-private struct StubMCPContext: MCPCallContext {
+private struct StubMCPContext: MCPToolCalling {
     let auditDirectory: URL
     let settingsDirectory: URL
 
-    func makeExecutor() -> ToolExecutor {
+    func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+        await makeExecutor().execute(name: name, arguments: arguments)
+    }
+
+    private func makeExecutor() -> ToolExecutor {
         ToolExecutor(
             provider: StubProvider(),
             gate: PermissionGate(settings: MCPSettings(mode: .off), appRunning: false),

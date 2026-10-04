@@ -33,7 +33,7 @@ public protocol SnapshotSource: Sendable {
 /// since CPU and disk rates are differences between sweeps and per-process
 /// network needs a `nettop` pass — and the provider's snapshot cache is only
 /// reachable that way. A caller that builds a source per call pays a cold sweep
-/// every time instead; slice 1's `LiveMCPCallContext` therefore builds its
+/// every time instead; slice 1's `LocalMCPCallContext` therefore builds its
 /// provider once, in `init`, which is also why a read carries a ~10 s budget for
 /// its first reading. Neither behavior should be assumed from the type — check how
 /// the source is owned.

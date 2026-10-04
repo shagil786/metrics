@@ -18,7 +18,7 @@
 //     takes effect without restarting the server.
 //
 // The provider is deliberately *not* per call: it owns the sampler, and the
-// sampler is expensive. `LiveMCPCallContext` builds it once and shares it.
+// sampler is expensive. `LocalMCPCallContext` builds it once and shares it.
 import Foundation
 import MCP
 
@@ -130,21 +130,29 @@ public enum MCPArguments {
 
 // MARK: - Per-call context
 
-/// Supplies the executor for one `tools/call`.
+/// Answers one tool call.
 ///
-/// A protocol rather than a stored executor so that "per call" is structural:
-/// there is nowhere to cache one.
-public protocol MCPCallContext: Sendable {
-    /// A ready-to-run executor. Called once per tool call, never once per process.
-    func makeExecutor() -> ToolExecutor
+/// Widened from slice 1's `makeExecutor() -> ToolExecutor` so that a surface which
+/// does not hold an executor at all can be plugged in beside one that does. Slice 1's
+/// only caller was this process, and "hand me a thing I can run a call on" said
+/// nothing about *where* that thing ran; now the CLI relays to the running app when
+/// there is one, and this protocol is what both paths satisfy.
+///
+/// A protocol rather than a stored executor so that "per call" is structural: there is
+/// nowhere to cache one. It is also why "one authority per call" is enforceable — a
+/// context is asked to answer a call, and the answer is whatever it alone decides.
+public protocol MCPToolCalling: Sendable {
+    /// Runs one call and reports it as data, never as a thrown error: a failure is
+    /// something the host has to render.
+    func call(name: String, arguments: [String: String]) async -> ToolOutcome
 }
 
-/// The production context: one real provider and the real audit log, plus a gate
+/// The on-demand context: one real provider and the real audit log, plus a gate
 /// rebuilt from freshly observed state on every call.
 ///
 /// Slice 1 has no `MCPHost`, so `confirmEach` always denies with its documented
 /// message — the app has no way to be asked, and no path here pretends otherwise.
-public struct LiveMCPCallContext: MCPCallContext {
+public struct LocalMCPCallContext: MCPToolCalling {
     /// Built once, in `init`, and shared by every call. A provider owns a
     /// `LiveSnapshotSource`, which owns a `SamplingEngine`, which owns the
     /// snapshot cache — so a per-call provider means a per-call engine, and the
@@ -185,14 +193,29 @@ public struct LiveMCPCallContext: MCPCallContext {
         self.settingsDirectory = settingsDirectory
     }
 
-    public func makeExecutor() -> ToolExecutor {
+    public func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+        await makeExecutor().execute(name: name, arguments: arguments)
+    }
+
+    /// A ready-to-run executor, built fresh for one call.
+    ///
+    /// Slice 1's seam, kept as it was rather than inlined into `call`, because both of
+    /// its properties are load-bearing and both are invisible once they are:
+    ///
+    ///  - the **gate is per call**. `PermissionGate` takes the mutation mode and the
+    ///    app's liveness as construction-time values, so a gate built once would keep
+    ///    permitting `allowSession` mutations after the user quit Portmaster, and
+    ///    re-reading the settings file is what makes a mode change take effect without a
+    ///    restart. Both inputs are read here, per call, rather than captured above.
+    ///  - the **provider is not per call**. It owns the sampler, and the sampler is
+    ///    expensive; see `provider` above.
+    ///
+    /// The proxied path never reaches this method at all: the app's own executor is the
+    /// only authority for a relayed call, so there is never a second gate ruling on the
+    /// same mutation.
+    func makeExecutor() -> ToolExecutor {
         ToolExecutor(
             provider: provider,
-            // The gate is the one thing that must be observed per call, so both of
-            // its inputs are read here rather than captured above: a gate built
-            // once would keep permitting `allowSession` mutations after the user
-            // quit Portmaster, and re-reading the settings file is what makes a
-            // mode change take effect without a restart.
             gate: PermissionGate(settings: loadSettings(), appRunning: appRunning()),
             audit: AuditLog(directory: auditDirectory),
             settingsDirectory: settingsDirectory
@@ -208,12 +231,16 @@ public enum MCPDispatch {
     /// as data with `isError` set, never as a JSON-RPC error, because a transport
     /// error tells the caller the connection broke rather than that the tool
     /// refused.
+    ///
+    /// `context` is asked to answer the call rather than asked for an executor, so
+    /// whether it runs the call here or forwards it to a running app is not this
+    /// function's business — and cannot become its bug.
     public static func call(
         name: String,
         arguments: [String: String],
-        context: any MCPCallContext
+        context: any MCPToolCalling
     ) async -> ToolOutcome {
-        await context.makeExecutor().execute(name: name, arguments: arguments)
+        await context.call(name: name, arguments: arguments)
     }
 }
 
@@ -253,7 +280,7 @@ public enum MCPServerSurface {
     /// Every wait here is bounded. A handler that hangs costs the deadline and
     /// nothing more: no client can keep the server alive by work it will not finish.
     public static func serveSession(
-        context: any MCPCallContext,
+        context: any MCPToolCalling,
         transport: any Transport
     ) async throws {
         let server = makeServer()
@@ -276,7 +303,7 @@ public enum MCPServerSurface {
     /// The tracker is returned rather than hidden because the caller has to wait
     /// on it before shutting down — see `serveSession`.
     @discardableResult
-    public static func configure(_ server: Server, context: any MCPCallContext) async
+    public static func configure(_ server: Server, context: any MCPToolCalling) async
         -> CallTracker
     {
         let tracker = CallTracker()

@@ -61,7 +61,7 @@ public final class MCPHostServer: @unchecked Sendable {
 
     private let boundSocketURL: URL
     private let endpointDirectory: URL?
-    private let context: any MCPCallContext
+    private let context: any MCPToolCalling
 
     private let lock = NSLock()
     /// The token this launch minted. Read by the handshake check and nowhere else:
@@ -96,7 +96,7 @@ public final class MCPHostServer: @unchecked Sendable {
     ///     the token would be real.
     ///   - context: the shared call context. Built once and shared by every connection —
     ///     see the note at the top of this file.
-    public init(socketURL: URL, endpointDirectory: URL?, context: any MCPCallContext) {
+    public init(socketURL: URL, endpointDirectory: URL?, context: any MCPToolCalling) {
         self.boundSocketURL = socketURL
         self.endpointDirectory = endpointDirectory
         self.context = context

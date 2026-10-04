@@ -75,30 +75,57 @@ public enum MCPStdioRunner {
     /// loop the caller has: everything below belongs to whoever called it. Call
     /// `runMain` for the stdio process.
     ///
+    /// `context` is a call surface, not an executor factory, so the same `serve`
+    /// serves the on-demand path and the relayed one without knowing which it has.
+    ///
     /// The session itself lives in `MCPServerSurface.serveSession`, which the socket
     /// host also calls — the two transports must serve the same `initialize` and
     /// drain the same way, so there is one implementation of both rather than two
     /// that agree today.
-    public static func serve(context: any MCPCallContext, transport: any Transport) async throws {
+    public static func serve(context: any MCPToolCalling, transport: any Transport) async throws {
         try await MCPServerSurface.serveSession(context: context, transport: transport)
     }
 
     /// Serves MCP on stdin/stdout until the client closes stdin. Does not return:
     /// the caller exits the process.
     ///
+    /// With no `context`, the route is chosen **once**, here, before anything is
+    /// served: relay to a running Portmaster if there is one, otherwise do the work
+    /// this process does exactly as slice 1 did. It is a single decision rather than a
+    /// per-call one on purpose — a call must have exactly one authority, and deciding
+    /// per call is how a mutation ends up gated twice or answered from two different
+    /// snapshots.
+    ///
     /// Only diagnostics go to stderr, and only if the session could not be
     /// served at all. stdout carries JSON-RPC and nothing else.
-    public static func runMain(context: any MCPCallContext = LiveMCPCallContext()) {
+    ///
+    /// - Parameter context: serves this surface instead of routing. For a test that
+    ///   wants one specific authority; the executable passes none.
+    public static func runMain(context: (any MCPToolCalling)? = nil) {
         let session = SessionOutcome()
 
         // Detached so the session is served by the concurrency pool and the main
         // thread stays free to run its run loop. Nothing in `serve` or in
         // `ToolExecutor` is main-actor isolated, so this costs nothing.
         Task.detached(priority: .userInitiated) {
+            var relayed: SocketMCPClient?
             do {
-                try await serve(context: context, transport: StdioTransport())
+                let surface: any MCPToolCalling
+                if let context {
+                    surface = context
+                } else {
+                    let route = await MCPRouteSelector.select()
+                    if case .proxy(let client) = route { relayed = client }
+                    surface = route.context
+                }
+                try await serve(context: surface, transport: StdioTransport())
+                await relayed?.disconnect()
                 session.finish(error: nil)
             } catch {
+                // The session is over either way, so a relayed socket is closed either
+                // way: a CLI that exits leaving a descriptor and a reader thread behind
+                // is a CLI whose exit path is not the one that was tested.
+                await relayed?.disconnect()
                 session.finish(error: error)
             }
         }

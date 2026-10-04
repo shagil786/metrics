@@ -156,17 +156,21 @@ final class ClientRegistry: @unchecked Sendable {
 
 // MARK: - Recording
 
-/// Stamps a connection's `lastCallAt` every time an executor is asked for.
+/// Stamps a connection's `lastCallAt` every time a call is asked of the context.
 ///
-/// The stamp is the point, and it is exact: `MCPCallContext.makeExecutor` is called
-/// once per `tools/call` and never once per process, so this fires for tool calls and
-/// for nothing else. No slice-1 wiring is changed to arrange it.
-struct RecordingContext: MCPCallContext {
-    let base: any MCPCallContext
+/// The stamp is the point, and it is exact: `MCPToolCalling.call` is reached once per
+/// `tools/call` and never once per process, so this fires for tool calls and for
+/// nothing else. No slice-1 wiring is changed to arrange it.
+///
+/// Forwards rather than replacing, so the shared provider and the shared sampler
+/// behind `base` survive — and so nothing about who *answers* a call is changed by
+/// the fact that we are watching it.
+struct RecordingContext: MCPToolCalling {
+    let base: any MCPToolCalling
     let onCall: @Sendable () -> Void
 
-    func makeExecutor() -> ToolExecutor {
+    func call(name: String, arguments: [String: String]) async -> ToolOutcome {
         onCall()
-        return base.makeExecutor()
+        return await base.call(name: name, arguments: arguments)
     }
 }

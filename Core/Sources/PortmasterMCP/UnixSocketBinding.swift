@@ -104,6 +104,42 @@ enum UnixSocketBinding {
         return connected == 0
     }
 
+    /// Connects to `path`, or returns `nil` when nothing is listening.
+    ///
+    /// The client's half of the binding, and `nil` rather than a throw because "there
+    /// is no app here" is an answer a caller acts on, not a failure to recover from.
+    ///
+    /// `SO_NOSIGPIPE` is set on the way out, and it is not optional polish. A write to a
+    /// socket whose peer has gone raises `SIGPIPE`, whose default action kills the
+    /// process — so without this, a CLI whose Portmaster quit between two tool calls
+    /// would die mid-conversation instead of returning a tool error, which is the one
+    /// thing slice 2 promises cannot happen. The host side has the same exposure when a
+    /// client disappears, and it is set on both sides because one `connect` helper is
+    /// where both halves live.
+    static func connect(path: String) -> UnixSocket? {
+        guard var address = try? socketAddress(path: path) else { return nil }
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return nil }
+
+        var enabled: Int32 = 1
+        setsockopt(
+            descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+            socklen_t(MemoryLayout.size(ofValue: enabled))
+        )
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else {
+            close(descriptor)
+            return nil
+        }
+        // Ownership moves to the socket, whose `close` is idempotent — so every failure
+        // path above can close freely and this one must not.
+        return UnixSocket(descriptor)
+    }
+
     /// `sockaddr_un` for `path`.
     ///
     /// Throws rather than truncating: a truncated path would bind a socket at a

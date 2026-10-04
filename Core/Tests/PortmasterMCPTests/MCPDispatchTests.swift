@@ -12,9 +12,9 @@ import XCTest
 
 final class MCPDispatchTests: XCTestCase {
 
-    /// A context that hands out a fresh executor every time and counts them.
-    /// `@unchecked Sendable` because the count is guarded by a lock.
-    private final class CountingContext: MCPCallContext, @unchecked Sendable {
+    /// A context that answers by handing out a fresh executor every time, and counts
+    /// them. `@unchecked Sendable` because the count is guarded by a lock.
+    private final class CountingContext: MCPToolCalling, @unchecked Sendable {
         private let lock = NSLock()
         private var made = 0
         private let executor: @Sendable () -> ToolExecutor
@@ -23,9 +23,12 @@ final class MCPDispatchTests: XCTestCase {
 
         var executorsMade: Int { lock.withLock { made } }
 
-        func makeExecutor() -> ToolExecutor {
-            lock.withLock { made += 1 }
-            return executor()
+        func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+            let tool = lock.withLock { () -> ToolExecutor in
+                made += 1
+                return executor()
+            }
+            return await tool.execute(name: name, arguments: arguments)
         }
     }
 
@@ -77,7 +80,7 @@ final class MCPDispatchTests: XCTestCase {
             appRunning: { false },
             cacheTTL: 5
         )
-        let context = LiveMCPCallContext(
+        let context = LocalMCPCallContext(
             provider: provider,
             loadSettings: { MCPSettings(mode: .off) },
             appRunning: { false },
@@ -110,7 +113,7 @@ final class MCPDispatchTests: XCTestCase {
         let auditDirectory = try makeTemporaryDirectory(prefix: name)
         let provider = StubProvider()
         let running = LivenessStub(startsRunning: true)
-        let context = LiveMCPCallContext(
+        let context = LocalMCPCallContext(
             provider: provider,
             loadSettings: { MCPSettings(mode: .allowSession) },
             appRunning: { running.isRunning },
@@ -150,7 +153,7 @@ final class MCPDispatchTests: XCTestCase {
         let settingsDirectory = try makeTemporaryDirectory(prefix: name)
         let settings = SettingsStub(MCPSettings(mode: .off))
         let provider = StubProvider()
-        let context = LiveMCPCallContext(
+        let context = LocalMCPCallContext(
             provider: provider,
             loadSettings: { settings.current },
             appRunning: { false },
