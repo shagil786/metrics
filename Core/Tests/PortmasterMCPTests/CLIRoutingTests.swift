@@ -370,6 +370,20 @@ private final class RecordingHostContext: MCPToolCalling, @unchecked Sendable {
     }
 }
 
+/// The app's own answer to `tools/list`.
+///
+/// Lives here rather than in `SocketMCPClient` because nothing in production asks it: it
+/// exists so "the catalog is the same either way" can be checked against a real host
+/// rather than against this process's idea of what the host would say.
+private extension SocketMCPClient {
+    func listedToolNames() async throws -> [String] {
+        let client = try XCTUnwrap(
+            mcpClient, "the client must be connected before its catalog can be asked for"
+        )
+        return try await client.listTools().tools.map(\.name)
+    }
+}
+
 /// Runs `body` with this process's stderr redirected into a temporary file, and returns
 /// what was written to it.
 ///
