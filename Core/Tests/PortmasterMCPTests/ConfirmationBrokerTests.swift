@@ -21,7 +21,6 @@ import PortmasterMCP
 import XCTest
 
 final class ConfirmationBrokerTests: XCTestCase {
-
     // MARK: - Approve and deny
 
     func testApproveReturnsApproved() async throws {
@@ -86,7 +85,7 @@ final class ConfirmationBrokerTests: XCTestCase {
 
         let (secondBox, _) = start(broker, second)
         await waitWhileSuspended(secondBox)
-        XCTAssertNil(secondBox.result, "a queued request must stay suspended")
+        XCTAssertNil(secondBox.outcome, "a queued request must stay suspended")
         let whileQueued = await pendingIDs(broker)
         XCTAssertEqual(
             whileQueued, [first.id],
@@ -117,7 +116,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         await broker.decide(id: UUID(), outcome: .approved)
         await broker.decide(id: UUID(), outcome: .denied(reason: "wrong request"))
         await waitWhileSuspended(box)
-        XCTAssertNil(box.result, "an unknown id must not resume anything")
+        XCTAssertNil(box.outcome, "an unknown id must not resume anything")
         let unchanged = await pendingIDs(broker)
         XCTAssertEqual(unchanged, [id], "an unknown id must leave the queue alone")
 
@@ -162,6 +161,70 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(afterTimeout, [], "timed out leaves nothing pending")
     }
 
+    /// A burst that nobody answers has to terminate request by request, not just
+    /// for the one that happened to be on screen. Both budgets lapse within the
+    /// same window here, so the second expiry may find itself at the head or
+    /// behind the first; either way each caller gets its own `.timedOut` and the
+    /// queue drains completely.
+    func testAQueuedRequestTimesOutBehindTheFirst() async throws {
+        let broker = ConfirmationBroker(timeout: 0.05)
+        let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
+        let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
+
+        let (firstBox, _) = start(broker, first)
+        await waitForPending(broker, 1)
+        let (secondBox, _) = start(broker, second)
+        await waitForQueued(broker, 2)
+
+        // Nobody decides either. The queued one must not be stranded behind the
+        // presented one, and must not be resumed by the other's timer either.
+        let firstOutcome = try await waitForOutcome(firstBox)
+        XCTAssertEqual(firstOutcome, .timedOut)
+        let secondOutcome = try await waitForOutcome(secondBox)
+        XCTAssertEqual(secondOutcome, .timedOut)
+        let remaining = await broker.queuedCount
+        XCTAssertEqual(remaining, 0, "a lapsed burst leaves nothing queued")
+        let pending = await pendingIDs(broker)
+        XCTAssertEqual(pending, [])
+    }
+
+    // MARK: - Answering a request that is not the one on screen
+
+    /// A presenter may be holding a request that has been superseded, or a window
+    /// that outlived the queue. `decide` answers by id wherever the request is, so
+    /// answering a queued request reaches that caller and leaves the presented one
+    /// alone — the alternative, restricting `decide` to the head, would strand
+    /// every request behind an answer the user already gave.
+    func testDecideAnswersAQueuedRequestWithoutDisturbingTheHead() async throws {
+        let broker = ConfirmationBroker(timeout: 5)
+        let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
+        let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
+
+        let (firstBox, _) = start(broker, first)
+        let presented = await waitForPending(broker, 1)
+        XCTAssertEqual(presented.map(\.id), [first.id])
+        let (secondBox, _) = start(broker, second)
+        await waitForQueued(broker, 2)
+
+        await broker.decide(id: second.id, outcome: .approved)
+        let secondOutcome = try await waitForOutcome(secondBox)
+        XCTAssertEqual(secondOutcome, .approved, "the answer must reach its own caller")
+
+        await waitWhileSuspended(firstBox)
+        XCTAssertNil(
+            firstBox.outcome,
+            "answering the queued request must not decide the presented one"
+        )
+        let stillPresented = await pendingIDs(broker)
+        XCTAssertEqual(stillPresented, [first.id], "the head is untouched")
+        let depth = await broker.queuedCount
+        XCTAssertEqual(depth, 1)
+
+        await broker.decide(id: first.id, outcome: .approved)
+        let firstOutcome = try await waitForOutcome(firstBox)
+        XCTAssertEqual(firstOutcome, .approved)
+    }
+
     func testCancelAllDeniesEverythingPending() async throws {
         let broker = ConfirmationBroker(timeout: 5)
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
@@ -171,10 +234,9 @@ final class ConfirmationBrokerTests: XCTestCase {
         let presented = await waitForPending(broker, 1)
         XCTAssertEqual(presented.map(\.id), [first.id])
         let (secondBox, _) = start(broker, second)
-        // The queued request has to have reached the actor before the shutdown
-        // happens, or `cancelAll` would legitimately miss it and this test would
-        // be measuring scheduling luck rather than the broker.
-        await waitWhileSuspended(secondBox, duration: 0.2)
+        // Wait for the enqueue itself rather than a slice of real time: `pending`
+        // cannot show a request that is still waiting its turn.
+        await waitForQueued(broker, 2)
 
         await broker.cancelAll(reason: "Portmaster is quitting.")
 
@@ -186,6 +248,18 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(secondOutcome, .denied(reason: "Portmaster is quitting."))
         let remaining = await pendingIDs(broker)
         XCTAssertEqual(remaining, [])
+
+        // `cancelAll` is a bulk denial of what is queued, not a close: whether the
+        // broker stops accepting requests is the caller's decision to make, not a
+        // side effect of shutting a batch down. A caller that comes back afterwards
+        // must be served, or a late tool call would hang for its whole budget.
+        let later = makeRequest(kind: .setPreference, summary: "Change temperatureUnit")
+        let (laterBox, _) = start(broker, later)
+        let laterPresented = await waitForPending(broker, 1)
+        XCTAssertEqual(laterPresented.map(\.id), [later.id])
+        await broker.decide(id: later.id, outcome: .approved)
+        let laterOutcome = try await waitForOutcome(laterBox)
+        XCTAssertEqual(laterOutcome, .approved, "the broker keeps serving after a bulk denial")
     }
 
     func testAFailedDecisionDoesNotLeakTheContinuation() async throws {
@@ -196,7 +270,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         let (firstBox, _) = start(broker, first)
         await waitForPending(broker, 1)
         let (secondBox, _) = start(broker, second)
-        await waitWhileSuspended(secondBox, duration: 0.2)
+        await waitForQueued(broker, 2)
 
         // The interesting half of "no leak": a caller that says no must not
         // consume or strand the request waiting behind it.
@@ -222,14 +296,14 @@ final class ConfirmationBrokerTests: XCTestCase {
     func testACancelledCallerDoesNotStrandTheQueue() async throws {
         let broker = ConfirmationBroker(timeout: 5)
         let abandoned = makeRequest(kind: .quitApp, summary: "Quit Mail?")
-        let abandonedTask = Task { try await broker.request(abandoned) }
+        let abandonedTask = Task { await broker.request(abandoned) }
         await waitForPending(broker, 1)
 
         abandonedTask.cancel()
 
         let next = makeRequest(kind: .stopContainer, summary: "Stop container web")
         let (nextBox, _) = start(broker, next)
-        await waitWhileSuspended(nextBox, duration: 0.2)
+        await waitForQueued(broker, 2)
         let afterCancel = await pendingIDs(broker)
         XCTAssertEqual(
             afterCancel, [abandoned.id],
@@ -237,8 +311,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         )
 
         await broker.decide(id: abandoned.id, outcome: .denied(reason: "Caller went away."))
-        let abandonedResult = await abandonedTask.result
-        let abandonedOutcome = try abandonedResult.get()
+        let abandonedOutcome = await abandonedTask.value
         XCTAssertEqual(
             abandonedOutcome, .denied(reason: "Caller went away."),
             "a cancelled caller must still be resumed rather than left suspended"
@@ -253,6 +326,37 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(remaining, [])
     }
 
+    /// Ids are how the broker matches an answer to a caller, so two live entries
+    /// sharing one id would make the answer a coin toss — and a stale answer could
+    /// be handed to the wrong caller. The second request is refused outright
+    /// rather than queued behind an id it cannot be told apart from, which keeps
+    /// "one entry per id" an invariant the broker maintains instead of assumes.
+    func testADuplicateIDIsRefusedRatherThanQueued() async throws {
+        let broker = ConfirmationBroker(timeout: 5)
+        let shared = UUID()
+        let first = makeRequest(kind: .quitApp, summary: "Quit Mail?", id: shared)
+        let (firstBox, _) = start(broker, first)
+        await waitForPending(broker, 1)
+
+        let (secondBox, _) = start(
+            broker, makeRequest(kind: .stopContainer, summary: "Stop container web", id: shared)
+        )
+        let secondOutcome = try await waitForOutcome(secondBox)
+        XCTAssertEqual(
+            secondOutcome,
+            .denied(reason: "Another request with this id is already awaiting a decision."),
+            "a duplicate id is refused instead of queued"
+        )
+        let depth = await broker.queuedCount
+        XCTAssertEqual(depth, 1, "only the first request is waiting")
+
+        // And the surviving entry is answerable, which is the half that matters:
+        // the answer went to the request it was asked about.
+        await broker.decide(id: shared, outcome: .approved)
+        let firstOutcome = try await waitForOutcome(firstBox)
+        XCTAssertEqual(firstOutcome, .approved)
+    }
+
     // MARK: - The clock is real, not decorative
 
     /// The budget is measured against the injected clock, not against wall time.
@@ -265,7 +369,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         await waitForPending(broker, 1)
 
         await waitWhileSuspended(box)
-        XCTAssertNil(box.result, "a budget that has not elapsed must not expire")
+        XCTAssertNil(box.outcome, "a budget that has not elapsed must not expire")
 
         clock.advance(by: ConfirmationBroker.defaultTimeout + 1)
         let outcome = try await waitForOutcome(box)
@@ -307,9 +411,10 @@ final class ConfirmationBrokerTests: XCTestCase {
     private func makeRequest(
         kind: MCPApprovalRequest.Kind = .quitApp,
         summary: String = "Quit Mail?",
-        detail: String = "Portmaster will ask Mail to quit."
+        detail: String = "Portmaster will ask Mail to quit.",
+        id: UUID = UUID()
     ) -> MCPApprovalRequest {
-        MCPApprovalRequest(kind: kind, summary: summary, detail: detail)
+        MCPApprovalRequest(id: id, kind: kind, summary: summary, detail: detail)
     }
 
     /// Runs a request in its own task and records what came back.
@@ -323,13 +428,7 @@ final class ConfirmationBrokerTests: XCTestCase {
         _ request: MCPApprovalRequest
     ) -> (OutcomeBox, Task<Void, Never>) {
         let box = OutcomeBox()
-        let task = Task {
-            do {
-                box.store(.success(try await broker.request(request)))
-            } catch {
-                box.store(.failure(error))
-            }
-        }
+        let task = Task { box.store(await broker.request(request)) }
         return (box, task)
     }
 
@@ -337,6 +436,30 @@ final class ConfirmationBrokerTests: XCTestCase {
     /// takes autoclosures, and an autoclosure cannot await.
     private func pendingIDs(_ broker: ConfirmationBroker) async -> [UUID] {
         await broker.pending.map(\.id)
+    }
+
+    /// Polls until the queue holds exactly `count` requests, or fails the test.
+    ///
+    /// This is the deterministic enqueue signal. `pending` cannot be it: it holds
+    /// at most the request being presented, so a second request waiting its turn
+    /// is invisible and a test can only guess at how long it takes to get there.
+    @discardableResult
+    private func waitForQueued(
+        _ broker: ConfirmationBroker,
+        _ count: Int,
+        timeout: TimeInterval = 2,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latest = 0
+        while Date() < deadline {
+            latest = await broker.queuedCount
+            if latest == count { return latest }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTFail("expected \(count) queued request(s), saw \(latest)", file: file, line: line)
+        return latest
     }
 
     /// Polls until exactly `count` requests are presented, or fails the test.
@@ -374,15 +497,19 @@ final class ConfirmationBrokerTests: XCTestCase {
     ) async throws -> ApprovalOutcome {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let result = box.result {
-                // A thrown `windowUnavailable` fails the test here, with the
-                // broker's own reason, rather than as a confusing nil outcome.
-                return try result.get()
-            }
+            if let outcome = box.outcome { return outcome }
             try await Task.sleep(for: .milliseconds(2))
         }
+        // `XCTUnfail` would be the tidier tool — report the diagnosis without
+        // failing, and let the throw below be the only failure — but it does not
+        // exist in this toolchain's XCTest (checked against the SDK with a
+        // standalone type-check, on Swift 6.4). So the diagnosis is carried twice
+        // instead: once as the recorded failure, and once in the thrown error's
+        // own description, which is what XCTest prints if the body unwinds
+        // through here. A `CancellationError` standing in for "this never
+        // happened" reads as a failure of something else and hides the cause.
         XCTFail("the request never came back", file: file, line: line)
-        throw CancellationError()
+        throw NeverReturned.theRequestNeverCameBack
     }
 
     /// Gives a request that must *not* resolve a bounded chance to resolve
@@ -390,7 +517,7 @@ final class ConfirmationBrokerTests: XCTestCase {
     private func waitWhileSuspended(_ box: OutcomeBox, duration: TimeInterval = 0.05) async {
         let deadline = Date().addingTimeInterval(duration)
         repeat {
-            if box.result != nil { return }
+            if box.outcome != nil { return }
             try? await Task.sleep(for: .milliseconds(2))
         } while Date() < deadline
     }
@@ -399,17 +526,12 @@ final class ConfirmationBrokerTests: XCTestCase {
     /// it and the test task reads it; the lock is what makes that safe.
     private final class OutcomeBox: @unchecked Sendable {
         private let lock = NSLock()
-        private var stored: Result<ApprovalOutcome, Error>?
+        private var stored: ApprovalOutcome?
 
-        var result: Result<ApprovalOutcome, Error>? { lock.withLock { stored } }
+        var outcome: ApprovalOutcome? { lock.withLock { stored } }
 
-        var outcome: ApprovalOutcome? {
-            guard case .success(let outcome) = result else { return nil }
-            return outcome
-        }
-
-        func store(_ result: Result<ApprovalOutcome, Error>) {
-            lock.withLock { stored = result }
+        func store(_ outcome: ApprovalOutcome) {
+            lock.withLock { stored = outcome }
         }
     }
 
@@ -428,5 +550,18 @@ final class ConfirmationBrokerTests: XCTestCase {
         func advance(by seconds: TimeInterval) {
             lock.withLock { current = current.addingTimeInterval(seconds) }
         }
+    }
+}
+
+/// Thrown only to abandon a test whose subject never arrived. It lives at file
+/// scope rather than nested in the test case because a nested type inherits the
+/// case's isolation and could not be constructed from the helper that throws it.
+private enum NeverReturned: Error, CustomStringConvertible {
+    case theRequestNeverCameBack
+
+    /// Printed by XCTest when a test body unwinds through here, so it has to say
+    /// what went wrong rather than name a Swift type.
+    var description: String {
+        "the request never came back: the broker never resumed it within the wait"
     }
 }

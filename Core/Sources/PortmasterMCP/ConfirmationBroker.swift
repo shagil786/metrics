@@ -39,16 +39,6 @@ public enum ApprovalOutcome: Equatable, Sendable {
     case timedOut
 }
 
-/// The broker cannot ask, so the request fails rather than waiting out its budget.
-///
-/// The broker itself never throws this — it answers every request it accepts.
-/// It belongs to the caller that has to put a question in front of a person, so
-/// that a request can be failed at the moment the prompt cannot be shown instead
-/// of after the caller has already waited.
-public enum ConfirmationBrokerError: Error, Equatable, Sendable {
-    case windowUnavailable(String)
-}
-
 /// The approval state machine between an AI client's request to change something
 /// and the change actually happening.
 ///
@@ -56,10 +46,12 @@ public enum ConfirmationBrokerError: Error, Equatable, Sendable {
 /// calls `decide`. What it owns is the part that has to be right no matter how
 /// impatient or unlucky the caller is:
 ///
-/// - **Nothing hangs.** Every accepted request ends in exactly one outcome:
-///   approved, denied with a reason, or `timedOut`. A caller whose own task is
-///   cancelled still gets resumed, because the broker resumes the continuation
-///   regardless of what the awaiting task has since decided to do.
+/// - **Nothing hangs, and nothing throws.** Every accepted request ends in
+///   exactly one outcome: approved, denied with a reason, or `timedOut`. There is
+///   no failure mode for a caller to catch, because a caller that cannot put the
+///   question to a person answers its own request instead. A caller whose own
+///   task is cancelled still gets resumed, because the broker resumes the
+///   continuation regardless of what the awaiting task has since decided to do.
 /// - **Requests are served one at a time, in order.** A burst of agent calls
 ///   queues instead of stacking prompts, because a person who sees three dialogs
 ///   at once can approve the wrong one. Only the request at the head of the queue
@@ -79,7 +71,7 @@ public actor ConfirmationBroker {
 
     private struct Entry {
         let request: MCPApprovalRequest
-        let continuation: CheckedContinuation<ApprovalOutcome, Error>
+        let continuation: CheckedContinuation<ApprovalOutcome, Never>
         /// When this request's caller stops waiting, measured on `clock`.
         let deadline: Date
         var timeout: Task<Void, Never>?
@@ -113,14 +105,40 @@ public actor ConfirmationBroker {
         queue.first.map { [$0.request] } ?? []
     }
 
-    /// Suspends until this request is decided, denied in bulk, or times out.
+    /// How many requests are waiting for an answer, the presented one included.
+    ///
+    /// `pending` cannot report this: it holds at most the request being presented,
+    /// so a presenter watching it can never tell a person that others are waiting,
+    /// nor a caller that it is in the queue at all. This is the count to watch for
+    /// "one shown, N-1 waiting"; the depth can be read without disturbing anything.
+    public var queuedCount: Int { queue.count }
+
+    /// Suspends until this request is decided, denied in bulk, or times out. Every
+    /// accepted request returns an outcome, so nothing about this call can fail —
+    /// including the caller failing to ask a person.
     ///
     /// The budget starts when the request is *made*, not when it reaches the head
     /// of the queue: a caller that queues behind three others is not owed a fourth
     /// budget, and no caller waits longer than `timeout` in total.
-    public func request(_ request: MCPApprovalRequest) async throws -> ApprovalOutcome {
+    ///
+    /// "I could not put this to a person" — no prompt available, the app quitting
+    /// — is reported by answering the request, not by throwing: call
+    /// `decide(id:outcome: .denied(reason:))` for that request as soon as the
+    /// caller knows. The reason is what reaches the AI client, so it should name
+    /// what went wrong. There is deliberately no error case here: an outcome the
+    /// model can read is worth more than a thrown error it has to translate.
+    public func request(_ request: MCPApprovalRequest) async -> ApprovalOutcome {
+        // Two entries sharing an id would make `decide` ambiguous — a stale answer
+        // for the first could be delivered to the second — so the second caller is
+        // told no instead of being queued behind an id it cannot be told apart
+        // from. Answering it here rather than throwing keeps the rule that every
+        // request ends in an outcome the model can read.
+        guard !queue.contains(where: { $0.request.id == request.id }) else {
+            return .denied(reason: "Another request with this id is already awaiting a decision.")
+        }
+
         let deadline = clock().addingTimeInterval(timeout)
-        return try await withCheckedThrowingContinuation { continuation in
+        return await withCheckedContinuation { continuation in
             queue.append(
                 Entry(request: request, continuation: continuation, deadline: deadline)
             )
@@ -130,19 +148,31 @@ public actor ConfirmationBroker {
             // a deallocated broker strand a suspended caller with no way to ever
             // resume it. The cycle is bounded by the budget, and `resume` cancels
             // the task, which ends it.
-            queue[queue.count - 1].timeout = Task { [self] in
+            //
+            // The index is captured rather than recomputed as `queue.count - 1`
+            // because the task belongs to *this* entry. Nothing can interleave
+            // between the append and this line — the body is synchronous inside an
+            // actor-isolated method — so the two are equivalent today, and if they
+            // were ever separated by an await the task would be attached to some
+            // other request and `expire` would cancel the wrong budget.
+            let index = queue.count - 1
+            queue[index].timeout = Task { [self] in
                 await Self.wait(until: deadline, clock: clock)
                 expire(id: request.id)
             }
         }
     }
 
-    /// Answers a pending request. Answers for an id that is not pending — already
-    /// decided, already timed out, never asked — are ignored.
+    /// Answers a pending request, whatever its position in the queue. Answers for
+    /// an id that is not pending — already decided, already timed out, never
+    /// asked — are ignored.
     ///
-    /// Matching is by id rather than "whoever is at the head", so an answer for a
-    /// request that has already moved on reaches its own caller (or nobody) and
-    /// cannot be applied to a different request.
+    /// Deliberately not restricted to the request being presented: a presenter may
+    /// be looking at a request the user has already answered, or at a window that
+    /// outlived the queue, and the answer it holds belongs to that request's
+    /// caller. Matching by id is what makes that safe — the answer reaches its own
+    /// caller or nobody, and can never be applied to a different request. An answer
+    /// for the wrong id is inert, so being generous here cannot mis-deliver.
     public func decide(id: UUID, outcome: ApprovalOutcome) {
         guard let index = queue.firstIndex(where: { $0.request.id == id }) else { return }
         resume(queue.remove(at: index), with: outcome)
@@ -162,9 +192,17 @@ public actor ConfirmationBroker {
 
     // MARK: - Terminating a request
 
-    /// The budget ran out. Removes the entry wherever it sits — a queued request
-    /// whose budget elapsed while it was still waiting has missed it just as
-    /// surely as one that was being presented.
+    /// The budget ran out. Looks the entry up by id rather than by position,
+    /// because a queued request whose budget elapsed while it was still waiting
+    /// has missed it just as surely as one that was being presented, and because
+    /// `decide` can remove an entry from anywhere in the queue.
+    ///
+    /// In practice the head lapses first — every entry shares one budget and
+    /// deadlines run in enqueue order — so this is a head removal today. The
+    /// id lookup rather than `removeFirst()` is what keeps it correct anyway: an
+    /// entry that is not where the timer expects it still gets its own caller
+    /// resumed exactly once, and a timer's late fire still finds its own entry
+    /// rather than someone else's.
     private func expire(id: UUID) {
         guard let index = queue.firstIndex(where: { $0.request.id == id }) else { return }
         resume(queue.remove(at: index), with: .timedOut)
