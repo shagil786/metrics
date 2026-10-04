@@ -59,6 +59,32 @@ public struct OnDemandProvider: DataProvider {
     public static let thermalNotSampledMessage =
         "Temperature and fan readings are not known yet; no sensor reading has been observed."
 
+    /// Said when the container scan has not reported yet. One string for every
+    /// path that can report it — the on-demand read and its stop, and the app's
+    /// proxied read — so a caller sees the same explanation whichever provider
+    /// and whichever tool asked.
+    public static let dockerNotKnownMessage =
+        "Docker status is not known yet; the first container scan has not finished."
+
+    /// Said when no app in the reading answers to an id.
+    ///
+    /// `static` and shared: a client can reach this provider or `LiveDataProvider`
+    /// for the same tool, and the two refusals must be the same sentence.
+    static func appNotFound(_ id: String) -> MCPToolError {
+        MCPToolError(message: "App not found: \(id)")
+    }
+
+    /// Names the recorded history a read asked for, for `MCPToolError.wrapping`.
+    ///
+    /// A resource reading belongs to no app, so it is named after the resource;
+    /// everything else is app history. Built here rather than written at each
+    /// throw site because both providers wrap history failures and a wrapper that
+    /// named a different subsystem on one path than the other would send a caller
+    /// looking in two places for one fault.
+    static func historySubsystem(for resource: HistoryResource? = nil) -> String {
+        resource.map { "recorded \($0.rawValue) history" } ?? "recorded app history"
+    }
+
     /// How long to keep a collected snapshot before collecting again.
     public static let defaultCacheTTL: TimeInterval = 5
     /// Budget for the first reading of a call. Generous because a cold sampler
@@ -188,13 +214,19 @@ public struct OnDemandProvider: DataProvider {
         // Ranking and truncation are the executor's, which owns the payload and
         // the nil-sorts-last rule; a second ranking here could only disagree
         // with it. `metric` and `limit` are therefore not read here.
+        //
+        // **Known asymmetry, deliberate.** `LiveDataProvider.topApps` *does* read
+        // them, through the executor's own `rank` and `validatedLimit`, because a
+        // client reaching the proxied path must get the same refused limit the
+        // fallback refuses. No payload can tell the two apart: the ranking is a
+        // total order and the executor truncates again after either returns.
         try await snapshot().rollups
     }
 
     public func appDetail(id: String) async throws -> AppRollup {
         let rollups = try await snapshot().rollups
         guard let rollup = rollups.first(where: { $0.id == id }) else {
-            throw MCPToolError(message: "App not found: \(id)")
+            throw Self.appNotFound(id)
         }
         return rollup
     }
@@ -204,26 +236,35 @@ public struct OnDemandProvider: DataProvider {
         // installed". Reporting an availability the collector never reported
         // would be a claim about the machine that nothing observed.
         guard let docker = try await snapshot().docker else {
-            throw MCPToolError(
-                message: "Docker status is not known yet; the first container scan has not finished."
-            )
+            throw MCPToolError(message: Self.dockerNotKnownMessage)
         }
         return docker
     }
 
     public func temperaturesFans() async throws -> ThermalSample {
-        // Three answers, kept apart. nil and `.notSampledYet` are the same fact —
-        // nothing has been observed yet — so both refuse the way `containers()`
-        // does: answering `available: false` for them would be a claim about the
-        // user's hardware that no pass made. `.noSensors` is a different fact, and
-        // a narrower one than its name suggests: the last pass read a working SMC
-        // and no *recognized* sensor produced a plausible reading from it. That
-        // is what the caller is told — a sensor type this collector cannot decode
-        // reports the same way a Mac with no sensors does.
-        guard let thermal = try await snapshot().system.thermal,
+        try Self.thermalSample(from: await snapshot())
+    }
+
+    /// The thermal answer for one reading, in three states kept apart.
+    ///
+    /// nil and `.notSampledYet` are the same fact — nothing has been observed
+    /// yet — so both refuse the way `containers()` does: answering
+    /// `available: false` for them would be a claim about the user's hardware that
+    /// no pass made. `.noSensors` is a different fact, and a narrower one than its
+    /// name suggests: the last pass read a working SMC and no *recognized* sensor
+    /// produced a plausible reading from it. That is what the caller is told — a
+    /// sensor type this collector cannot decode reports the same way a Mac with no
+    /// sensors does.
+    ///
+    /// Shared with `LiveDataProvider` so the two cannot answer `get_temperatures_fans`
+    /// differently for the same snapshot.
+    static func thermalSample(
+        from snapshot: ObservationSnapshot
+    ) throws -> ThermalSample {
+        guard let thermal = snapshot.system.thermal,
               thermal.availability != .notSampledYet
         else {
-            throw MCPToolError(message: Self.thermalNotSampledMessage)
+            throw MCPToolError(message: thermalNotSampledMessage)
         }
         return thermal
     }
@@ -272,7 +313,7 @@ public struct OnDemandProvider: DataProvider {
         do {
             return try await history.get().appTrends(since: window.since)
         } catch {
-            throw MCPToolError.wrapping(error, subsystem: "recorded app history")
+            throw MCPToolError.wrapping(error, subsystem: Self.historySubsystem())
         }
     }
 
@@ -282,7 +323,7 @@ public struct OnDemandProvider: DataProvider {
         do {
             return try await history.get().resourceSamples(resource, since: window.since)
         } catch {
-            throw MCPToolError.wrapping(error, subsystem: "recorded \(resource.rawValue) history")
+            throw MCPToolError.wrapping(error, subsystem: Self.historySubsystem(for: resource))
         }
     }
 
@@ -304,13 +345,13 @@ public struct OnDemandProvider: DataProvider {
         do {
             trends = try await history.get().appTrends(since: now.addingTimeInterval(-AlertEngine.cpuWindow))
         } catch {
-            throw MCPToolError.wrapping(error, subsystem: "recorded app history")
+            throw MCPToolError.wrapping(error, subsystem: Self.historySubsystem())
         }
         let spans: [AppMemorySpan]
         do {
             spans = try await history.get().appMemorySpans(since: now.addingTimeInterval(-AlertEngine.memGrowthWindow))
         } catch {
-            throw MCPToolError.wrapping(error, subsystem: "recorded app history")
+            throw MCPToolError.wrapping(error, subsystem: Self.historySubsystem())
         }
 
         var alerts: [ActingUpAlert] = []
@@ -415,7 +456,7 @@ public struct OnDemandProvider: DataProvider {
     public func quitApp(id: String, force: Bool) async throws -> StopReport {
         let snapshot = try await snapshot(forceRefresh: true)
         guard let rollup = snapshot.rollups.first(where: { $0.id == id }) else {
-            throw MCPToolError(message: "App not found: \(id)")
+            throw Self.appNotFound(id)
         }
         // Membership is frozen from this sweep: a process that starts now was not
         // on the list the permission gate approved.
@@ -451,9 +492,7 @@ public struct OnDemandProvider: DataProvider {
     public func stopContainer(id: String) async throws -> StopReport {
         let snapshot = try await snapshot(forceRefresh: true)
         guard let docker = snapshot.docker else {
-            throw MCPToolError(
-                message: "Docker status is not known yet; the first container scan has not finished."
-            )
+            throw MCPToolError(message: Self.dockerNotKnownMessage)
         }
         // Availability first: with the daemon down or docker absent there is no
         // container list to match against, and no stop to attempt.

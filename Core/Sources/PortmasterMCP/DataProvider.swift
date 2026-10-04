@@ -37,7 +37,7 @@ public enum HistoryWindow: String, CaseIterable, Sendable {
 /// A detected repository, as MCP callers see it: identity plus the process and
 /// port footprint. Distinct from `PortmasterCore.ProjectSummary`, which also
 /// carries memory and is a display model for the app's Projects screen.
-public struct ProjectSummary: Codable, Sendable {
+public struct ProjectSummary: Codable, Equatable, Sendable {
     /// Project identifier (the attributed repository path).
     public let id: String
     /// Last path component of `id`, for display.
@@ -111,7 +111,7 @@ public struct AlertsSnapshot: Sendable {
 /// Result of a stop action, keyed by pid: `"stopped"` or `"failed: <reason>"`.
 /// Mirrors `StopCoordinator.Outcome.Status`, which has no separate unsupported
 /// case — an unsupported host arrives as `.failed(reason:)`.
-public struct StopReport: Codable, Sendable {
+public struct StopReport: Codable, Equatable, Sendable {
     public let results: [String: String]
 
     public init(results: [String: String]) {

@@ -684,10 +684,30 @@ public struct ToolExecutor: Sendable {
 
     private static func limit(_ raw: String?) throws -> Int {
         guard let raw else { return 10 }
-        guard let limit = Int(raw), limit > 0, limit <= maxTopApps else {
-            throw MCPToolError(message: "Invalid limit: \(raw) (must be 1...\(maxTopApps))")
+        guard let parsed = Int(raw) else {
+            throw MCPToolError(message: invalidLimit(raw))
+        }
+        return try validatedLimit(parsed)
+    }
+
+    /// The `1...maxTopApps` range, refused rather than clamped.
+    ///
+    /// Widen past the argument parser because a provider can be handed a limit
+    /// directly, and a client reaches whichever provider is installed: a limit one
+    /// path refuses must not be quietly clamped into a different answer on the
+    /// other. Clamping would answer a question nobody asked — a limit of 0 or 101
+    /// would silently become the largest legal one.
+    static func validatedLimit(_ limit: Int) throws -> Int {
+        guard limit > 0, limit <= maxTopApps else {
+            throw MCPToolError(message: invalidLimit(String(limit)))
         }
         return limit
+    }
+
+    /// One refusal for both the unparsable and the out-of-range limit, so the
+    /// range is stated the same way however it was missed.
+    private static func invalidLimit(_ raw: String) -> String {
+        "Invalid limit: \(raw) (must be 1...\(maxTopApps))"
     }
 
     // MARK: Ranking
@@ -695,7 +715,13 @@ public struct ToolExecutor: Sendable {
     /// Orders rollups by the requested metric, highest first. A nil total means
     /// "not measured yet" and sorts last — reading it as zero would rank an
     /// unmeasured app above a slow one, which reads as a fact about the app.
-    private static func rank(_ rollups: [AppRollup], by metric: AppMetric) -> [AppRollup] {
+    ///
+    /// Not private: `LiveDataProvider` ranks with this same function, so a
+    /// `get_top_apps` call cannot be ordered one way through the app and another
+    /// way without it. Applying it twice is applying it once — the comparator is
+    /// a total order on the metric — so the executor's own re-ranking below is
+    /// unchanged.
+    static func rank(_ rollups: [AppRollup], by metric: AppMetric) -> [AppRollup] {
         let total: (AppRollup) -> Double?
         switch metric {
         case .cpu: total = { $0.totalCPU }
