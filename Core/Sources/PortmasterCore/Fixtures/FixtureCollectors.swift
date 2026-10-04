@@ -194,8 +194,8 @@ public final class FixtureDockerProvider: DockerProviding {
 public struct FixtureThermalProvider: ThermalProviding {
     public init() {}
     public func sample() -> ThermalSample? {
-        ThermalSample(cpuTempC: 54, gpuTempC: 47, hottestTempC: 56,
-                      fans: [FanSample(name: "Preview fan", currentRPM: 1200)])
+        ThermalSample.readings(cpuTempC: 54, gpuTempC: 47, hottestTempC: 56,
+                               fans: [FanSample(name: "Preview fan", currentRPM: 1200)])
     }
 }
 

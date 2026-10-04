@@ -24,23 +24,70 @@ public struct FanSample: Hashable, Sendable {
     }
 }
 
+/// What a thermal sample is a statement about. Three answers, kept apart because
+/// "this machine has no sensors" and "no pass has finished yet" are different
+/// facts: one is a property of the hardware, the other of the clock. Mirrors
+/// `DockerAvailability` for the same reason.
+public enum ThermalAvailability: Hashable, Sendable {
+    /// A sensor pass ran and produced readings.
+    case available
+    /// A sensor pass ran and the sensors answered with nothing — no keys
+    /// resolved, or nothing plausible was decoded.
+    case noSensors
+    /// No pass has completed, so nothing has been observed at all.
+    case notSampledYet
+}
+
 /// Machine thermal state. Every field is nil when its sensors are absent
 /// (no keys for that group, SMC unavailable) — never zero-filled.
+/// `availability` says which of the three answers the sample as a whole is, so
+/// the readings are never read as the answer on their own: all-nil readings can
+/// mean "no sensors answered" or "nothing has been observed yet", and only the
+/// enum tells those apart.
 public struct ThermalSample: Hashable, Sendable {
+    /// Which of the three answers this sample carries. Required rather than
+    /// defaulted, so no construction site can quietly publish a state nobody
+    /// observed.
+    public let availability: ThermalAvailability
     public let cpuTempC: Double?
     public let gpuTempC: Double?
     /// Hottest plausible sensor of any kind — the reference's "Hottest".
     public let hottestTempC: Double?
     public let fans: [FanSample]
 
-    public init(cpuTempC: Double?, gpuTempC: Double?, hottestTempC: Double?, fans: [FanSample]) {
+    public init(
+        availability: ThermalAvailability, cpuTempC: Double?, gpuTempC: Double?,
+        hottestTempC: Double?, fans: [FanSample]
+    ) {
+        self.availability = availability
         self.cpuTempC = cpuTempC
         self.gpuTempC = gpuTempC
         self.hottestTempC = hottestTempC
         self.fans = fans
     }
 
-    public static let unknown = ThermalSample(cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: [])
+    /// Readings from a pass that observed them.
+    public static func readings(
+        cpuTempC: Double?, gpuTempC: Double?, hottestTempC: Double?, fans: [FanSample]
+    ) -> ThermalSample {
+        ThermalSample(
+            availability: .available, cpuTempC: cpuTempC, gpuTempC: gpuTempC,
+            hottestTempC: hottestTempC, fans: fans
+        )
+    }
+
+    /// A pass ran and every sensor answered with nothing. Carries no readings,
+    /// so it can never be read as a sensor reporting zero.
+    public static let noSensors = ThermalSample(
+        availability: .noSensors, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
+    )
+
+    /// Nothing has been observed yet. The same readings as `noSensors`, and a
+    /// different fact: no pass has finished, so this says nothing about the
+    /// machine's hardware.
+    public static let notSampledYet = ThermalSample(
+        availability: .notSampledYet, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
+    )
 }
 
 public protocol ThermalProviding: Sendable {
@@ -97,7 +144,10 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
         }
 
         guard !allValues.isEmpty || !fans.isEmpty else { return nil }
-        return ThermalSample(
+        // Returning a sample at all means this pass observed something, so the
+        // sample says `.available`. A pass that finds nothing returns nil and
+        // the caller decides what an empty pass means — see `SamplingEngine`.
+        return ThermalSample.readings(
             cpuTempC: cpuValues.max(),
             gpuTempC: gpuValues.max(),
             hottestTempC: allValues.max(),

@@ -476,7 +476,7 @@ final class OnDemandProviderTests: XCTestCase {
                 Self.makeSnapshot(cpuPercent: 10, thermal: nil),
                 Self.makeSnapshot(
                     cpuPercent: 10,
-                    thermal: ThermalSample(
+                    thermal: ThermalSample.readings(
                         cpuTempC: 71.5, gpuTempC: nil, hottestTempC: 71.5, fans: []
                     )
                 )

@@ -182,7 +182,9 @@ public protocol DataProvider: Sendable {
     /// a snapshot taken before that pass lands has no thermal sample in it — and
     /// "not sampled yet" is not the same claim as "this machine has no
     /// temperature sensors". Returning nil would let the payload turn the first
-    /// into the second.
+    /// into the second. `ThermalSample.availability` separates the two: the
+    /// provider throws for `.notSampledYet` and returns the sample for `.noSensors`
+    /// and `.available`.
     func temperaturesFans() async throws -> ThermalSample
     func activeAlerts() async throws -> AlertsSnapshot
     func settingsSnapshot() -> SettingsSnapshot

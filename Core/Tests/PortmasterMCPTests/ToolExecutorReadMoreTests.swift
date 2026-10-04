@@ -290,7 +290,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     /// says the readings are unavailable without sending a zero for any of them.
     func testTemperaturesWithNoReadingsReportsUnavailable() async throws {
         let stub = StubProvider()
-        stub.thermal = ThermalSample.unknown
+        stub.thermal = ThermalSample.noSensors
         let tool = try makeExecutor(provider: stub)
 
         let outcome = await tool.execute(name: "get_temperatures_fans", arguments: [:])
@@ -314,7 +314,7 @@ final class ToolExecutorReadMoreTests: XCTestCase {
     /// are three distinct numbers precisely so a swap is visible.
     func testTemperaturesMapsEachSensorAndFanToItsOwnField() async throws {
         let stub = StubProvider()
-        stub.thermal = ThermalSample(
+        stub.thermal = ThermalSample.readings(
             cpuTempC: 72.3125, gpuTempC: 60.5, hottestTempC: 88.125,
             fans: [
                 FanSample(name: "Fan 1", currentRPM: 1_800),

@@ -346,7 +346,9 @@ public struct ToolExecutor: Sendable {
         ToolDefinition(
             name: "get_temperatures_fans",
             description: "CPU/GPU/hottest sensor temperatures and fan RPMs. "
-                + "Says so when the sensor pass has not reported yet, rather than "
+                + "Reports 'availability': 'available' with the readings, or "
+                + "'noSensors' when a completed sensor pass read nothing. Refuses "
+                + "while the first sensor pass is still pending, rather than "
                 + "guessing that the machine has no sensors.",
             arguments: [],
             effect: .read

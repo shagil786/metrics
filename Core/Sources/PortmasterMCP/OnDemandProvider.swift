@@ -207,12 +207,15 @@ public struct OnDemandProvider: DataProvider {
     }
 
     public func temperaturesFans() async throws -> ThermalSample {
-        // nil here is not "no SMC sensor". The sensor pass runs on the engine's
-        // slow lane and lands a tick after it is kicked, so the first snapshot of
-        // a cold engine has no thermal sample in it at all — and answering
-        // `available: false` for that would be a claim about the user's hardware
-        // that nothing observed. Refuse the way `containers()` does instead.
-        guard let thermal = try await snapshot().system.thermal else {
+        // Three answers, kept apart. nil and `.notSampledYet` are the same fact —
+        // the sensor pass has not finished — so both refuse the way
+        // `containers()` does: answering `available: false` for them would be a
+        // claim about the user's hardware that nothing observed. `.noSensors` is
+        // a different fact, a pass that ran and read nothing, and it is returned
+        // so the caller can report a machine with no sensors as one.
+        guard let thermal = try await snapshot().system.thermal,
+              thermal.availability != .notSampledYet
+        else {
             throw MCPToolError(message: Self.thermalNotSampledMessage)
         }
         return thermal

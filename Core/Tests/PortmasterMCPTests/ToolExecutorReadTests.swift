@@ -21,7 +21,7 @@ final class StubProvider: DataProvider, @unchecked Sendable {
     var projectSummaries: [PortmasterMCP.ProjectSummary] = []
     var trends: [AppHistoryTrend] = []
     var resourcePoints: [ResourceHistoryPoint] = []
-    var thermal: ThermalSample = .unknown
+    var thermal: ThermalSample = .noSensors
     var alerts: [ActingUpAlert] = []
     var alertSource: AlertSource = .historyApproximate
 

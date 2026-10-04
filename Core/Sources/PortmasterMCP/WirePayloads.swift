@@ -86,17 +86,20 @@ struct HistoryTrendPayload: Encodable {
 
 /// Uniform shape for sensors.
 ///
-/// `available` is computed from the sample rather than hard-coded, so it reports
-/// what this sample actually carries: a reading, or a sensor group that answered
-/// with nothing. It is *not* a claim about whether the machine has sensors at
-/// all — the provider refuses a read whose sensor pass has not landed yet, so a
-/// payload always describes an observation.
+/// `availability` names which of the three sensor answers this payload carries,
+/// the same plain string `ContainersPayload` uses, so "the sensors answered
+/// nothing" and "the sensor pass has not reported yet" are states a caller can
+/// tell apart. Only the second is ever an error: the provider refuses it, so a
+/// payload always describes an observation. `available` stays for callers that
+/// read only the flag, and is derived from `availability` rather than from the
+/// readings — a payload must never claim availability and its numbers disagree.
 ///
 /// The synthesized `Encodable` **omits** nil keys rather than emitting `null`, so
 /// a sensor that did not answer is absent entirely — never a fabricated zero.
 /// Anything reading these must treat a missing reading as unavailable rather
 /// than defaulting it.
 struct TemperaturesPayload: Encodable {
+    let availability: String
     let available: Bool
     let cpuTempC: Double?
     let gpuTempC: Double?
@@ -104,10 +107,15 @@ struct TemperaturesPayload: Encodable {
     let fans: [FanPayload]
 
     init(_ thermal: ThermalSample) {
-        available = thermal.cpuTempC != nil
-            || thermal.gpuTempC != nil
-            || thermal.hottestTempC != nil
-            || !thermal.fans.isEmpty
+        // `notSampledYet` is unreachable through the provider, which refuses it;
+        // it is encoded rather than faked so a payload built elsewhere still
+        // says what it carries.
+        switch thermal.availability {
+        case .available: availability = "available"
+        case .noSensors: availability = "noSensors"
+        case .notSampledYet: availability = "notSampledYet"
+        }
+        available = thermal.availability == .available
         cpuTempC = thermal.cpuTempC
         gpuTempC = thermal.gpuTempC
         hottestTempC = thermal.hottestTempC

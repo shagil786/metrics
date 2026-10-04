@@ -335,7 +335,16 @@ static let portPollInterval: TimeInterval = 10
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 self.slowInFlight = false
-                if thermalDue { self.latestThermal = thermalResult }
+                if thermalDue {
+                    // A pass that finished with nothing is an observation, not an
+                    // unfinished pass: publish it as `noSensors` so the two can
+                    // never be answered alike. Until the first pass completes
+                    // `latestThermal` stays nil, which is this engine's encoding
+                    // of "not sampled yet" — a nil sample asserts nothing about
+                    // the machine's sensors, so the surfaces that key off a
+                    // non-nil sample keep waiting exactly as they did before.
+                    self.latestThermal = thermalResult ?? ThermalSample.noSensors
+                }
                 if let audioResult { self.latestAudio = audioResult }
                 if let bluetoothResult { self.latestBluetooth = bluetoothResult }
                 if let assertionResult { self.latestAssertions = assertionResult }

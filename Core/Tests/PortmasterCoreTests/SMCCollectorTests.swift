@@ -109,6 +109,9 @@ final class SMCCollectorTests: XCTestCase {
         }
     }
 
+    /// A pass that reads nothing must not leave the readings it published earlier
+    /// standing. It publishes an empty sample in their place: the readings are
+    /// gone, and the state says a pass ran rather than that one never finished.
     func testFailedReadClearsPreviouslyPublishedSensors() {
         let engine = SamplingEngine(
             systemCollector: FixtureSystemCollector(), processCollector: FixtureProcessCollector(),
@@ -119,8 +122,15 @@ final class SMCCollectorTests: XCTestCase {
         let cleared = expectation(description: "failed sensor read clears old data")
         var sawReading = false
         let subscription = engine.$latest.sink { snapshot in
-            if snapshot.system.thermal != nil { sawReading = true }
-            else if sawReading { cleared.fulfill() }
+            if snapshot.system.thermal?.availability == .available { sawReading = true }
+            else if snapshot.system.thermal?.availability == .noSensors {
+                XCTAssertTrue(sawReading, "an empty pass must follow a reading, not precede one")
+                XCTAssertNil(
+                    snapshot.system.thermal?.cpuTempC,
+                    "the earlier reading must not survive a pass that read nothing"
+                )
+                cleared.fulfill()
+            }
         }
         engine.start()
         // Publish the first slow result, poll again after its five-second
