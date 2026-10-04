@@ -66,6 +66,23 @@ final class PreferencesStore: @unchecked Sendable {
         }
     }
 
+    /// Whether one allowlisted key/value pair can be applied at all.
+    ///
+    /// A check, not a write, and shaped as one so a caller that only needs the
+    /// answer says so: `LiveDataProvider` hands preference writes on to the app,
+    /// which is the thing that writes, and asking this question must not require
+    /// it to know what a preferences blob is.
+    ///
+    /// The throwaway `AppPreferences` is the cost of having one definition of the
+    /// allowed values rather than two — a second switch over the same five keys
+    /// would be free to drift from `apply`, which is exactly what this file's
+    /// refusals exist to prevent. The refusals below are `apply`'s own, so there is
+    /// one answer to "can this be applied" in the module.
+    static func validate(key: String, value: String) throws {
+        var scratch = AppPreferences()
+        try apply(key: key, value: value, to: &scratch)
+    }
+
     /// Applies one allowlisted value.
     ///
     /// **How values are read, in one place:** a value is trimmed of surrounding

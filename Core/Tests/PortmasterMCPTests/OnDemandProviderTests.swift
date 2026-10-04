@@ -411,6 +411,28 @@ final class OnDemandProviderTests: XCTestCase {
         XCTAssertEqual(rollups.first?.totalCPU ?? 0, 10, accuracy: 0.001)
     }
 
+    /// A limit outside `1...100` is refused here, not clamped, and refused before
+    /// the machine is swept. `LiveDataProvider` refuses the same range in the same
+    /// words for the same reason: a client can reach either provider, so neither
+    /// may be the one that quietly turns 101 into 100.
+    func testTopAppsRefusesAnOutOfRangeLimitBeforeCollectingAnything() async throws {
+        let source = StubSnapshotSource([Self.makeSnapshot(cpuPercent: 10)])
+        let provider = OnDemandProvider(snapshotSource: source, appRunning: { false })
+
+        for limit in [0, -1, 101] {
+            do {
+                _ = try await provider.topApps(metric: .cpu, limit: limit)
+                XCTFail("A limit of \(limit) is outside 1...100 and must be refused, not clamped")
+            } catch let error as MCPToolError {
+                XCTAssertEqual(error.message, "Invalid limit: \(limit) (must be 1...100)")
+            }
+        }
+        XCTAssertEqual(
+            source.callCount, 0,
+            "an unusable limit is refused before a process sweep is paid for"
+        )
+    }
+
     func testAppDetailUnknownIDIsAnHonestError() async throws {
         let provider = OnDemandProvider(
             snapshotSource: StubSnapshotSource([Self.makeSnapshot(cpuPercent: 10)]),

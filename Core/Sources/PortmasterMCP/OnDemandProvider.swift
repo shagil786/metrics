@@ -74,6 +74,59 @@ public struct OnDemandProvider: DataProvider {
         MCPToolError(message: "App not found: \(id)")
     }
 
+    /// Said when an app is in the reading but none of its processes is.
+    ///
+    /// `static` and shared, like `appNotFound`: an app that has stopped but is
+    /// still listed is a different fact from one that is not listed at all, and
+    /// both providers have to be able to say it.
+    static func noRunningProcessesMessage(for appName: String) -> MCPToolError {
+        MCPToolError(message: "No running processes found for \(appName).")
+    }
+
+    /// Said when a project id matches no process, quoted because it is a path and
+    /// a path is more use to a caller when they can see which one was missing.
+    static func noRunningProcessesMessage(forProject id: String) -> MCPToolError {
+        MCPToolError(message: "No running processes found for project '\(id)'.")
+    }
+
+    /// Said when an id or a name matches no container in the reading. Reported
+    /// rather than passed on as a stop that was never attempted.
+    static func containerNotFound(_ id: String) -> MCPToolError {
+        MCPToolError(message: "Container not found: \(id)")
+    }
+
+    /// Said when there is nothing to stop a container with: docker is absent, its
+    /// daemon is down, or the CLI vanished between the sample and the stop.
+    ///
+    /// Three refusals rather than one because three different things are wrong,
+    /// and only the first two are facts about the machine the sample observed.
+    static func dockerUnavailableMessage(
+        _ availability: DockerAvailability, container id: String
+    ) -> MCPToolError? {
+        switch availability {
+        case .notInstalled:
+            return MCPToolError(
+                message: "Docker is not installed, so container '\(id)' was not stopped."
+            )
+        case .daemonDown:
+            return MCPToolError(
+                message: "The Docker daemon is not running, so container '\(id)' was not stopped."
+            )
+        case .running:
+            return nil
+        }
+    }
+
+    /// Said when the sample reported docker and the CLI is not there now. Not one
+    /// of `dockerUnavailableMessage`'s three: the sample said docker was there, so
+    /// this is a disagreement between two observations rather than a fact about the
+    /// machine, and it is worded as the sample not being the last word.
+    static func dockerCommandUnavailableMessage(container id: String) -> MCPToolError {
+        MCPToolError(
+            message: "The docker command is not available, so container '\(id)' was not stopped."
+        )
+    }
+
     /// Names the recorded history a read asked for, for `MCPToolError.wrapping`.
     ///
     /// A resource reading belongs to no app, so it is named after the resource;
@@ -211,16 +264,24 @@ public struct OnDemandProvider: DataProvider {
     }
 
     public func topApps(metric: AppMetric, limit: Int) async throws -> [AppRollup] {
-        // Ranking and truncation are the executor's, which owns the payload and
-        // the nil-sorts-last rule; a second ranking here could only disagree
-        // with it. `metric` and `limit` are therefore not read here.
+        // The range is checked here and in `LiveDataProvider.topApps`, through
+        // the executor's own `validatedLimit`, and refused before the snapshot is
+        // read. Not clamped: a limit of 0 or 101 silently becoming the largest
+        // legal one would answer a question nobody asked, and a client that can
+        // reach either provider must be refused the same way by both — including
+        // the day the executor stops validating ahead of the provider.
         //
-        // **Known asymmetry, deliberate.** `LiveDataProvider.topApps` *does* read
-        // them, through the executor's own `rank` and `validatedLimit`, because a
-        // client reaching the proxied path must get the same refused limit the
-        // fallback refuses. No payload can tell the two apart: the ranking is a
-        // total order and the executor truncates again after either returns.
-        try await snapshot().rollups
+        // Ranking and truncation stay the executor's, which owns the payload and
+        // the nil-sorts-last rule; a second ranking here could only disagree with
+        // it, so `metric` is still not read. `LiveDataProvider` does re-rank with
+        // `ToolExecutor.rank` for the same reason this refuses: the proxied path
+        // must not be the one that answers a different question. No payload can
+        // tell the two apart — the same multiset in the same order, except that
+        // `sorted` is not stable, so apps tied on the metric may permute between
+        // the two providers. The payload's tie-break is by display name, so that
+        // only shows up as reordering within a tie.
+        _ = try ToolExecutor.validatedLimit(limit)
+        return try await snapshot().rollups
     }
 
     public func appDetail(id: String) async throws -> AppRollup {
@@ -462,7 +523,7 @@ public struct OnDemandProvider: DataProvider {
         // on the list the permission gate approved.
         let targets = ConfirmedStopPlan.ordered(rollup.processes)
         guard !targets.isEmpty else {
-            throw MCPToolError(message: "No running processes found for \(rollup.displayName).")
+            throw Self.noRunningProcessesMessage(for: rollup.displayName)
         }
         return await stop(targets, force: force)
     }
@@ -471,7 +532,7 @@ public struct OnDemandProvider: DataProvider {
         let snapshot = try await snapshot(forceRefresh: true)
         let targets = ConfirmedStopPlan.project(id, rows: snapshot.processes)
         guard !targets.isEmpty else {
-            throw MCPToolError(message: "No running processes found for project '\(id)'.")
+            throw Self.noRunningProcessesMessage(forProject: id)
         }
         return await stop(targets, force: false)
     }
@@ -496,26 +557,15 @@ public struct OnDemandProvider: DataProvider {
         }
         // Availability first: with the daemon down or docker absent there is no
         // container list to match against, and no stop to attempt.
-        switch docker.availability {
-        case .notInstalled:
-            throw MCPToolError(
-                message: "Docker is not installed, so container '\(id)' was not stopped."
-            )
-        case .daemonDown:
-            throw MCPToolError(
-                message: "The Docker daemon is not running, so container '\(id)' was not stopped."
-            )
-        case .running:
-            break
+        if let refusal = Self.dockerUnavailableMessage(docker.availability, container: id) {
+            throw refusal
         }
         guard docker.containers.contains(where: { $0.id == id || $0.name == id }) else {
-            throw MCPToolError(message: "Container not found: \(id)")
+            throw Self.containerNotFound(id)
         }
         guard let executable = dockerExecutable() else {
             // The sample said docker was there; it is not now.
-            throw MCPToolError(
-                message: "The docker command is not available, so container '\(id)' was not stopped."
-            )
+            throw Self.dockerCommandUnavailableMessage(container: id)
         }
 
         let outcome: CommandOutcome

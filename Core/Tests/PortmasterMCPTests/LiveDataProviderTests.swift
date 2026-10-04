@@ -216,6 +216,36 @@ final class LiveDataProviderTests: XCTestCase {
         XCTAssertEqual(projects, OnDemandProvider.projectSummaries(from: snapshot))
     }
 
+    /// The container sample is the app's, whole — including the answer that docker
+    /// is there and not answering, which is a fact about the machine and not a
+    /// failure of this read. Only "the scan has not reported yet" refuses.
+    ///
+    /// The cold-snapshot test cannot cover this: it fails before the guard runs.
+    func testContainersReturnsTheAppsSampleAndRefusesOnlyAnAbsentOne() async throws {
+        let down = DockerSample(
+            availability: .daemonDown,
+            containers: [OnDemandProviderTests.makeContainer(id: "abc123", name: "api")],
+            at: OnDemandProviderTests.sampleTime
+        )
+        let answered = try await makeProvider(
+            PublishedSnapshot(Self.snapshot(docker: down))
+        ).containers()
+        XCTAssertEqual(
+            answered, down,
+            "a daemon that is down is reported, not turned into an error or an empty list"
+        )
+
+        let refusal = await refusal("a reading with no docker sample") {
+            _ = try await makeProvider(
+                PublishedSnapshot(Self.snapshot(docker: nil))
+            ).containers()
+        }
+        XCTAssertEqual(
+            refusal.message, OnDemandProvider.dockerNotKnownMessage,
+            "absent means not scanned yet, which is not 'Docker is not installed'"
+        )
+    }
+
     /// The live `AlertEngine`'s answer, handed over whole. The source travels with
     /// it because an empty list cannot say which evaluation produced it — and
     /// with the app in the loop, "no alerts" really can mean the live engine ran
@@ -323,28 +353,49 @@ final class LiveDataProviderTests: XCTestCase {
     /// A history failure reaches the caller as an `MCPToolError` naming what
     /// failed — a bare Foundation error renders as "The operation couldn't be
     /// completed…" — and the store is only opened by a history question.
+    ///
+    /// The message is pinned exactly, against the same failing seam driven through
+    /// `OnDemandProvider`. `contains("history")` would pass just as happily for a
+    /// bare `"history"` subsystem as for the two this names, so it would protect
+    /// nothing: the whole point of both providers wrapping a history failure the
+    /// same way is that the two sentences are the same sentence.
     func testHistoryFailureIsWrappedNamingTheSubsystem() async throws {
-        let published = PublishedSnapshot(Self.snapshot())
         let history = HistoryOpener(FailingHistoryReading(message: "database is locked"))
-        let provider = makeProvider(published, history: history)
+        let provider = makeProvider(PublishedSnapshot(Self.snapshot()), history: history)
 
         _ = try await provider.projects()
         XCTAssertEqual(history.openCount, 0, "only a history question opens the store")
 
-        do {
+        // The fallback, over the same failing seam: what the proxied path must say.
+        let onDemand = OnDemandProvider(
+            snapshotSource: stubSnapshotSourceWithoutReading(),
+            historyFactory: { FailingHistoryReading(message: "database is locked") },
+            appRunning: { false },
+            snapshotTimeout: 0.1
+        )
+        let locked = StubError(message: "database is locked")
+
+        let rankings = await refusal("the proxied rankings read") {
             _ = try await provider.historyRankings(window: .h1, resource: nil)
-            XCTFail("A history failure must not answer with an empty ranking")
-        } catch let error as MCPToolError {
-            XCTAssertTrue(error.message.contains("history"), error.message)
-            XCTAssertTrue(error.message.contains("database is locked"), error.message)
         }
-        do {
+        let onDemandRankings = await refusal("the on-demand rankings read") {
+            _ = try await onDemand.historyRankings(window: .h1, resource: nil)
+        }
+        XCTAssertEqual(rankings, onDemandRankings)
+        XCTAssertEqual(
+            rankings,
+            MCPToolError.wrapping(locked, subsystem: OnDemandProvider.historySubsystem()),
+            "and it is the subsystem name the on-demand path builds, not a similar one"
+        )
+
+        let resources = await refusal("the proxied resources read") {
             _ = try await provider.historyResources(window: .h1, resource: .gpu)
-            XCTFail("A history failure must not answer with an empty point list")
-        } catch let error as MCPToolError {
-            XCTAssertTrue(error.message.contains("history"), error.message)
-            XCTAssertTrue(error.message.contains("gpu"), "the resource must be named: \(error.message)")
         }
+        XCTAssertEqual(
+            resources,
+            MCPToolError.wrapping(locked, subsystem: OnDemandProvider.historySubsystem(for: .gpu)),
+            "a resource read names the resource, exactly as the fallback does"
+        )
         XCTAssertEqual(history.openCount, 1, "the store is opened once and kept")
     }
 
@@ -437,6 +488,24 @@ final class LiveDataProviderTests: XCTestCase {
 
     // MARK: Helpers
 
+    /// The `MCPToolError` a read threw. Fails the test if it answered instead,
+    /// or threw something that is not an `MCPToolError` — both of which would
+    /// otherwise be compared away as a placeholder.
+    private func refusal(
+        _ what: String, _ read: () async throws -> Void
+    ) async -> MCPToolError {
+        do {
+            try await read()
+        } catch let error as MCPToolError {
+            return error
+        } catch {
+            XCTFail("\(what) threw \(error), which names no subsystem")
+            return MCPToolError(message: "unreachable")
+        }
+        XCTFail("\(what) answered instead of refusing")
+        return MCPToolError(message: "unreachable")
+    }
+
     /// A provider over the stubs, so a test only spells out the seam it is about.
     private func makeProvider(
         _ published: PublishedSnapshot,
@@ -475,6 +544,7 @@ final class LiveDataProviderTests: XCTestCase {
         processes: [ProcessRow] = [],
         ports: [ListeningPort] = [],
         rollups: [AppRollup]? = nil,
+        docker: DockerSample? = nil,
         thermal: ThermalSample? = nil
     ) -> ObservationSnapshot {
         OnDemandProviderTests.makeSnapshot(
@@ -482,6 +552,7 @@ final class LiveDataProviderTests: XCTestCase {
             processes: processes,
             ports: ports,
             rollups: rollups ?? [Self.rollup(name: "Chrome", netIn: 1_000)],
+            docker: docker,
             thermal: thermal
         )
     }

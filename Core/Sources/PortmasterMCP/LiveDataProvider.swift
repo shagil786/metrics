@@ -88,12 +88,18 @@ public struct LiveDataProvider: DataProvider {
     }
 
     public func topApps(metric: AppMetric, limit: Int) async throws -> [AppRollup] {
-        // The executor owns ranking and truncation for the payload, and does both
-        // again after this returns. Applying the same two steps here is applying
-        // them once — the comparator is a total order on the metric, so re-ranking
-        // a ranked prefix reproduces it — and it means the limit range is enforced
-        // on whichever provider a client happens to be talking to.
+        // The range is refused here and in `OnDemandProvider.topApps`, through the
+        // executor's own `validatedLimit` and before the snapshot is read, so a
+        // limit outside `1...100` is an error on whichever provider a client
+        // happens to be talking to rather than a silent clamp on one of them.
         let allowed = try ToolExecutor.validatedLimit(limit)
+        // Ranking and truncation are the executor's for the payload, and it does
+        // both again after this returns. Applying them here as well is applying
+        // them once: the same set of apps in the same order, except that `sorted`
+        // is not stable, so apps tied on the metric may permute — and the payload
+        // tie-breaks by display name, so that is the only difference a caller can
+        // see. What it buys is that neither provider can answer "the top N by this
+        // metric" without the range check and the nil-sorts-last rule behind it.
         return Array(ToolExecutor.rank(try await snapshot().rollups, by: metric).prefix(allowed))
     }
 
@@ -188,12 +194,12 @@ public struct LiveDataProvider: DataProvider {
     /// screen makes. `mcpMode` still never reaches this method — the executor owns
     /// that key end to end, and `apply` refuses it on both paths.
     public func setPreference(key: String, value: String) throws {
-        // `apply` raises the two refusals the on-demand path uses — a key outside
-        // the executor's allowlist, and a value no enum case matches — with the
-        // same wording, built from the same allowlist. The preferences it writes
-        // into are discarded: this is a check, not a write.
-        var scratch = AppPreferences()
-        try PreferencesStore.apply(key: key, value: value, to: &scratch)
+        // `validate` raises the two refusals the on-demand path uses — a key
+        // outside the executor's allowlist, and a value no enum case matches —
+        // with the same wording, from the same code, built from the same
+        // allowlist. It is a check, not a write: nothing is handed on unless it
+        // passes.
+        try PreferencesStore.validate(key: key, value: value)
         try applyPreference(key, value)
     }
 
