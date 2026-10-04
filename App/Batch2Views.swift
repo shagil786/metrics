@@ -37,7 +37,10 @@ struct ThermalContextView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Heat context").font(.callout.weight(.semibold))
             Text("macOS thermal pressure: \(pressure)").font(.caption)
-            if model.snapshot.system.thermal != nil {
+            // Only readings justify pairing heat with per-app CPU activity: with no
+            // reading observed, "waiting" is the honest state, and the caption
+            // below this branch already says readings cannot attribute heat.
+            if model.snapshot.system.thermal?.availability == .available {
                 ForEach(Array(model.snapshot.rollups.filter { $0.totalCPU > 0.1 }
                     .sorted { $0.totalCPU > $1.totalCPU }.prefix(3))) { app in
                     Button { model.openApp(app) } label: {

@@ -1,7 +1,8 @@
-// Thermal availability: "this Mac has no sensors" and "the first sensor pass
-// has not finished yet" are different facts, and the sampler must be able to
-// tell them apart. These tests pin the three answers the engine publishes, all
-// driven through fixture collectors — no real SMC, no subprocesses.
+// Thermal availability: "this Mac has no sensors", "no sensor produced a
+// plausible reading", and "nothing could be read at all yet" are three
+// different facts, and the sampler must be able to tell them apart. These tests
+// pin what a pass publishes, all driven through fixture collectors — no real
+// SMC, no subprocesses.
 import XCTest
 import Combine
 @testable import PortmasterCore
@@ -29,11 +30,11 @@ final class ThermalAvailabilityTests: XCTestCase {
         subscription.cancel()
     }
 
-    /// A pass that completed and produced nothing is not an unfinished pass: the
-    /// sensors were asked and answered with nothing, so the sample says so
-    /// instead of leaving the pre-pass state in place forever.
-    func testPassThatProducesNothingPublishesNoSensors() {
-        let engine = Self.makeEngine(thermal: SilentThermalProvider())
+    /// A readable key space with nothing plausible in it is a statement about
+    /// the machine, so it is published — as an empty sample, never as one
+    /// carrying a number for a sensor that said none.
+    func testPassThatReadsNothingPublishesNoSensors() {
+        let engine = Self.makeEngine(thermal: NoRecognizedSensorProvider())
         let published = expectation(description: "an empty sample")
         let subscription = engine.$latest.first { $0.system.thermal != nil }.sink { snapshot in
             guard let thermal = snapshot.system.thermal else { return XCTFail("no thermal sample") }
@@ -47,6 +48,55 @@ final class ThermalAvailabilityTests: XCTestCase {
         engine.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { engine.refreshNow() }
         wait(for: [published], timeout: 4)
+        engine.stop()
+        subscription.cancel()
+    }
+
+    /// A pass that never reached the machine observed nothing, so it publishes
+    /// `notSampledYet`. Publishing `noSensors` here would be a hardware claim
+    /// the pass never made.
+    func testPassThatCouldNotReadAnythingPublishesNotSampledYet() {
+        let engine = Self.makeEngine(thermal: UnreadableSMCProvider())
+        let published = expectation(description: "an unsampled state")
+        let subscription = engine.$latest.first { $0.system.thermal != nil }.sink { snapshot in
+            guard let thermal = snapshot.system.thermal else { return XCTFail("no thermal sample") }
+            XCTAssertEqual(thermal.availability, .notSampledYet)
+            published.fulfill()
+        }
+        engine.start()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { engine.refreshNow() }
+        wait(for: [published], timeout: 4)
+        engine.stop()
+        subscription.cancel()
+    }
+
+    /// An unreadable pass replaces the reading published before it. Leaving the
+    /// older reading standing would report a number this tick knows nothing
+    /// about; reporting the empty pass as `noSensors` would claim a fact about
+    /// the hardware the pass never established.
+    func testNotSampledYetReplacesAnEarlierReading() {
+        let engine = Self.makeEngine(thermal: ReadingsThenUnreadableProvider())
+        let replaced = expectation(description: "the stale reading is replaced")
+        var sawReading = false
+        let subscription = engine.$latest.sink { snapshot in
+            if snapshot.system.thermal?.availability == .available {
+                sawReading = true
+            } else if snapshot.system.thermal?.availability == .notSampledYet {
+                XCTAssertTrue(sawReading, "the unreadable pass must follow a reading")
+                XCTAssertNil(
+                    snapshot.system.thermal?.cpuTempC,
+                    "an earlier reading must not survive a pass that read nothing"
+                )
+                replaced.fulfill()
+            }
+        }
+        engine.start()
+        // Publish the first slow result, poll again after its five-second
+        // cadence, then publish the unreadable pass. No real SMC/subprocess work.
+        for delay in [0.5, 5.2, 5.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { engine.refreshNow() }
+        }
+        wait(for: [replaced], timeout: 8)
         engine.stop()
         subscription.cancel()
     }
@@ -110,9 +160,27 @@ final class ThermalAvailabilityTests: XCTestCase {
         )
     }
 
-    /// A sensor seam that never answers — the shape of a machine whose key space
-    /// yields nothing plausible, or an SMC the collector cannot open.
-    private final class SilentThermalProvider: ThermalProviding, @unchecked Sendable {
-        func sample() -> ThermalSample? { nil }
+    /// An SMC that opened and enumerated but whose recognized sensors answered
+    /// with nothing plausible — the shape of a Mac with no usable sensors.
+    private struct NoRecognizedSensorProvider: ThermalProviding {
+        func sample() -> ThermalSample { .noSensors }
+    }
+
+    /// An SMC that could not be read at all: nothing was observed, so nothing
+    /// may be claimed about the machine.
+    private struct UnreadableSMCProvider: ThermalProviding {
+        func sample() -> ThermalSample { .notSampledYet }
+    }
+
+    /// Readings first, then an SMC that stopped answering — the mid-session
+    /// failure that must not read as "no sensors" nor leave the old value up.
+    private final class ReadingsThenUnreadableProvider: ThermalProviding, @unchecked Sendable {
+        // Accessed only on the engine's serial slow lane.
+        private var calls = 0
+        func sample() -> ThermalSample {
+            calls += 1
+            guard calls == 1 else { return .notSampledYet }
+            return FixtureThermalProvider().sample()
+        }
     }
 }

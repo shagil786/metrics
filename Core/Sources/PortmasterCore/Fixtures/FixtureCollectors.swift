@@ -193,7 +193,7 @@ public final class FixtureDockerProvider: DockerProviding {
 /// Explicit preview sensors; never read the real SMC in fixture mode.
 public struct FixtureThermalProvider: ThermalProviding {
     public init() {}
-    public func sample() -> ThermalSample? {
+    public func sample() -> ThermalSample {
         ThermalSample.readings(cpuTempC: 54, gpuTempC: 47, hottestTempC: 56,
                                fans: [FanSample(name: "Preview fan", currentRPM: 1200)])
     }

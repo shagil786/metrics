@@ -31,10 +31,14 @@ public struct FanSample: Hashable, Sendable {
 public enum ThermalAvailability: Hashable, Sendable {
     /// A sensor pass ran and produced readings.
     case available
-    /// A sensor pass ran and the sensors answered with nothing — no keys
-    /// resolved, or nothing plausible was decoded.
+    /// A pass reached a readable SMC and no recognized sensor produced a
+    /// plausible reading: no temperature/fan key of a type this collector
+    /// decodes, or none of them decoded to a believable value. It is not a claim
+    /// that the machine has no sensors — only that nothing this collector can
+    /// read came back with a value.
     case noSensors
-    /// No pass has completed, so nothing has been observed at all.
+    /// No pass has observed anything: the SMC never opened, or not one cached
+    /// key could be read. Says nothing at all about the machine's hardware.
     case notSampledYet
 }
 
@@ -42,12 +46,10 @@ public enum ThermalAvailability: Hashable, Sendable {
 /// (no keys for that group, SMC unavailable) — never zero-filled.
 /// `availability` says which of the three answers the sample as a whole is, so
 /// the readings are never read as the answer on their own: all-nil readings can
-/// mean "no sensors answered" or "nothing has been observed yet", and only the
-/// enum tells those apart.
+/// mean "nothing readable answered" or "nothing has been observed yet", and
+/// only the enum tells those apart.
 public struct ThermalSample: Hashable, Sendable {
-    /// Which of the three answers this sample carries. Required rather than
-    /// defaulted, so no construction site can quietly publish a state nobody
-    /// observed.
+    /// Which of the three answers this sample carries.
     public let availability: ThermalAvailability
     public let cpuTempC: Double?
     public let gpuTempC: Double?
@@ -55,7 +57,12 @@ public struct ThermalSample: Hashable, Sendable {
     public let hottestTempC: Double?
     public let fans: [FanSample]
 
-    public init(
+    /// Internal, not public: `readings`, `noSensors` and `notSampledYet` are the
+    /// only ways in, so a sample's state and the readings it carries cannot be
+    /// assembled independently of each other. Requiring the argument only buys
+    /// the naming — a public init would still accept `noSensors` beside a
+    /// temperature.
+    init(
         availability: ThermalAvailability, cpuTempC: Double?, gpuTempC: Double?,
         hottestTempC: Double?, fans: [FanSample]
     ) {
@@ -76,22 +83,25 @@ public struct ThermalSample: Hashable, Sendable {
         )
     }
 
-    /// A pass ran and every sensor answered with nothing. Carries no readings,
+    /// A readable key space with nothing plausible in it. Carries no readings,
     /// so it can never be read as a sensor reporting zero.
     public static let noSensors = ThermalSample(
         availability: .noSensors, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
     )
 
     /// Nothing has been observed yet. The same readings as `noSensors`, and a
-    /// different fact: no pass has finished, so this says nothing about the
-    /// machine's hardware.
+    /// different fact: no pass has read the machine, so this says nothing about
+    /// its hardware.
     public static let notSampledYet = ThermalSample(
         availability: .notSampledYet, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
     )
 }
 
+/// One sensor pass. Non-optional on purpose: every pass answers with the state
+/// it established, so a caller cannot mistake "this pass found nothing" for
+/// "no pass has run" — or, worse, for a fact about the machine's hardware.
 public protocol ThermalProviding: Sendable {
-    func sample() -> ThermalSample?
+    func sample() -> ThermalSample
 }
 
 public final class SMCCollector: ThermalProviding, @unchecked Sendable {
@@ -108,6 +118,10 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
     private var fanRpmKeys: [SMCKey] = []
     private var fanNames: [String: String] = [:]
     private var scanned = false
+    /// Raw SMC reads that answered during the current pass. Zero means the
+    /// machine said nothing at all, which is a different fact from "it said
+    /// nothing plausible" — see `sample()`.
+    private var rawReadsAnswered = 0
     // PMShim shares one connection across collector instances.
     private static let lock = NSLock()
 
@@ -116,11 +130,26 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
     /// Sample the cached sensors. The first call performs the full SMC key
     /// enumeration (~1-2k keys, a few hundred ms on the slow lane,
     /// once per launch); later calls re-read only the cached keys.
-    public func sample() -> ThermalSample? {
+    ///
+    /// Always answers with what the pass established, and never with more:
+    ///
+    /// - readings this pass decoded,
+    /// - `.noSensors` when a readable SMC held no key this collector decodes, or
+    ///   none of them decoded to a believable value,
+    /// - `.notSampledYet` when the SMC never opened, or when not one cached key
+    ///   could be read — a pass that reached nothing observed nothing, so it must
+    ///   not report the machine as having no sensors.
+    public func sample() -> ThermalSample {
         Self.lock.lock(); defer { Self.lock.unlock() }
-        if !scanned { scanLocked() }
+        rawReadsAnswered = 0
+        if !scanned {
+            scanLocked()
+            // `scanLocked` leaves `scanned` false when the SMC never opened: the
+            // key space was never enumerated, so nothing is known about it.
+            guard scanned else { return .notSampledYet }
+        }
 
-        guard !allTempKeys.isEmpty || !fanRpmKeys.isEmpty else { return nil }
+        guard !allTempKeys.isEmpty || !fanRpmKeys.isEmpty else { return .noSensors }
 
         func readTemp(_ key: SMCKey) -> Double? {
             guard let value = readKey(key) else { return nil }
@@ -143,10 +172,8 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
             fans.append(FanSample(name: name, currentRPM: rpm))
         }
 
-        guard !allValues.isEmpty || !fans.isEmpty else { return nil }
-        // Returning a sample at all means this pass observed something, so the
-        // sample says `.available`. A pass that finds nothing returns nil and
-        // the caller decides what an empty pass means — see `SamplingEngine`.
+        guard rawReadsAnswered > 0 else { return .notSampledYet }
+        guard !allValues.isEmpty || !fans.isEmpty else { return .noSensors }
         return ThermalSample.readings(
             cpuTempC: cpuValues.max(),
             gpuTempC: gpuValues.max(),
@@ -160,6 +187,10 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
     /// Enumerate the whole SMC key space once and classify the
     /// temperature-type keys. Cache even temporarily invalid readings so
     /// a cold/idle sensor can recover. The first failed index ends the scan.
+    ///
+    /// `scanned` stays false when the SMC never opened or not one key could be
+    /// enumerated, so the pass reports `notSampledYet` rather than an empty key
+    /// space it never actually saw. Both are retried on the next pass.
     private func scanLocked() {
         guard pm_smc_open() else { return }
         var cpu: [SMCKey] = []
@@ -167,10 +198,12 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
         var temps: [SMCKey] = []
         var rpmKeys: [SMCKey] = []
         var names: [String: String] = [:]
+        var enumerated = 0
 
         for index in 0..<4000 {
             var raw4 = [CChar](repeating: 0, count: 4)
             guard pm_smc_key_at(UInt32(index), &raw4) == 1 else { break }
+            enumerated += 1
             let raw = raw4.prefix(4).map { UInt8(bitPattern: $0) }
             guard let canonical = Self.canonicalString(raw), canonical.count == 4 else { continue }
             let key = SMCKey(raw: raw, canonical: canonical)
@@ -192,6 +225,10 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
             if Self.isGpuTempKey(canonical) { gpu.append(key) }
         }
 
+        // Every Mac with a working SMC exposes thousands of keys, so an
+        // enumeration that yielded none did not reach the key space at all.
+        guard enumerated > 0 else { return }
+
         scanned = true
         cpuKeys = cpu
         gpuKeys = gpu
@@ -212,6 +249,10 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
         var raw = [UInt8](repeating: 0, count: 32)
         let size = pm_smc_read(key.raw, &raw, 32)
         guard size > 0 else { return nil }
+        // The SMC answered for this key. Counted whether or not the payload
+        // decodes: an implausible value is the sensor speaking, while a failed
+        // read is the machine not answering at all.
+        rawReadsAnswered += 1
         return Self.decode(type: type, bytes: Array(raw.prefix(Int(size))))
     }
 

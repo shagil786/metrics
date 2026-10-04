@@ -710,7 +710,12 @@ struct MenuBarPanel: View {
                 } else {
                     Text("No fan readings available").font(.caption).foregroundStyle(.secondary)
                 }
-                Text(thermal == nil ? "SMC sensor readings are unavailable on this Mac." : "Read-only sensors. CPU and GPU show the maximum observed in each group. Refreshed about every 5 seconds while open; slower in the background.")
+                // Only a pass that actually produced readings may claim sensors are being
+                // refreshed; "nothing has been observed yet" and "no recognized
+                // sensor produced a plausible reading" both mean there is
+                // nothing here to describe, and saying otherwise would assert
+                // sensors this Mac has not been shown to have.
+                Text(thermal?.availability == .available ? "Read-only sensors. CPU and GPU show the maximum observed in each group. Refreshed about every 5 seconds while open; slower in the background." : "SMC sensor readings are unavailable on this Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

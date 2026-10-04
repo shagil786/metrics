@@ -128,16 +128,27 @@ struct FanPayload: Encodable {
     }
 }
 
-// `TemperaturesPayload` in `WirePayloads.swift` has a uniform "available or all
-// null" shape for the same sensors; this one is the overview's slice of the same
-// sample, where the surrounding sections are independently optional.
+// `TemperaturesPayload` in `WirePayloads.swift` answers the same sensors with
+// the same three states; this one is the overview's slice of the same sample,
+// where the surrounding sections are independently optional. It therefore
+// carries `availability` too: the section's own presence says only that a pass
+// has answered, not that the sensors produced readings, so the state has to be
+// named or a caller would read presence as availability.
 private struct ThermalPayload: Encodable {
+    let availability: String
+    let available: Bool
     let cpuTempC: Double?
     let gpuTempC: Double?
     let hottestTempC: Double?
     let fans: [FanPayload]
 
     init(_ thermal: ThermalSample) {
+        switch thermal.availability {
+        case .available: availability = "available"
+        case .noSensors: availability = "noSensors"
+        case .notSampledYet: availability = "notSampledYet"
+        }
+        available = thermal.availability == .available
         cpuTempC = thermal.cpuTempC
         gpuTempC = thermal.gpuTempC
         hottestTempC = thermal.hottestTempC
@@ -347,9 +358,9 @@ public struct ToolExecutor: Sendable {
             name: "get_temperatures_fans",
             description: "CPU/GPU/hottest sensor temperatures and fan RPMs. "
                 + "Reports 'availability': 'available' with the readings, or "
-                + "'noSensors' when a completed sensor pass read nothing. Refuses "
-                + "while the first sensor pass is still pending, rather than "
-                + "guessing that the machine has no sensors.",
+                + "'noSensors' when a completed pass over a readable SMC produced "
+                + "no plausible reading. Refuses while no sensor reading has been "
+                + "observed, rather than guessing that the machine has no sensors.",
             arguments: [],
             effect: .read
         ),

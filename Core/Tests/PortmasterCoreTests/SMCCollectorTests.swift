@@ -103,31 +103,36 @@ final class SMCCollectorTests: XCTestCase {
     private final class FailingThermalProvider: ThermalProviding, @unchecked Sendable {
         // Accessed only on the engine's serial slow lane.
         private var calls = 0
-        func sample() -> ThermalSample? {
+        func sample() -> ThermalSample {
             calls += 1
-            return calls == 1 ? FixtureThermalProvider().sample() : nil
+            return calls == 1 ? FixtureThermalProvider().sample() : .notSampledYet
         }
     }
 
-    /// A pass that reads nothing must not leave the readings it published earlier
-    /// standing. It publishes an empty sample in their place: the readings are
-    /// gone, and the state says a pass ran rather than that one never finished.
-    func testFailedReadClearsPreviouslyPublishedSensors() {
+    /// A pass that cannot read the SMC must not leave the readings it published
+    /// earlier standing, and must not be reported as a machine with no sensors
+    /// either: it established nothing, so it publishes `notSampledYet` in place
+    /// of the stale reading.
+    func testUnreadablePassReplacesPublishedReadingsWithNotSampledYet() {
         let engine = SamplingEngine(
             systemCollector: FixtureSystemCollector(), processCollector: FixtureProcessCollector(),
             portCollector: FixturePortCollector(), nettopCollector: FixtureNettopProvider(),
             assertionCollector: FixtureAssertionProvider(), dockerCollector: FixtureDockerProvider(),
             thermalCollector: FailingThermalProvider(),
             audioCollector: FixtureAudioProvider(), bluetoothCollector: FixtureBluetoothProvider())
-        let cleared = expectation(description: "failed sensor read clears old data")
+        let cleared = expectation(description: "an unreadable pass clears old data")
         var sawReading = false
         let subscription = engine.$latest.sink { snapshot in
             if snapshot.system.thermal?.availability == .available { sawReading = true }
-            else if snapshot.system.thermal?.availability == .noSensors {
-                XCTAssertTrue(sawReading, "an empty pass must follow a reading, not precede one")
+            else if snapshot.system.thermal?.availability == .notSampledYet {
+                XCTAssertTrue(sawReading, "the unreadable pass must follow a reading")
                 XCTAssertNil(
                     snapshot.system.thermal?.cpuTempC,
                     "the earlier reading must not survive a pass that read nothing"
+                )
+                XCTAssertNotEqual(
+                    snapshot.system.thermal?.availability, .noSensors,
+                    "a pass that read nothing observed no evidence that the Mac has no sensors"
                 )
                 cleared.fulfill()
             }
@@ -144,8 +149,14 @@ final class SMCCollectorTests: XCTestCase {
     }
 
     func testLiveSMCReadingsArePlausibleWhenAvailable() {
-        // Portable smoke test: unsupported/blocked SMC is an honest nil.
-        guard let reading = SMCCollector().sample() else { return }
+        // Portable smoke test: an SMC that cannot be read is an honest
+        // `notSampledYet`, and an unreadable sensor key space is `noSensors`.
+        // Neither is a claim about plausibility, so only readings are checked.
+        let reading = SMCCollector().sample()
+        guard reading.availability == .available else {
+            print("SMC LIVE: unavailable (\(reading.availability))")
+            return
+        }
         for value in [reading.cpuTempC, reading.gpuTempC, reading.hottestTempC].compactMap({ $0 }) {
             XCTAssertTrue(SMCCollector.isPlausibleTemp(value))
         }

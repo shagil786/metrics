@@ -49,10 +49,15 @@ public struct OnDemandProvider: DataProvider {
         "Portmaster is running; close it before changing preferences via MCP "
         + "(live writes arrive with the MCP host)."
 
-    /// Said when no thermal reading has been sampled yet. One string for the
+    /// Said when no sensor reading has been observed yet. One string for the
     /// refusal, so the payload can never be reached with nothing behind it.
+    ///
+    /// Wording covers both reasons nothing has been observed — the first sensor
+    /// pass is still pending, and a pass that could not read the SMC — because
+    /// both leave the caller with nothing observed, and neither may be reported
+    /// as a machine with no sensors.
     public static let thermalNotSampledMessage =
-        "Temperature and fan readings are not known yet; the first sensor pass has not finished."
+        "Temperature and fan readings are not known yet; no sensor reading has been observed."
 
     /// How long to keep a collected snapshot before collecting again.
     public static let defaultCacheTTL: TimeInterval = 5

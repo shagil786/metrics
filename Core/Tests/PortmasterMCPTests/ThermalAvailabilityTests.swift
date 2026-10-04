@@ -11,6 +11,18 @@ final class ThermalAvailabilityTests: XCTestCase {
 
     // MARK: - The provider's three answers
 
+    /// The refusal covers both reasons a pass can leave nothing observed — the
+    /// first pass still pending, and an SMC that stopped answering mid-session —
+    /// so its wording cannot be narrowed back to one of them.
+    func testTheRefusalIsTrueForEveryUnobservedState() {
+        let message = OnDemandProvider.thermalNotSampledMessage.lowercased()
+        XCTAssertTrue(
+            message.contains("no sensor reading has been observed"),
+            "the refusal must read as 'nothing observed yet', not as a first-pass excuse: "
+                + OnDemandProvider.thermalNotSampledMessage
+        )
+    }
+
     /// An unfinished pass has produced nothing to report, so the tool refuses.
     /// The snapshot encodes that state as no sample at all; a sample that names
     /// it explicitly must refuse identically rather than fall through to an
@@ -146,5 +158,54 @@ final class ThermalAvailabilityTests: XCTestCase {
         XCTAssertTrue(outcome.isError)
         XCTAssertEqual(outcome.text, OnDemandProvider.thermalNotSampledMessage)
         XCTAssertFalse(outcome.text.contains("availability"))
+    }
+
+    // MARK: - The overview's slice of the same sample
+
+    /// The overview's thermal section is independently optional, so before the
+    /// first pass its key is absent. Once a pass has answered, the section is
+    /// present — and presence must not read as "the sensors answered": it names
+    /// the state, exactly as `get_temperatures_fans` does.
+    func testOverviewThermalSectionNamesTheStateWhenItIsPresent() async throws {
+        for (sample, expected) in [
+            (ThermalSample.noSensors, "noSensors"),
+            (ThermalSample.notSampledYet, "notSampledYet"),
+            (
+                ThermalSample.readings(cpuTempC: 40, gpuTempC: nil, hottestTempC: 40, fans: []),
+                "available"
+            ),
+        ] {
+            let stub = StubProvider()
+            var system = StubProvider.makeSample()
+            system.thermal = sample
+            stub.sample = system
+            let tool = try makeExecutor(provider: stub)
+            let outcome = await tool.execute(name: "get_system_overview", arguments: [:])
+
+            XCTAssertFalse(outcome.isError, outcome.text)
+            let thermal = try XCTUnwrap(
+                jsonObject(outcome.text)["thermal"] as? [String: Any],
+                "a sample in the snapshot must produce a thermal section: \(outcome.text)"
+            )
+            XCTAssertEqual(thermal["availability"] as? String, expected)
+            XCTAssertEqual(thermal["available"] as? Bool, expected == "available")
+        }
+    }
+
+    /// With no sample at all the overview omits the section entirely, which is
+    /// the one case where absence is the honest answer.
+    func testOverviewOmitsThermalBeforeAnySample() async throws {
+        let stub = StubProvider()
+        stub.sample = StubProvider.makeSample()
+        stub.sample.thermal = nil
+        let tool = try makeExecutor(provider: stub)
+        let outcome = await tool.execute(name: "get_system_overview", arguments: [:])
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        let json = try jsonObject(outcome.text)
+        XCTAssertFalse(
+            json.keys.contains("thermal"),
+            "an unsampled snapshot has nothing to say about sensors: \(outcome.text)"
+        )
     }
 }
