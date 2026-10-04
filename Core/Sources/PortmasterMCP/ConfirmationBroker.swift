@@ -64,17 +64,40 @@ public actor ConfirmationBroker {
 
     public static let defaultTimeout: TimeInterval = 60
 
+    /// What a caller is told when it asks about an id that is already waiting. It
+    /// reaches the AI client as-is, so it names the problem rather than the
+    /// internal rule that caused it.
+    static let duplicateIDReason =
+        "Another request with this id is already awaiting a decision."
+
     /// Longest real time a waiting task sleeps before re-reading the clock.
     /// Small enough for a test to move an injected clock and see the effect,
     /// large enough to be noise next to a person taking seconds to decide.
     private static let clockPollInterval: TimeInterval = 0.05
 
-    private struct Entry {
+    /// A pending request and the caller waiting on it.
+    ///
+    /// A class rather than a struct, so that a budget task can recognise *its own*
+    /// entry by identity. That matters because a timer can wake after its entry is
+    /// gone: if it looked the entry up by id, a request that reused that id would
+    /// be expired by a budget that was never its own. With identity there is nothing
+    /// to confuse — a late timer finds its own entry missing and stops.
+    private final class Entry {
         let request: MCPApprovalRequest
         let continuation: CheckedContinuation<ApprovalOutcome, Never>
         /// When this request's caller stops waiting, measured on `clock`.
         let deadline: Date
         var timeout: Task<Void, Never>?
+
+        init(
+            request: MCPApprovalRequest,
+            continuation: CheckedContinuation<ApprovalOutcome, Never>,
+            deadline: Date
+        ) {
+            self.request = request
+            self.continuation = continuation
+            self.deadline = deadline
+        }
     }
 
     private let timeout: TimeInterval
@@ -128,37 +151,44 @@ public actor ConfirmationBroker {
     /// what went wrong. There is deliberately no error case here: an outcome the
     /// model can read is worth more than a thrown error it has to translate.
     public func request(_ request: MCPApprovalRequest) async -> ApprovalOutcome {
-        // Two entries sharing an id would make `decide` ambiguous — a stale answer
-        // for the first could be delivered to the second — so the second caller is
-        // told no instead of being queued behind an id it cannot be told apart
-        // from. Answering it here rather than throwing keeps the rule that every
-        // request ends in an outcome the model can read.
+        // Two live entries sharing an id would make `decide` ambiguous — a
+        // stale answer could be delivered to the wrong caller — so the second
+        // caller is told no instead of being queued behind an id it cannot be told
+        // apart from. Answering it here rather than throwing keeps the rule that
+        // every request ends in an outcome the model can read. This guard is what
+        // makes `decide`'s id lookup unambiguous among live entries.
+        //
+        // Reusing an id *after* its entry has left the queue is safe from this
+        // side: a budget task recognises its own entry by identity, so a late timer
+        // cannot expire the new request with `.timedOut`. What can still cross is a
+        // presenter's own late answer, because it holds nothing but the id. So the
+        // rule for callers is: never reuse an id. Ids come from `UUID()` and nothing
+        // in the slice regenerates them, which is what makes that hold.
         guard !queue.contains(where: { $0.request.id == request.id }) else {
-            return .denied(reason: "Another request with this id is already awaiting a decision.")
+            return .denied(reason: Self.duplicateIDReason)
         }
 
         let deadline = clock().addingTimeInterval(timeout)
         return await withCheckedContinuation { continuation in
-            queue.append(
-                Entry(request: request, continuation: continuation, deadline: deadline)
+            let entry = Entry(
+                request: request, continuation: continuation, deadline: deadline
             )
+            queue.append(entry)
             // Armed here rather than when the request reaches the head, so the
-            // budget cannot be silently extended by queueing. The task captures
-            // the broker strongly and that is deliberate: a weak capture would let
-            // a deallocated broker strand a suspended caller with no way to ever
-            // resume it. The cycle is bounded by the budget, and `resume` cancels
-            // the task, which ends it.
+            // budget cannot be silently extended by queueing. The task captures the
+            // broker strongly and that is deliberate: a weak capture would let a
+            // deallocated broker strand a suspended caller with no way to ever
+            // resume it. The cycle is bounded by the budget, and `resume` cancels the
+            // task, which ends it.
             //
-            // The index is captured rather than recomputed as `queue.count - 1`
-            // because the task belongs to *this* entry. Nothing can interleave
-            // between the append and this line — the body is synchronous inside an
-            // actor-isolated method — so the two are equivalent today, and if they
-            // were ever separated by an await the task would be attached to some
-            // other request and `expire` would cancel the wrong budget.
-            let index = queue.count - 1
-            queue[index].timeout = Task { [self] in
-                await Self.wait(until: deadline, clock: clock)
-                expire(id: request.id)
+            // The task is handed `entry`, not an index into `queue`, because the
+            // entry is what it has to act on. It cannot be given an index: the
+            // queue shifts under it every time anything is decided or cancelled, so
+            // the position would mean something different by the time the timer
+            // fired.
+            entry.timeout = Task { [self] in
+                await Self.wait(until: entry.deadline, clock: clock)
+                expire(entry)
             }
         }
     }
@@ -192,19 +222,19 @@ public actor ConfirmationBroker {
 
     // MARK: - Terminating a request
 
-    /// The budget ran out. Looks the entry up by id rather than by position,
-    /// because a queued request whose budget elapsed while it was still waiting
-    /// has missed it just as surely as one that was being presented, and because
-    /// `decide` can remove an entry from anywhere in the queue.
+    /// The budget ran out for `entry`. Looks the entry up by identity rather than by
+    /// position, because the entry it was armed for is exactly what must be
+    /// resumed — no more, no less.
     ///
-    /// In practice the head lapses first — every entry shares one budget and
-    /// deadlines run in enqueue order — so this is a head removal today. The
-    /// id lookup rather than `removeFirst()` is what keeps it correct anyway: an
-    /// entry that is not where the timer expects it still gets its own caller
-    /// resumed exactly once, and a timer's late fire still finds its own entry
-    /// rather than someone else's.
-    private func expire(id: UUID) {
-        guard let index = queue.firstIndex(where: { $0.request.id == id }) else { return }
+    /// Which position that is depends on the clock. Deadlines are assigned at
+    /// enqueue from the same clock, so with a real one they run in enqueue order,
+    /// the head's budget lapses first, and this is a removal from the front. When
+    /// two requests land on the *same* deadline — a frozen clock between the two
+    /// `request` calls, or a clock too coarse to tell them apart — neither lapses
+    /// first by construction, and the entry being removed can be anywhere in the
+    /// queue. So this must never assume it is at the front.
+    private func expire(_ entry: Entry) {
+        guard let index = queue.firstIndex(where: { $0 === entry }) else { return }
         resume(queue.remove(at: index), with: .timedOut)
     }
 

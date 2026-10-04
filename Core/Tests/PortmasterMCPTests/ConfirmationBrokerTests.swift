@@ -162,12 +162,14 @@ final class ConfirmationBrokerTests: XCTestCase {
     }
 
     /// A burst that nobody answers has to terminate request by request, not just
-    /// for the one that happened to be on screen. Both budgets lapse within the
-    /// same window here, so the second expiry may find itself at the head or
-    /// behind the first; either way each caller gets its own `.timedOut` and the
-    /// queue drains completely.
+    /// for the one that happened to be on screen.
+    ///
+    /// The budget is 0.25 s rather than something tighter: this test has to get two
+    /// task spawns and two actor hops inside one budget, and on a loaded machine a
+    /// 50 ms budget can lapse before the second request has enqueued — which would
+    /// fail the test for being slow rather than for being wrong.
     func testAQueuedRequestTimesOutBehindTheFirst() async throws {
-        let broker = ConfirmationBroker(timeout: 0.05)
+        let broker = ConfirmationBroker(timeout: 0.25)
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
@@ -188,7 +190,45 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(pending, [])
     }
 
-    // MARK: - Answering a request that is not the one on screen
+    /// Two requests whose deadlines land on the same instant, which is what a
+    /// clock frozen between the two `request` calls produces: both budgets are read
+    /// at enqueue, so with a clock that does not move they are identical.
+    ///
+    /// This is the case where a request is not at the head when its own budget
+    /// lapses, so it is the case that exercises expiry removing an entry from the
+    /// middle of the queue rather than the front — which a real clock cannot produce,
+    /// because staggered enqueues offset the 50 ms wake-ups and the head's budget
+    /// always runs out first. Both callers must come back `.timedOut` and nothing may
+    /// be left queued, whichever entry the timers reach first.
+    func testTwoRequestsOnTheSameDeadlineBothTimeOut() async throws {
+        let clock = FakeClock()
+        let broker = ConfirmationBroker(clock: { clock.now })
+        let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
+        let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
+
+        let (firstBox, _) = start(broker, first)
+        let (secondBox, _) = start(broker, second)
+        // Both are live before anything is decided, so neither deadline has passed
+        // and the queue is the thing being asserted, not one request's timing.
+        await waitForQueued(broker, 2)
+        await waitWhileSuspended(firstBox)
+        await waitWhileSuspended(secondBox)
+        XCTAssertNil(firstBox.outcome, "a budget that has not elapsed must not expire")
+        XCTAssertNil(secondBox.outcome, "a budget that has not elapsed must not expire")
+
+        // One advance past the shared deadline, so both timers lapse together.
+        clock.advance(by: ConfirmationBroker.defaultTimeout + 1)
+        let firstOutcome = try await waitForOutcome(firstBox)
+        XCTAssertEqual(firstOutcome, .timedOut)
+        let secondOutcome = try await waitForOutcome(secondBox)
+        XCTAssertEqual(secondOutcome, .timedOut)
+        let remaining = await broker.queuedCount
+        XCTAssertEqual(remaining, 0, "a lapsed pair leaves nothing queued")
+        let pending = await pendingIDs(broker)
+        XCTAssertEqual(pending, [])
+    }
+
+        // MARK: - Answering a request that is not the one on screen
 
     /// A presenter may be holding a request that has been superseded, or a window
     /// that outlived the queue. `decide` answers by id wherever the request is, so
@@ -342,10 +382,15 @@ final class ConfirmationBrokerTests: XCTestCase {
             broker, makeRequest(kind: .stopContainer, summary: "Stop container web", id: shared)
         )
         let secondOutcome = try await waitForOutcome(secondBox)
-        XCTAssertEqual(
-            secondOutcome,
-            .denied(reason: "Another request with this id is already awaiting a decision."),
-            "a duplicate id is refused instead of queued"
+        guard case .denied(let reason) = secondOutcome else {
+            return XCTFail("a duplicate id must be denied, got \(secondOutcome)")
+        }
+        // Matched loosely on purpose: the exact wording is user-facing text that can
+        // change without anything breaking, so pinning it here would only make the
+        // test a tripwire for a copy edit.
+        XCTAssertTrue(
+            reason.contains("already awaiting a decision"),
+            "the reason must say the id is taken, got: \(reason)"
         )
         let depth = await broker.queuedCount
         XCTAssertEqual(depth, 1, "only the first request is waiting")
