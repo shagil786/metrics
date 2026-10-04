@@ -177,28 +177,34 @@ final class CLIRoutingTests: XCTestCase {
     }
 
     /// A socket file left behind by a crash is the failure this design has to get right,
-    /// because the file *looks* like an app: it exists, it has a socket's shape, and it
-    /// was written by a real launch. The pid in it is the only thing that says the
-    /// process is gone.
+    /// because the file *looks* like an app: it exists, it is a real socket, and it was
+    /// written by a real launch. The pid in it is the only thing that says the process is
+    /// gone.
     ///
-    /// The socket path here is also not a socket at all — a leftover regular file — so
-    /// this fails closed twice over. A CLI that trusted the file would try to speak MCP
-    /// to a file and hang.
+    /// Both halves are real rather than mocked: the socket at `socketPath` was bound by
+    /// `UnixSocketBinding.listen` and then its listener closed, which is exactly what a
+    /// killed host leaves behind — a bound socket file with nothing behind it, so a
+    /// connect is refused with `ECONNREFUSED`. And the pid is genuinely gone, which the
+    /// test asserts before relying on it.
     func testFallsBackWhenTheHostDiesBeforeSelection() async throws {
-        let directory = try makeTemporaryDirectory(prefix: name)
+        // Short prefix, like `MCPHostHarness`: `sockaddr_un.sun_path` holds 103 bytes
+        // and this test binds a real socket, so a directory named after the test method
+        // would not fit.
+        let directory = try makeTemporaryDirectory(prefix: "pm")
         let socketPath = directory.appendingPathComponent("mcp.sock")
-        // Not a socket: whatever survives a crash, this is what a stale endpoint most
-        // often names.
-        try Data("not a socket".utf8).write(to: socketPath)
+        let listener = try UnixSocketBinding.listen(path: socketPath.path)
+        close(listener)
+        // A socket file with no listener is what a `kill -9` leaves; a regular file is
+        // not, and using one would let the test pass without either check working.
+        XCTAssertNil(
+            UnixSocketBinding.connect(path: socketPath.path),
+            "the socket file must be a real leftover, or this test proves nothing"
+        )
 
         let dead: pid_t = 0x7FFF_FFFF
         XCTAssertEqual(kill(dead, 0), -1, "the pid this test calls dead must actually be dead")
         try EndpointFileStore.write(
-            EndpointFile(
-                socket: socketPath,
-                token: try EndpointFileStore.newToken(),
-                pid: dead
-            ),
+            EndpointFile(socket: socketPath, token: try EndpointFileStore.newToken(), pid: dead),
             directory: directory
         )
 
@@ -207,6 +213,99 @@ final class CLIRoutingTests: XCTestCase {
         guard case .onDemand = route else {
             return XCTFail("an endpoint file naming a dead process must not be believed")
         }
+    }
+
+    /// The same leftover with a **live** pid, which is the only way to tell the two
+    /// staleness checks apart.
+    ///
+    /// With the test's own pid in the file, the endpoint passes every liveness check and
+    /// the refusal has to come from the refused connect. Together with the test above —
+    /// same leftover socket, dead pid — the two cover each mechanism independently
+    /// instead of both passing because *something* failed.
+    func testFallsBackWhenTheSocketIsRefusedEvenWithALivePID() async throws {
+        let directory = try makeTemporaryDirectory(prefix: "pm")
+        let socketPath = directory.appendingPathComponent("mcp.sock")
+        let listener = try UnixSocketBinding.listen(path: socketPath.path)
+        close(listener)
+
+        try EndpointFileStore.write(
+            EndpointFile(
+                socket: socketPath,
+                token: try EndpointFileStore.newToken(),
+                pid: ProcessInfo.processInfo.processIdentifier
+            ),
+            directory: directory
+        )
+        // The file passes `read` — a live pid, a well-formed token — so whatever makes
+        // this fall back is the refused connect and nothing else.
+        XCTAssertNotNil(
+            EndpointFileStore.read(directory: directory),
+            "this case must get past the liveness check, or it is the test above again"
+        )
+
+        let route = await MCPRouteSelector.select(environment: [:], endpointDirectory: directory)
+
+        guard case .onDemand = route else {
+            return XCTFail("a socket file nothing is listening on is not an app")
+        }
+    }
+
+    /// A wrong token is "app not available", and the refusal is the branch of the
+    /// handshake judgement that nothing else here reaches.
+    ///
+    /// Every other test in this file connects with the token the host minted, so the
+    /// only thing that distinguishes "admitted" from "closed" — the 250 ms wait for a
+    /// close that a refusal produces and an admission does not — is exercised here. Without
+    /// it, a client that treated every handshake as admitted would pass the whole file:
+    /// the cost of that bug is a CLI that believes in a socket it was just refused by,
+    /// and then waits `probeTimeout` for MCP that will never come.
+    func testWrongTokenIsAppNotAvailable() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+
+        // Same live socket, same live pid, a well-formed token that is not this launch's.
+        let real = try XCTUnwrap(EndpointFileStore.read(directory: harness.endpointDirectory))
+        let wrong = try Self.someOtherToken(real.token)
+        try EndpointFileStore.write(
+            EndpointFile(socket: real.socket, token: wrong, pid: real.pid),
+            directory: harness.endpointDirectory
+        )
+
+        XCTAssertNil(
+            SocketMCPClient(endpointDirectory: harness.endpointDirectory),
+            "a refused handshake must read as 'no app', not as a client that may speak"
+        )
+
+        let captured = try await captureStderr {
+            await MCPRouteSelector.select(environment: [:], endpointDirectory: harness.endpointDirectory)
+        }
+        guard case .onDemand = captured.value else {
+            return XCTFail("a wrong token must fall back, or every stale-token CLI hangs")
+        }
+        XCTAssertEqual(
+            captured.stderr.split(separator: "\n").count, 1,
+            "a refusal is one line on stderr and nothing the client can see: \(captured.stderr)"
+        )
+        XCTAssertFalse(
+            captured.stderr.contains(wrong),
+            "not even the token that was refused may be repeated back: \(captured.stderr)"
+        )
+    }
+
+    /// A well-formed 64-character hex token that is not `other`.
+    ///
+    /// The host only compares tokens it has been given, so the wrong one has to look
+    /// right to reach the comparison — a short or non-hex token would be refused as
+    /// malformed and would never test the branch this is for. Differing in exactly one
+    /// character is also the closest case to a real one: a token that is wrong everywhere
+    /// is a typo of a different kind.
+    private static func someOtherToken(_ other: String) throws -> String {
+        let replacement: Character = other.first == "0" ? "1" : "0"
+        var flipped = other
+        flipped.replaceSubrange(other.startIndex..<other.index(after: other.startIndex),
+                               with: String(replacement))
+        XCTAssertNotEqual(flipped, other, "the replacement token must actually differ")
+        return flipped
     }
 
     // MARK: - The token

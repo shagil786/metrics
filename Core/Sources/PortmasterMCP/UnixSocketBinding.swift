@@ -110,12 +110,19 @@ enum UnixSocketBinding {
     /// is no app here" is an answer a caller acts on, not a failure to recover from.
     ///
     /// `SO_NOSIGPIPE` is set on the way out, and it is not optional polish. A write to a
-    /// socket whose peer has gone raises `SIGPIPE`, whose default action kills the
+    /// socket whose peer has gone raises `SIGPIPE`, whose default action terminates the
     /// process — so without this, a CLI whose Portmaster quit between two tool calls
-    /// would die mid-conversation instead of returning a tool error, which is the one
-    /// thing slice 2 promises cannot happen. The host side has the same exposure when a
-    /// client disappears, and it is set on both sides because one `connect` helper is
-    /// where both halves live.
+    /// would die mid-conversation instead of returning the tool error, which is the one
+    /// thing slice 2 promises cannot happen.
+    ///
+    /// **Client side only, and the host is not covered by this.** `MCPHostServer`
+    /// accepts descriptors from its own listener, so this function — and this
+    /// `setsockopt` — are never on that path: a client that disappears while the app is
+    /// writing a reply leaves the app's `write` to raise `SIGPIPE` and terminate it.
+    /// That is a pre-existing gap on the host side rather than something this task
+    /// changed, and it is carried to the host's own work with the same reasoning:
+    /// `SO_NOSIGPIPE` belongs on **both** ends of an `AF_UNIX` pair, and a socket type
+    /// is the only place both ends are in reach of the same helper.
     static func connect(path: String) -> UnixSocket? {
         guard var address = try? socketAddress(path: path) else { return nil }
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)

@@ -96,8 +96,11 @@ public enum MCPStdioRunner {
     /// per call is how a mutation ends up gated twice or answered from two different
     /// snapshots.
     ///
-    /// Only diagnostics go to stderr, and only if the session could not be
-    /// served at all. stdout carries JSON-RPC and nothing else.
+    /// Only diagnostics go to stderr: the route's one line when there is no app to relay
+    /// to, and this function's own line if the session could not be served at all. The
+    /// first of those is the *normal* path whenever Portmaster is not running, which is
+    /// why it is worded as a statement rather than as a failure. stdout carries
+    /// JSON-RPC and nothing else.
     ///
     /// - Parameter context: serves this surface instead of routing. For a test that
     ///   wants one specific authority; the executable passes none.

@@ -207,6 +207,53 @@ final class CLIIntegrationTests: XCTestCase {
         XCTAssertNotNil(payload["memory"], text)
     }
 
+    // MARK: Routing, in the executable
+
+    /// `runMain`'s routing, end to end, in the process it actually runs in.
+    ///
+    /// Nothing else here covers it: every routing test in `CLIRoutingTests` calls
+    /// `MCPRouteSelector` or `SocketMCPClient` directly, so the wiring this task added to
+    /// `runMain` — choose the route once inside the serving task, serve stdio with
+    /// `route.context`, disconnect the relayed socket on the way out — could be deleted
+    /// and every one of them would still pass. And stderr was previously read only to
+    /// explain a failure, so a CLI that printed nothing on the fallback, or printed a
+    /// paragraph, would also have passed.
+    ///
+    /// Both halves are asserted on one session: exactly one stderr line saying what
+    /// happened, and a session that answers normally regardless. The second half is the
+    /// one that matters most — the fallback line is on the *success* path, so a version
+    /// of this code that wrote to stdout to announce it would break every other test in
+    /// this file by corrupting the JSON-RPC channel, and this is where that would be
+    /// caught.
+    func testForcedOnDemandWritesOneStderrLineAndStillServesStdio() async throws {
+        let server = try MCPServerProcess.launch()
+
+        try server.initialize(id: 1)
+        let listed: [String: Any] = try server.request(
+            #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            timeout: Self.handshakeTimeout
+        )
+        XCTAssertNil(listed["error"], "\(listed)")
+        let tools = try XCTUnwrap(listed["result"] as? [String: Any])
+        XCTAssertEqual(
+            ((tools["tools"] as? [[String: Any]]) ?? []).count, 13,
+            "the fallback must serve the same catalog the app would"
+        )
+
+        // Read after the session has answered, so the line is known to have been written
+        // before it is asserted on rather than merely not written *yet*.
+        let stderrLines = server.stderrLines
+        XCTAssertEqual(
+            stderrLines.count, 1,
+            "the fallback is one line on stderr: \(stderrLines)"
+        )
+        XCTAssertTrue(
+            stderrLines.first?.contains("PORTMASTER_MCP") == true,
+            "the line must name the reason it fell back, so the user knows which thing to "
+                + "unset: \(stderrLines)"
+        )
+    }
+
     // MARK: Helpers
 
     /// The text of a single-content tool result.
@@ -242,10 +289,28 @@ final class MCPServerProcess {
     /// Launches the binary, or skips the test when it cannot be built for
     /// reasons that have nothing to do with this code — a broken toolchain is
     /// not a verdict on the server. An assertion failure never skips.
-    static func launch() throws -> MCPServerProcess {
+    ///
+    /// The child is launched with `PORTMASTER_MCP=on-demand` **merged into** this
+    /// process's environment, and that is load-bearing rather than tidiness.
+    /// `portmaster-mcp` now routes at startup: it reads the endpoint file at
+    /// `~/.portmaster/mcp-endpoint.json` and, if a Portmaster with MCP enabled is
+    /// running on this machine, it would relay to it. Then every test below would be
+    /// measuring the app's live sampler and its live gate instead of this process's
+    /// fallback, and would pass or fail as a function of whether the developer happened
+    /// to have the app open. These tests are about the local surface, so they ask for it.
+    ///
+    /// Merged rather than assigned: `Process.environment` replaces the child's
+    /// environment outright, and a binary with no `PATH` or `HOME` fails in ways that
+    /// have nothing to do with what is under test.
+    static func launch(environment additions: [String: String] = ["PORTMASTER_MCP": "on-demand"])
+        throws -> MCPServerProcess
+    {
         let binary = try resolveBinary()
         let process = Process()
         process.executableURL = binary
+        process.environment = ProcessInfo.processInfo.environment.merging(additions) {
+            _, forced in forced
+        }
         let toServer = Pipe()
         let fromServer = Pipe()
         let errors = Pipe()
@@ -270,6 +335,15 @@ final class MCPServerProcess {
     }
 
     deinit { stop(expectingExit: false) }
+
+    /// Everything the server has written to stderr so far, as lines.
+    ///
+    /// Read from a pipe rather than a captured file: the whole point of this file's
+    /// routing assertion is that the fallback line arrives while the session is still
+    /// open, so the test must not have to wait for the process to exit to see it.
+    var stderrLines: [String] {
+        stderrReader.text.split(separator: "\n").map(String.init)
+    }
 
     /// Closes stdin, which is how an MCP client ends a stdio session, and waits
     /// for the process to exit — the server's promise that EOF ends the session.

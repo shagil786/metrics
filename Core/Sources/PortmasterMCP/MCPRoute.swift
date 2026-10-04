@@ -6,9 +6,27 @@
 // machine. So the CLI's first act is to ask whether there is an app to talk to, and only
 // then decide who answers.
 //
-// The route was extracted out of `SocketMCPClient`, which owns the relay itself; the
-// decision and the thing it decides between are different questions, and this file now
-// holds the first beside `MCPRouteSelector` alone.
+// Four decisions, each of which the obvious alternative gets wrong:
+//
+//  1. **The route is chosen once, at startup, and never revisited.** Not per call: a
+//     per-call decision is how one mutation ends up gated twice — once here, once in
+//     the app — or how two reads come back from two snapshots taken a second apart.
+//     Once is also what makes "one authority per call" checkable rather than aspirational.
+//  2. **Failing to reach an app is not a client-visible error.** Absent endpoint, wrong
+//     token, dead pid, refused connect, wedged socket: all of it is "no app", which is
+//     slice 1's situation and slice 1's path. One line on stderr, then the on-demand
+//     path. An agent asking for a reading must not be told its connection broke because
+//     the user has not launched Portmaster.
+//  3. **The relay performs no gating and writes no audit line.** It forwards a name and
+//     arguments and returns what comes back. A second gate is a second policy, and a
+//     second audit line is a second account of what was decided; the app's executor is
+//     the only authority for a relayed call.
+//  4. **The token is never a route's business.** The route never reads it, prints it or
+//     reasons about it; the client presents it once and nothing else on this path can
+//     see it. A token in a log line outlives the connection that leaked it.
+//
+// The relay itself is `SocketMCPClient`, and the on-demand path is slice 1's
+// `LocalMCPCallContext`, unchanged.
 
 import Foundation
 
@@ -44,10 +62,23 @@ public enum MCPRouteSelector {
     /// working, it is for one that is not.
     public static let onDemandVariable = "PORTMASTER_MCP"
 
-    /// The one line a fallback writes. On stderr, and never on stdout — stdout is the
-    /// JSON-RPC channel, and a client reading a diagnostic there will try to parse it.
-    public static let fallbackNotice =
-        "portmaster-mcp: no Portmaster on the socket; answering from an on-demand sweep."
+    /// What the CLI says when it could not reach an app.
+    ///
+    /// Said about the socket rather than about Portmaster: every trigger here is
+    /// "nothing is answering on the socket", and a line that named a cause would name
+    /// the wrong one more often than not.
+    public static let unavailableNotice =
+        "portmaster-mcp: no Portmaster answering on the socket; this session is doing its own sweep."
+
+    /// What the CLI says when the user forced the on-demand path.
+    ///
+    /// **Not** `unavailableNotice`, and the difference is the whole point of the
+    /// variable. When this is printed, an app may well be listening and perfectly
+    /// healthy — that is the usual reason anyone sets it — and telling the user "no
+    /// Portmaster answering on the socket" would be the one untrue thing the process
+    /// says, pointing them away from the wedged app they were trying to route around.
+    public static let forcedNotice =
+        "portmaster-mcp: \(onDemandVariable)=on-demand, so this session is doing its own sweep even though Portmaster is up."
 
     /// `.proxy` when a live, authenticated host answers; `.onDemand` when
     /// `PORTMASTER_MCP=on-demand` is set, the endpoint is unavailable, or the
@@ -68,7 +99,7 @@ public enum MCPRouteSelector {
         endpointDirectory: URL? = nil
     ) async -> MCPRoute {
         if isForcedOnDemand(environment) {
-            notice()
+            notice(forcedNotice)
             return .onDemand(LocalMCPCallContext())
         }
         // `nil` here is every way of not reaching an app at once: no endpoint file, a
@@ -80,7 +111,7 @@ public enum MCPRouteSelector {
         {
             return .proxy(client)
         }
-        notice()
+        notice(unavailableNotice)
         return .onDemand(LocalMCPCallContext())
     }
 
@@ -91,14 +122,13 @@ public enum MCPRouteSelector {
         return value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "on-demand"
     }
 
-    /// The one line a fallback writes, to stderr — never to stdout, which is the
-    /// JSON-RPC channel, where a client would try to parse it.
+    /// One line, to stderr — never to stdout, which is the JSON-RPC channel, where a
+    /// client would try to parse it.
     ///
-    /// No token anywhere near this, and nothing about *why* the probe failed: a reason
+    /// No token anywhere near this, and nothing about *why* a probe failed: a reason
     /// would be a description of the endpoint file, and the endpoint file is where the
     /// token is.
-    private static func notice() {
-        FileHandle.standardError.write(Data((fallbackNotice + "\n").utf8))
+    private static func notice(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
-

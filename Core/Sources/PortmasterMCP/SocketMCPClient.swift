@@ -1,39 +1,31 @@
-// SocketMCPClient: the CLI's half of slice 2, and the decision it exists to make.
+// SocketMCPClient: the CLI's half of slice 2.
 //
-// Slice 1 made the CLI a server. Slice 2 has to make it a *router*: when Portmaster is
-// running it holds the authoritative state, the permission gate and the confirmation
-// window, and a CLI that ignores all of that is a second, weaker opinion about the same
-// machine. So the CLI's first act is to ask whether there is an app to talk to, and only
-// then decide who answers.
+// Slice 1 made the CLI a server and slice 2 gave the running app one of its own. This is
+// the client half of the pair: it presents the token, speaks MCP to whatever is on the
+// socket, and forwards a call's name and arguments without ever interpreting them. Where
+// the session's authority comes from — and the decision itself — is `MCPRoute`.
 //
-// Five decisions, each of which the obvious alternative gets wrong:
+// Four things here are load-bearing and are stated once each, at the code that does them:
 //
-//  1. **The route is chosen once, at startup, and never revisited.** Not per call: a
-//     per-call decision is how one mutation ends up gated twice — once here, once in
-//     the app — or how two reads come back from two snapshots taken a second apart.
-//     Once is also what makes "one authority per call" checkable rather than aspirational.
-//  2. **Failing to reach an app is not a client-visible error.** Absent endpoint, wrong
-//     token, dead pid, refused connect, wedged socket: all of it is "no app", which is
-//     slice 1's situation and slice 1's path. One line on stderr, then the on-demand
-//     path. An agent asking for a reading must not be told its connection broke because
-//     the user has not launched Portmaster.
-//  3. **The relay performs no gating and writes no audit line.** It forwards a name and
-//     arguments and returns what comes back. A second gate is a second policy, and a
-//     second audit line is a second account of what was decided; the app's executor is
-//     the only authority for a relayed call.
-//  4. **A failure mid-call is a tool result, not a thrown error.** The host renders tool
-//     results and refuses to render transport errors, so a client whose app quit must
-//     still receive something it can read. The text says what happened and invents no
-//     outcome — in particular it does *not* re-run the call locally, because that would
-//     be a second attempt at a mutation nobody knows the state of.
-//  5. **The token goes out once, in the handshake line, and nowhere else.** It is read
-//     from the endpoint file, written straight to the descriptor, and never formed into
-//     a diagnostic, an error string, a log line or a payload. A token in an error string
-//     outlives the connection that leaked it.
+//  1. **Nothing is interpreted locally.** No gate, no audit line, no retry, no local
+//     re-run on failure. A relayed call has one authority or it has none: re-running it
+//     here would apply a second gate to a mutation whose first outcome nobody can see
+//     any more, and would answer a caller from a different machine state than the one
+//     the app just acted on.
+//  2. **Every wait is bounded.** The failure this exists for is the app *disappearing*:
+//     the SDK's message loop ends when its input does and leaves a request it already
+//     read outstanding, so a call made at that moment waits for a reply that can never
+//     arrive. A bound is what turns a wedged app into an error an agent can read.
+//  3. **Failures are tool results, never throws.** The host renders tool results and
+//     refuses to render transport errors, so a client whose app quit must still receive
+//     something readable — and something that invents no outcome.
+//  4. **The token goes out once, in the handshake line, and nowhere else.** Read from
+//     the endpoint file, written straight to the descriptor, never formed into a
+//     diagnostic, an error string, a log line or a payload.
 //
-// The handshake itself is not reimplemented here: `UnixSocketBinding` addresses the
-// socket, and `UnixSocketTransport` frames MCP over the connected descriptor — the same
-// code the host uses, so the two ends cannot drift apart.
+// The handshake itself is not reimplemented: `UnixSocketBinding` addresses the socket
+// and `UnixSocketTransport` frames MCP over the connected descriptor — the same code the
+// host uses, so the two ends cannot drift apart.
 
 import Foundation
 import MCP
@@ -43,8 +35,6 @@ import MCP
 #elseif canImport(Glibc)
     import Glibc
 #endif
-
-// MARK: - The client
 
 /// Relays tool calls to a running Portmaster over its Unix socket.
 ///
@@ -56,8 +46,8 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
 
     /// What a client is told when the app cannot answer. Plain language, no errno, no
     /// socket path, and no suggestion that anything was retried: the honest description
-    /// is that the app is not there, and inventing a cause would send whoever reads it
-    /// looking in the wrong place.
+    /// is that the app is not answering, and inventing a cause would send whoever reads
+    /// it looking in the wrong place.
     public static let unavailableText =
         "Portmaster isn't running; showing on-demand readings instead."
 
@@ -71,12 +61,25 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// Short, because it is paid on every CLI start with an app running and there is
     /// nothing to wait for: a refusal closes the descriptor as soon as the host has read
     /// the line, which on a local socket is far below this.
+    ///
+    /// **It is a cooperative-pool cost, and raising it is not a tuning decision.**
+    /// `init?` judges the handshake with a blocking read on whatever thread called it,
+    /// and its callers are async, so every millisecond here is a millisecond a
+    /// cooperative-pool thread spends blocked in `recv`. At 250 ms that is invisible. At
+    /// the host's own ten-second handshake timeout it would be a real stall in a pool
+    /// sized to the machine's cores — and it would be silent, because nothing about the
+    /// code would have changed. A future raise must come with the probe moved off the
+    /// pool (see `wasAdmitted`), not on its own.
     static let handshakeSilenceTimeout: TimeInterval = 0.25
 
-    /// How long `initialize` may take before the app is written off. Generous, because
-    /// this is the one probe that decides the whole session and being wrong in the slow
-    /// direction only costs a client its live data for one turn.
-    static let probeTimeout: TimeInterval = 10
+    /// How long `initialize` may take before the app is written off.
+    ///
+    /// ~10× the cost of a probe that works (a local socket, ~250 ms including the
+    /// handshake wait), which leaves room for a loaded machine and a cold app without
+    /// making a wedged app cost a startup stall anyone would report. The host is
+    /// answering MCP on a Unix socket; a healthy one answers in microseconds, so there is
+    /// no legitimate case this needs to be large.
+    static let probeTimeout: TimeInterval = 2.5
 
     /// How long one relayed call may take.
     ///
@@ -106,6 +109,17 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// decided inside `init?` — by watching for the close a refusal produces — and
     /// whether MCP itself came up is `open()`'s, because that part is asynchronous and
     /// `MCPRouteSelector` is what asks.
+    ///
+    /// This blocks for up to `handshakeSilenceTimeout` doing that judgement, on the
+    /// caller's thread. That is a bounded cost accepted on purpose, and the reasoning is
+    /// the same as for not using a semaphore: the alternative — blocking on the SDK's
+    /// async `connect` from here — would park a cooperative-pool thread for a whole
+    /// round trip *and* nest a wait inside the call that has to make progress. A
+    /// semaphore does not deadlock this, it would just cost more and prove less; the real
+    /// reason to stay synchronous is that `open()` then has a single job (MCP), rather
+    /// than also having to re-derive whether it may talk on this descriptor at all.
+    /// See the note on `handshakeSilenceTimeout` for the constraint that puts on raising
+    /// either number.
     ///
     /// Not throwing is the design, not a convenience: a CLI's startup path has exactly
     /// one fallback, and an `NSError` about a socket would tempt a caller into
@@ -143,20 +157,21 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// descriptor open", which is a question no caller has.
     public var isConnected: Bool { lock.withLock { connected } }
 
+    /// The underlying SDK client, once there is one.
+    ///
+    /// Internal, and it exists so a test can ask the app a question of its own —
+    /// `tools/list` in particular, which cannot be compared against the CLI's own idea
+    /// of what the app would say. Every production path goes through `call`, which is
+    /// the one that bounds, translates and reports.
+    var mcpClient: Client? { lock.withLock { connected ? client : nil } }
+
     /// Runs one call in the app and reports what it said.
     ///
-    /// Never throws and never falls back to a local executor. A relayed call has one
-    /// authority or it has none: re-running it here would apply a second gate to a
-    /// mutation whose first outcome nobody can see any more, and would answer a caller
-    /// with data from a different machine state than the one the app just acted on.
+    /// Never throws and never falls back to a local executor. See the note at the top of
+    /// this file: a relayed call has one authority or it has none.
     public func call(name: String, arguments: [String: String]) async -> ToolOutcome {
         guard let client = mcpClient else { return Self.unavailable }
         do {
-            // Bounded, because the failure this exists for is the app *disappearing*:
-            // the SDK's message loop ends when its input does and leaves a request it
-            // has already read outstanding, so a call made at that moment waits for a
-            // reply that can never arrive. A bound is what turns a wedged app into an
-            // error an agent can read.
             let answer: (text: String, isError: Bool)? = try await Self.withDeadline(
                 Self.callTimeout
             ) {
@@ -189,14 +204,6 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
         }
     }
 
-    /// The underlying SDK client, once there is one.
-    ///
-    /// Internal, and it exists so a test can ask the app a question of its own —
-    /// `tools/list` in particular, which cannot be compared against the CLI's own idea
-    /// of what the app would say. Every production path goes through `call`, which is
-    /// the one that bounds, translates and reports.
-    var mcpClient: Client? { lock.withLock { connected ? client : nil } }
-
     /// Completes MCP's `initialize`, or reports that there is no app to talk to.
     ///
     /// Separate from `init?` because this part is asynchronous and `init?` cannot be:
@@ -208,8 +215,15 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// Returns `false` for every reason there is no app, including the deadline: a host
     /// that accepts the connection and then says nothing is not available, whatever the
     /// endpoint file claims.
+    ///
+    /// Idempotent, because the alternative is a second `initialize` on a connection the
+    /// app is already serving MCP on — which its `Server` answers with "Server is
+    /// already initialized", and which would leave a second session in the app's
+    /// `ClientRegistry` behind a client that only wanted to ask whether it was up.
     @discardableResult
     public func open() async -> Bool {
+        if isConnected { return true }
+
         let client = Client(name: "portmaster-mcp-cli", version: MCPStdioRunner.serverVersion)
         // The host's own transport, over the descriptor the handshake already left
         // authenticated. There is no pending bytes to seed: the handshake read the
@@ -277,6 +291,11 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// Any byte at all is a refusal of a different kind: the host this connects to
     /// answers a handshake, and nothing on this connection could be framed correctly
     /// after that.
+    ///
+    /// **This blocks the calling thread**, which is why `handshakeSilenceTimeout` is
+    /// 250 ms and carries the warning it does. Moving the wait off the cooperative pool
+    /// means reading the descriptor on a thread of its own and handing the answer back —
+    /// which is also what a handshake-scale timeout would require.
     private static func wasAdmitted(_ socket: UnixSocket) -> Bool {
         let deadline = Date().addingTimeInterval(handshakeSilenceTimeout)
         var chunk = [UInt8](repeating: 0, count: 512)
