@@ -25,20 +25,24 @@ public struct FanSample: Hashable, Sendable {
 }
 
 /// What a thermal sample is a statement about. Three answers, kept apart because
-/// "this machine has no sensors" and "no pass has finished yet" are different
-/// facts: one is a property of the hardware, the other of the clock. Mirrors
-/// `DockerAvailability` for the same reason.
+/// "this machine has no sensors" and "this pass read nothing" are different
+/// facts: one is about the hardware, the other about a single pass. Both are
+/// statements about the pass that produced the sample, never about the whole
+/// session — a later pass may answer differently. Mirrors `DockerAvailability`
+/// for the same reason.
 public enum ThermalAvailability: Hashable, Sendable {
-    /// A sensor pass ran and produced readings.
+    /// This pass decoded readings.
     case available
-    /// A pass reached a readable SMC and no recognized sensor produced a
+    /// This pass reached a readable SMC and no recognized sensor produced a
     /// plausible reading: no temperature/fan key of a type this collector
     /// decodes, or none of them decoded to a believable value. It is not a claim
     /// that the machine has no sensors — only that nothing this collector can
-    /// read came back with a value.
+    /// read came back with a value on this pass.
     case noSensors
-    /// No pass has observed anything: the SMC never opened, or not one cached
-    /// key could be read. Says nothing at all about the machine's hardware.
+    /// This pass observed nothing: the SMC never opened, the key space could not
+    /// be enumerated at all, or not one cached key could be read. Says nothing at
+    /// all about the machine's hardware, and nothing about earlier or later
+    /// passes — the same SMC may answer on the next one.
     case notSampledYet
 }
 
@@ -46,8 +50,8 @@ public enum ThermalAvailability: Hashable, Sendable {
 /// (no keys for that group, SMC unavailable) — never zero-filled.
 /// `availability` says which of the three answers the sample as a whole is, so
 /// the readings are never read as the answer on their own: all-nil readings can
-/// mean "nothing readable answered" or "nothing has been observed yet", and
-/// only the enum tells those apart.
+/// mean "nothing readable answered on this pass" or "this pass reached nothing",
+/// and only the enum tells those apart.
 public struct ThermalSample: Hashable, Sendable {
     /// Which of the three answers this sample carries.
     public let availability: ThermalAvailability
@@ -89,9 +93,10 @@ public struct ThermalSample: Hashable, Sendable {
         availability: .noSensors, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
     )
 
-    /// Nothing has been observed yet. The same readings as `noSensors`, and a
-    /// different fact: no pass has read the machine, so this says nothing about
-    /// its hardware.
+    /// The pass that produced this sample read nothing. The same readings as
+    /// `noSensors`, and a different fact: this pass never reached a reading, so
+    /// it says nothing about the machine's sensors — an earlier or a later pass
+    /// may have answered.
     public static let notSampledYet = ThermalSample(
         availability: .notSampledYet, cpuTempC: nil, gpuTempC: nil, hottestTempC: nil, fans: []
     )
@@ -136,9 +141,11 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
     /// - readings this pass decoded,
     /// - `.noSensors` when a readable SMC held no key this collector decodes, or
     ///   none of them decoded to a believable value,
-    /// - `.notSampledYet` when the SMC never opened, or when not one cached key
-    ///   could be read — a pass that reached nothing observed nothing, so it must
-    ///   not report the machine as having no sensors.
+    /// - `.notSampledYet` when the SMC never opened, when the enumeration yielded
+    ///   no keys at all (so the key space was never seen), or when not one cached
+    ///   key could be read — cached keys only exist because some earlier pass
+    ///   enumerated them, so this case means *this* pass read nothing, not that no
+    ///   pass ever has. It must not report the machine as having no sensors.
     public func sample() -> ThermalSample {
         Self.lock.lock(); defer { Self.lock.unlock() }
         rawReadsAnswered = 0
@@ -188,9 +195,12 @@ public final class SMCCollector: ThermalProviding, @unchecked Sendable {
     /// temperature-type keys. Cache even temporarily invalid readings so
     /// a cold/idle sensor can recover. The first failed index ends the scan.
     ///
-    /// `scanned` stays false when the SMC never opened or not one key could be
-    /// enumerated, so the pass reports `notSampledYet` rather than an empty key
-    /// space it never actually saw. Both are retried on the next pass.
+    /// `scanned` stays false in the two cases where the key space was never
+    /// actually seen — the SMC never opened, or the enumeration yielded zero
+    /// keys (the `enumerated > 0` guard below) — so this pass reports
+    /// `notSampledYet` instead of an empty key space it never looked at. Both are
+    /// retried on the next pass, and a pass that does reach the key space sets
+    /// `scanned` whatever it finds, including nothing.
     private func scanLocked() {
         guard pm_smc_open() else { return }
         var cpu: [SMCKey] = []

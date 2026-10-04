@@ -179,12 +179,12 @@ public protocol DataProvider: Sendable {
     ///
     /// Non-optional on purpose, and the provider must throw rather than answer
     /// when it has no reading. The sensor pass runs on the sampler's slow lane, so
-    /// a snapshot taken before that pass lands has no thermal sample in it — and
-    /// "not sampled yet" is not the same claim as "this machine has no
-    /// temperature sensors". Returning nil would let the payload turn the first
-    /// into the second. `ThermalSample.availability` separates the two: the
-    /// provider throws for `.notSampledYet` and returns the sample for `.noSensors`
-    /// and `.available`.
+    /// a snapshot taken before that pass lands has no thermal sample in it, and a
+    /// later pass that cannot read the SMC reports `notSampledYet` — and neither
+    /// is the same claim as "this machine has no temperature sensors". Returning
+    /// nil would let the payload turn the first into the second.
+    /// `ThermalSample.availability` separates them: the provider throws for
+    /// `.notSampledYet` and returns the sample for `.noSensors` and `.available`.
     func temperaturesFans() async throws -> ThermalSample
     func activeAlerts() async throws -> AlertsSnapshot
     func settingsSnapshot() -> SettingsSnapshot

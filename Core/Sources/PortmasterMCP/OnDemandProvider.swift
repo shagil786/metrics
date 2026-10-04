@@ -213,11 +213,13 @@ public struct OnDemandProvider: DataProvider {
 
     public func temperaturesFans() async throws -> ThermalSample {
         // Three answers, kept apart. nil and `.notSampledYet` are the same fact —
-        // the sensor pass has not finished — so both refuse the way
-        // `containers()` does: answering `available: false` for them would be a
-        // claim about the user's hardware that nothing observed. `.noSensors` is
-        // a different fact, a pass that ran and read nothing, and it is returned
-        // so the caller can report a machine with no sensors as one.
+        // nothing has been observed yet — so both refuse the way `containers()`
+        // does: answering `available: false` for them would be a claim about the
+        // user's hardware that no pass made. `.noSensors` is a different fact, and
+        // a narrower one than its name suggests: the last pass read a working SMC
+        // and no *recognized* sensor produced a plausible reading from it. That
+        // is what the caller is told — a sensor type this collector cannot decode
+        // reports the same way a Mac with no sensors does.
         guard let thermal = try await snapshot().system.thermal,
               thermal.availability != .notSampledYet
         else {
