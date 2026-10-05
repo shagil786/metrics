@@ -9,8 +9,10 @@
 //
 // Nothing here touches a window, a socket or the machine. The provider is the
 // shared `StubProvider`, the settings file and the audit log are in a temp
-// directory, and the "person" is a closure — which is the whole of what the
-// controller injects.
+// directory, the "person" is a closure, and the "sampler" is a script that
+// publishes on whichever poll the test names — which is the whole of what the
+// controller injects, and the reason a test can age a reading by five minutes
+// without waiting five minutes.
 import Foundation
 import PortmasterCore
 @testable import PortmasterMCP
@@ -481,35 +483,66 @@ final class MCPHostWiringTests: XCTestCase {
     // MARK: - Waking a quiet sampler
 
     /// A reading older than the bound is not the end of the answer: the app owns the
-    /// sampler, and `SamplingEngine` pauses itself after five idle minutes — the
-    /// normal state of a menu-bar app. So the host nudges it once and waits for that
-    /// one tick.
+    /// sampler, and `SamplingEngine` pauses itself after five idle minutes — the normal
+    /// state of a menu-bar app. So the host resumes it for one sample and waits.
     ///
-    /// Both halves are here because they are different code paths: a wake that lands
-    /// answers, and a wake that does not is refused in the same words as one that was
-    /// never tried — with exactly one nudge either way, since a second attempt is how a
-    /// "wake the sampler" feature turns into a retry loop.
-    func testAStaleMirrorIsWokenOnceAndAnsweredFromTheNewReading() async throws {
+    /// **The reading lands on the third poll here, not the first.** That is the real
+    /// shape of the thing: `resumeOnce()` schedules a tick on the engine's own queue,
+    /// and the reading appears only once that tick has swept and published. A stub
+    /// whose reading existed before the first poll would return on iteration one and
+    /// never execute the poll interval at all — which is how a 5-second budget, and the
+    /// `wakePollInterval` that spends it, ended up with no coverage at all.
+    func testAStaleMirrorIsWokenOnceAndAnsweredFromTheLaterReading() async throws {
         let stale = Self.snapshot(at: Date().addingTimeInterval(-600))
-        let fresh = Self.snapshot(at: Date())
-        let nudges = WakeCounter()
-        let clock = WakeCounter()
+        let script = WakeScript(landingAfterPolls: 3)
 
         let woken = await LiveDataProvider.wake(
             replacing: stale,
-            budget: 1,
-            nudge: {
-                nudges.record()
-                // The tick is scheduled, not synchronous: the reading lands on a later
-                // poll, which is the whole reason the wake waits at all.
-                clock.record(fresh)
-            },
-            latest: { clock.newest }
+            budget: 2,
+            // The nudge starts a tick; it publishes nothing by itself, which is the
+            // whole reason there is a poll.
+            nudge: { script.recordNudge() },
+            latest: { await script.reading() }
         )
 
-        XCTAssertEqual(nudges.count, 1, "one nudge, one attempt")
-        XCTAssertEqual(woken.at, fresh.at)
+        XCTAssertEqual(script.nudges, 1, "one nudge, one attempt")
+        XCTAssertEqual(
+            script.polls, 3,
+            "the wake must keep asking until the tick it started has published"
+        )
+        XCTAssertEqual(
+            woken.at, WakeScript.landed.at,
+            "the answer must be the reading the tick published, not the one we refused"
+        )
         XCTAssertNoThrow(try LiveDataProvider.requireReadable(woken))
+    }
+
+    /// The budget is what stops the wait, and it is measured monotonically so a clock
+    /// step cannot extend it — a stub that never publishes anything proves the first
+    /// half, and the implementation's `ContinuousClock` is what the second half rests
+    /// on.
+    func testAQuietSamplerGivesUpWhenTheBudgetRunsOut() async throws {
+        let stale = Self.snapshot(at: Date().addingTimeInterval(-600))
+        let script = WakeScript(landingAfterPolls: .max)
+
+        let started = Date()
+        // A budget of 0.5 s against a ceiling of 1.0 s: two polls' worth of headroom
+        // for a loaded machine, and still well under the 1.5 s a budget three times
+        // over would take — which is the shape of the mistake this catches.
+        let woken = await LiveDataProvider.wake(
+            replacing: stale,
+            budget: 0.5,
+            nudge: { script.recordNudge() },
+            latest: { await script.reading() }
+        )
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(woken.at, stale.at, "nothing published, so nothing newer to report")
+        XCTAssertLessThan(
+            elapsed, 1.0,
+            "the wait must end with its budget, not run on\(script.polls) polls of someone's latency"
+        )
+        XCTAssertGreaterThan(script.polls, 1, "and it must actually have polled")
     }
 
     /// A sampler that does not answer the nudge is refused for being idle, and only
@@ -517,16 +550,16 @@ final class MCPHostWiringTests: XCTestCase {
     /// whether to come back.
     func testAMirrorThatStaysStaleIsRefusedAfterOneWake() async throws {
         let stale = Self.snapshot(at: Date().addingTimeInterval(-600))
-        let nudges = WakeCounter()
+        let script = WakeScript(landingAfterPolls: .max)
 
         let woken = await LiveDataProvider.wake(
             replacing: stale,
             budget: 0.1,
-            nudge: { nudges.record() },
-            latest: { stale }
+            nudge: { script.recordNudge() },
+            latest: { await script.reading() }
         )
 
-        XCTAssertEqual(nudges.count, 1, "a wake that did not land must not be retried")
+        XCTAssertEqual(script.nudges, 1, "a wake that did not land must not be retried")
         XCTAssertEqual(woken.at, stale.at, "nothing newer arrived, so the old reading stands")
         do {
             _ = try LiveDataProvider.requireReadable(woken)
@@ -542,17 +575,16 @@ final class MCPHostWiringTests: XCTestCase {
     /// tick is cheaper than telling a client the sampler is still starting when a tick
     /// is one call away.
     func testAColdSamplerIsWokenRatherThanRefused() async throws {
-        let fresh = Self.snapshot(at: Date())
-        let nudges = WakeCounter()
+        let script = WakeScript(landingAfterPolls: 2)
 
         let woken = await LiveDataProvider.wake(
             replacing: .empty,
-            budget: 1,
-            nudge: { nudges.record() },
-            latest: { fresh }
+            budget: 2,
+            nudge: { script.recordNudge() },
+            latest: { await script.reading() }
         )
 
-        XCTAssertEqual(nudges.count, 1)
+        XCTAssertEqual(script.nudges, 1)
         XCTAssertNoThrow(try LiveDataProvider.requireReadable(woken))
     }
 
@@ -663,23 +695,58 @@ final class MCPHostWiringTests: XCTestCase {
     }
 }
 
-/// How many times a nudge was asked for, and what it produced.
-private final class WakeCounter: @unchecked Sendable {
+/// A sampler that publishes on the poll the test chooses, and counts what it was asked.
+///
+/// Modelling the delay instead of removing it is the point: the engine's tick is queued
+/// on another queue and the reading appears later, so `latest` answering with a reading
+/// from the start would be a stub that makes the wait untestable.
+private final class WakeScript: @unchecked Sendable {
     private let lock = NSLock()
-    private var nudges = 0
-    private var readings: [ObservationSnapshot] = []
+    private var nudgeCount = 0
+    private var pollCount = 0
+    private let landingAfterPolls: Int
+    private let published: ObservationSnapshot
 
-    func record() { lock.withLock { nudges += 1 } }
-
-    /// Records the reading a tick would have produced, in order.
-    func record(_ reading: ObservationSnapshot) { lock.withLock { readings.append(reading) } }
-
-    var count: Int { lock.withLock { nudges } }
-
-    /// The newest reading recorded, or `.empty` while none has landed.
-    var newest: ObservationSnapshot {
-        lock.withLock { readings.max(by: { $0.at < $1.at }) } ?? .empty
+    /// - Parameters:
+    ///   - landingAfterPolls: the poll at which the reading appears. `.max` for a
+    ///     sampler that never answers.
+    ///   - published: what it publishes when it does.
+    init(landingAfterPolls: Int, published: ObservationSnapshot = WakeScript.landed) {
+        self.landingAfterPolls = landingAfterPolls
+        self.published = published
     }
+
+    /// A reading stamped now, built once so repeated polls report the *same* instant —
+    /// a stub that re-stamped per poll would look like a faster sampler.
+    static let landed = ObservationSnapshot(
+        at: Date(),
+        system: SystemSample(
+            at: Date(),
+            cpu: SystemCPU(
+                totalPercent: 1, userPercent: 1, systemPercent: 0,
+                idlePercent: 99, corePercents: [1], coreCount: 1
+            ),
+            memory: SystemMemory(
+                totalBytes: 1, usedBytes: 1, pressureLevel: .normal,
+                pressureRatio: 0, swapBytes: nil, freeBytes: 0,
+                appBytes: nil, wiredBytes: nil, compressedBytes: nil
+            )
+        ),
+        processes: [], ports: [], services: [], rollups: []
+    )
+
+    func recordNudge() { lock.withLock { nudgeCount += 1 } }
+
+    /// What the app would report on this poll.
+    func reading() async -> ObservationSnapshot {
+        lock.withLock {
+            pollCount += 1
+            return pollCount >= landingAfterPolls ? published : .empty
+        }
+    }
+
+    var nudges: Int { lock.withLock { nudgeCount } }
+    var polls: Int { lock.withLock { pollCount } }
 }
 
 /// Where the app's preference write ran, and how many times.

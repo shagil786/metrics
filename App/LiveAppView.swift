@@ -19,12 +19,13 @@ import PortmasterMCP
 /// calls do not queue behind each other while holding it, and all three values are read
 /// together rather than one hop each.
 ///
-/// That replaced a `Combine` subscription that kept a copy current on every
-/// `@Published` write. It looks cheaper until it is measured: the app publishes five
-/// times per sample tick, so it ran five times a tick, for the life of the process, to
-/// keep fresh something read a handful of times a minute — and it could still be behind,
-/// because nothing observed a client connecting. Publishing on read has no schedule to
-/// keep and nothing to be stale by.
+/// That replaced a `Combine` subscription on the app's `objectWillChange`. Being fair
+/// about what that cost: it was coalesced and skipped while no client was connected, so
+/// it was not the per-tick work it looked like. What it could not do was be *correct* —
+/// nothing observed a client connecting, so a preference the user changed while nobody
+/// was connected was missing from that session's first `get_settings`, and the snapshot
+/// path needed a freshness bound and a hop to cover for it. Publishing on read has no
+/// schedule to keep, no gap to fall into, and no flag that has to be right.
 final class LiveAppView: @unchecked Sendable {
 
     /// The copy. One lock for all three values, so a reader cannot see a snapshot from
@@ -67,14 +68,6 @@ final class LiveAppView: @unchecked Sendable {
         lock.withLock { currentHistory = history }
     }
 
-    /// The one publish nothing asked for: what the app holds at launch, so the box is
-    /// not empty before the first client. Every other publish belongs to the read that
-    /// needs it.
-    @MainActor
-    func publishInitialState() {
-        publishFromModel()
-    }
-
     // MARK: Reading (publishes first, then answers off the main actor)
 
     /// The app's newest reading, woken into existence if it had gone quiet.
@@ -100,19 +93,32 @@ final class LiveAppView: @unchecked Sendable {
         let woken = await LiveDataProvider.wake(
             replacing: lock.withLock { currentSnapshot },
             // Both hops are main-actor reads of the app: the nudge is the engine's own
-            // API, and the reading is `AppModel`'s published copy. Published back into
-            // the box once at the end so `alerts` and the settings payload are not left
-            // describing the state before the wake.
+            // API, and the reading is `AppModel`'s published copy.
+            //
+            // `resumeOnce()`, **not** `noteUserActivity()`. A tool call is not a person
+            // at the keyboard, and stamping activity here would let an assistant polling
+            // every few minutes hold this menu-bar app sampling on its background
+            // cadence forever — the idle pause exists so an app nobody is looking at
+            // costs nothing, and this feature must not be what defeats it. `resumeOnce`
+            // takes the one sample and leaves the clock where the user left it.
+            //
+            // It also has to come before the tick it wants, which `resumeOnce` guarantees
+            // internally by setting its flag on the sampling queue immediately before the
+            // tick it queues; `refreshNow()` alone would be queued behind that tick and
+            // would hit the idle guard on a paused engine.
             nudge: {
-                await MainActor.run {
-                    AppModel.shared.engine.noteUserActivity()
-                    AppModel.shared.engine.refreshNow()
-                }
+                await MainActor.run { AppModel.shared.engine.resumeOnce() }
             },
             latest: { await MainActor.run { AppModel.shared.snapshot } }
         )
+        // Published before the decision, and the box wins ties on freshness: the tick
+        // can land between `wake`'s last poll and this line, and refusing while a fresh
+        // reading is in hand is exactly the refusal this path exists to remove.
         await MainActor.run { publishFromModel() }
-        return try LiveDataProvider.requireReadable(woken)
+        let current = lock.withLock { currentSnapshot }
+        return try LiveDataProvider.requireReadable(
+            current.at > woken.at ? current : woken
+        )
     }
 
     /// The app's current alerts, published fresh and then read.

@@ -111,11 +111,12 @@ final class MCPHostController: ObservableObject {
     /// whether launch already ran it cannot end up with two.
     func start() {
         guard host == nil else { return }
-        // Nothing is scheduled after this: a read publishes for itself. What is needed
-        // once, at launch, is the mode Settings shows and the history reader, whose
-        // store cannot change under the app afterwards.
+        // Nothing is scheduled after this, and nothing is seeded either: every read
+        // publishes from the app for itself. What is needed once, at launch, is the mode
+        // Settings shows, and the history reader — the store behind it cannot change
+        // under the app afterwards, so unlike the other three values it is not a
+        // per-read question.
         refreshFromSettings()
-        live.publishInitialState()
         live.publishHistory(makeHistory())
         let started = MCPHostServer(
             socketURL: Self.socketURL(in: directory),

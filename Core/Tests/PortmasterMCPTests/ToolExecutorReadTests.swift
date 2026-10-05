@@ -161,7 +161,10 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return AlertsSnapshot(source: alertSource, alerts: alerts)
     }
 
-    func settingsSnapshot() -> SettingsSnapshot {
+    /// `async`, like the requirement. The same note as `setPreference` below: a
+    /// synchronous function witnesses an async requirement without complaint, so the
+    /// only way this miss is visible is by reading for it.
+    func settingsSnapshot() async -> SettingsSnapshot {
         SettingsSnapshot(
             temperatureUnit: "celsius", networkUnit: "bytes", cpuScale: "total",
             temperatureSource: "hottest", compactMenuBar: false,

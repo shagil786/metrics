@@ -60,9 +60,16 @@ public struct LiveDataProvider: DataProvider {
     /// plus a margin, and a wake that overran that would turn a sampler that is slow
     /// into a CLI reporting that Portmaster is not running — a falsehood the client
     /// cannot distinguish from a real outage. Five seconds is long enough for the tick
-    /// `refreshNow()` schedules (a process sweep, an `lsof` port scan, and the publish
+    /// `resumeOnce()` schedules (a process sweep, an `lsof` port scan, and the publish
     /// that follows them on the main queue) and short enough to sit inside the margin
     /// rather than eat it.
+    ///
+    /// **What it does not bound:** a single `await` that is already in flight. The
+    /// deadline is checked between polls, so one `latest()` hop blocked behind a busy
+    /// main actor overruns the budget by however long it was blocked — cancelling it
+    /// mid-await would abandon a read of the app's own state, which is a worse outcome
+    /// than waiting one hop out. Monotonic, so a clock the user steps backwards cannot
+    /// extend the wait (see `wake`).
     public static let wakeBudget: TimeInterval = 5
 
     /// How often the wake re-reads while that tick is in flight.
@@ -89,7 +96,7 @@ public struct LiveDataProvider: DataProvider {
     /// - Parameters:
     ///   - stale: the reading that could not be answered with. A new reading is any
     ///     one stamped later; `.distantPast` therefore matches the first real one.
-    ///   - budget: how long that tick gets.
+    ///   - budget: how long the polling runs for, measured monotonically.
     ///   - nudge: asks the app to sample now. Called exactly once.
     ///   - latest: the app's newest reading, asked repeatedly until one is newer.
     /// - Returns: the newest reading seen, which may be `stale` itself.
@@ -100,9 +107,13 @@ public struct LiveDataProvider: DataProvider {
         latest: @escaping @Sendable () async -> ObservationSnapshot
     ) async -> ObservationSnapshot {
         await nudge()
-        let deadline = Date().addingTimeInterval(budget)
+        // `ContinuousClock` rather than `Date`: a deadline compared against wall time
+        // is extended by a clock the user (or an NTP correction) steps backwards, which
+        // is a wait nobody bounded. Uptime cannot be moved.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(budget))
         var newest = stale
-        while Date() < deadline {
+        while clock.now < deadline {
             let reading = await latest()
             if reading.at > newest.at { newest = reading }
             if newest.at > stale.at { return newest }
