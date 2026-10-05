@@ -367,6 +367,36 @@ final class CLIRoutingTests: XCTestCase {
         )
     }
 
+    /// `select`'s own parameter outranks the environment, which is the precedence its
+    /// documentation claims.
+    ///
+    /// Asserted **through `select`**, not through the helper: the helper test says the
+    /// parser reads the variable, and nothing says `select` prefers its argument over it.
+    /// The two hosts disagree on purpose — one is started and reachable, the other is a
+    /// plain empty directory — so a `select` that quietly followed the environment would
+    /// fall back while one that preferred its argument would relay.
+    func testSelectPrefersItsArgumentOverTheEnvironmentEndpointDirectory() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+        let empty = try makeTemporaryDirectory(prefix: "pm")
+
+        let route = await MCPRouteSelector.select(
+            environment: [MCPRouteSelector.endpointDirectoryVariable: empty.path],
+            endpointDirectory: harness.endpointDirectory
+        )
+        defer { Task { await client(from: route)?.disconnect() } }
+
+        guard case .proxy(let client) = route else {
+            return XCTFail(
+                """
+                the argument is the specific directory and the environment's is empty; \
+                relaying proves the argument won, and falling back proves it did not
+                """
+            )
+        }
+        XCTAssertTrue(client.isConnected, "the route is only taken once MCP is up")
+    }
+
     /// The endpoint directory the environment names is honoured, and an unusable value is
     /// ignored rather than believed.
     ///
@@ -508,18 +538,20 @@ final class CLIRoutingTests: XCTestCase {
     }
 
     /// The relayed bound must be able to outlast what the app makes it wait for.
-///
-/// This is a comparison, not a measurement, and deliberately so: the thing being protected
-/// is a number nobody runs to find out. A relayed `quit_app` under `confirmEach` reaches
-/// the app, the app asks a person, and the answer arrives when they decide — a wait bounded
-/// by `ConfirmationBroker.defaultTimeout`, not by anything in this process. A client whose
-/// bound is shorter fires first, disconnects, and answers "Portmaster isn't running", which
-/// is false and points at an app that is running perfectly.
-///
-/// So the assertion is a floor, not an equality: a larger bound is fine (it costs nothing
-/// but a slow failure), a smaller one is the trap. Whoever shortens either budget — the
-/// broker's, or the read budget underneath it — meets this failure instead of a bug report.
-func testRelayedCallBoundOutlastsTheConfirmationWindow() {
+    ///
+    /// This is a comparison, not a measurement, and deliberately so: the thing being
+    /// protected is a number nobody runs to find out. A relayed `quit_app` under
+    /// `confirmEach` reaches the app, the app asks a person, and the answer arrives when
+    /// they decide — a wait bounded by `ConfirmationBroker.defaultTimeout`, not by anything
+    /// in this process. A client whose bound is shorter fires first, disconnects, and
+    /// answers "Portmaster isn't running", which is false and points at an app that is
+    /// running perfectly.
+    ///
+    /// So the assertion is a floor, not an equality: a larger bound is fine (it costs
+    /// nothing but a slow failure), a smaller one is the trap. Whoever shortens either
+    /// budget — the broker's, or the read budget underneath it — meets this failure
+    /// instead of a bug report.
+    func testRelayedCallBoundOutlastsTheConfirmationWindow() {
     XCTAssertGreaterThanOrEqual(
         SocketMCPClient.callTimeout,
         ConfirmationBroker.defaultTimeout + OnDemandProvider.defaultSnapshotTimeout,

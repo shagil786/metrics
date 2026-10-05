@@ -324,10 +324,26 @@ final class CLIIntegrationTests: XCTestCase {
         XCTAssertEqual(fixture.connectedClients().count, 1, "the child is one authenticated client")
         XCTAssertEqual(server.stderrLines, [], "a proxied session has nothing to explain")
 
-        // EOF is the session's end, and `runMain` must close the relayed socket on the
-        // way out — a child that exits holding one leaves the app showing a client that
-        // is not there.
+        // EOF is the session's end. The order of the two assertions below matters, and it
+        // is the whole limit of what this can prove:
+        //
+        //  - the **precondition** is that the child is gone. A process that has exited
+        //    takes its socket with it, so from that moment the host's client count is
+        //    going to fall no matter what the CLI did — this assertion cannot tell an
+        //    explicit `disconnect()` from the kernel closing a descriptor, and it would
+        //    be overstating this test to say it could.
+        //  - what it *does* prove is that the relayed session left nothing behind: no
+        //    client the app still considers connected to a process that is gone, which
+        //    is what Settings would otherwise show.
+        //
+        // The order is checked first so that a future reader cannot reorder these two and
+        // believe they are asserting something stronger than they are.
         server.stop(expectingExit: true)
+        XCTAssertFalse(
+            server.processIsRunning,
+            "the child must be gone before the client count means anything: a live process "
+                + "closing its socket is a fact about the CLI, and a dead one's is not"
+        )
         try await fixture.waitForNoClients()
     }
 
@@ -367,14 +383,28 @@ final class MCPServerProcess {
     /// reasons that have nothing to do with this code — a broken toolchain is
     /// not a verdict on the server. An assertion failure never skips.
     ///
-    /// The child is launched with `PORTMASTER_MCP=on-demand` **merged into** this
+    /// The default child is launched with `PORTMASTER_MCP=on-demand` **merged into** this
     /// process's environment, and that is load-bearing rather than tidiness.
     /// `portmaster-mcp` now routes at startup: it reads the endpoint file at
     /// `~/.portmaster/mcp-endpoint.json` and, if a Portmaster with MCP enabled is
-    /// running on this machine, it would relay to it. Then every test below would be
-    /// measuring the app's live sampler and its live gate instead of this process's
-    /// fallback, and would pass or fail as a function of whether the developer happened
-    /// to have the app open. These tests are about the local surface, so they ask for it.
+    /// running on this machine, it would relay to it. Then every test using the default
+    /// would be measuring the app's live sampler and its live gate instead of this
+    /// process's fallback, and would pass or fail as a function of whether the developer
+    /// happened to have the app open. Those tests are about the local surface, so they ask
+    /// for it.
+    ///
+    /// **The one exception is `testProxiedSessionReachesTheHostAndDisconnectsOnExit`**,
+    /// which passes its own dictionary — the endpoint directory of a host it started — and
+    /// is the only test here that wants the relay. Two consequences worth knowing:
+    ///
+    ///  - a developer who exports `PORTMASTER_MCP=on-demand` in their shell breaks that
+    ///    test, because `additions` is merged *over* the inherited environment and this
+    ///    test's dictionary does not contain the variable. It fails loudly (the child
+    ///    falls back and the relayed assertions fail), not silently — but the failure
+    ///    message will be about the relay, and the cause will be the shell.
+    ///  - the default is stated as the *default* for that reason. A test that genuinely
+    ///    needs the unforced route with a live host of its own must pass its own
+    ///    dictionary, and must then say so.
     ///
     /// Merged rather than assigned: `Process.environment` replaces the child's
     /// environment outright, and a binary with no `PATH` or `HOME` fails in ways that
@@ -422,8 +452,13 @@ final class MCPServerProcess {
         stderrReader.text.split(separator: "\n").map(String.init)
     }
 
-    /// Whether the child is still running. Asserted on so "it disconnected" is never
-    /// confused with "it exited and the kernel closed the socket".
+    /// Whether the child is still running.
+    ///
+    /// Read as a **precondition** by the proxy test, before it draws any conclusion from
+    /// the host's client count: a dead process has already had its descriptors closed for
+    /// it by the kernel, so a count assertion after that point is about the host's state,
+    /// not about what the CLI chose to do. Asserted on so that fact is visible in the test
+    /// rather than assumed in the reader's head.
     var processIsRunning: Bool { process.isRunning }
 
     /// Closes stdin, which is how an MCP client ends a stdio session, and waits
