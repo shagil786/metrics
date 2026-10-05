@@ -252,6 +252,83 @@ final class CLIIntegrationTests: XCTestCase {
             "the line must name the reason it fell back, so the user knows which thing to "
                 + "unset: \(stderrLines)"
         )
+        // The line must not claim Portmaster *is* up: this branch runs before any probe,
+        // so it cannot know, and on a machine with nothing running the claim would be the
+        // one untrue thing the process says.
+        XCTAssertTrue(
+            stderrLines.first?.contains("may be up") == true,
+            "the forced path never probes, so it may only say Portmaster *may* be up: "
+                + "\(stderrLines)"
+        )
+    }
+
+    /// The other route, in the process it actually runs in.
+    ///
+    /// `runMain`'s proxy arm is the one that decides who the authority is for every
+    /// relayed call — it captures the relayed client and closes it on the way out — and
+    /// nothing else in the suite reaches it: `CLIRoutingTests` drives
+    /// `SocketMCPClient` directly, never `runMain`. Deleting the arm outright would leave
+    /// every test green, which is not a state this feature should be in: a CLI that
+    /// relays and never closes its socket leaves a session the app's Settings shows as
+    /// connected to a process that has gone.
+    ///
+    /// The host is started *here*, in this process, and the child is pointed at it with
+    /// `PORTMASTER_MCP_ENDPOINT_DIR`. Without that override the child would read the
+    /// developer's real `~/.portmaster` — which is why the rest of this suite forces the
+    /// on-demand path instead. Two suites, both isolated, one from each direction.
+    ///
+    /// The evidence that the call was *relayed* rather than answered locally is the
+    /// answer text and the recorded arguments: the app's stub produces that text, and the
+    /// CLI's own fallback has no way to know it.
+    func testProxiedSessionReachesTheHostAndDisconnectsOnExit() async throws {
+        let fixture = try startRecordingHost(text: "quit_app: stopped by the app")
+
+        let server = try MCPServerProcess.launch(
+            environment: [MCPRouteSelector.endpointDirectoryVariable: fixture.directory.path]
+        )
+        try server.initialize(id: 1)
+
+        let listed: [String: Any] = try server.request(
+            #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            timeout: Self.handshakeTimeout
+        )
+        let tools = try XCTUnwrap(listed["result"] as? [String: Any], "\(listed)")
+        XCTAssertEqual(
+            ((tools["tools"] as? [[String: Any]]) ?? []).count, 13,
+            "a relayed session must list the same catalog the app serves"
+        )
+
+        let called: [String: Any] = try server.request(
+            """
+            {"jsonrpc":"2.0","id":3,"method":"tools/call",\
+            "params":{"name":"quit_app","arguments":{"id":"app:Somewhere","reason":"because"}}}
+            """,
+            timeout: Self.handshakeTimeout
+        )
+        let result = try XCTUnwrap(called["result"] as? [String: Any], "\(called)")
+        XCTAssertEqual(result["isError"] as? Bool, false, "\(result)")
+        XCTAssertEqual(
+            try Self.contentText(result), "quit_app: stopped by the app",
+            "the answer must be the app's, not one the CLI invented"
+        )
+        XCTAssertEqual(
+            fixture.recordedCalls.count, 1,
+            "exactly one call must reach the app — a second would mean two authorities"
+        )
+        XCTAssertEqual(fixture.recordedCalls.first?.name, "quit_app")
+        XCTAssertEqual(
+            fixture.recordedCalls.first?.arguments,
+            ["id": "app:Somewhere", "reason": "because"],
+            "the arguments must survive the relay unchanged"
+        )
+        XCTAssertEqual(fixture.connectedClients().count, 1, "the child is one authenticated client")
+        XCTAssertEqual(server.stderrLines, [], "a proxied session has nothing to explain")
+
+        // EOF is the session's end, and `runMain` must close the relayed socket on the
+        // way out — a child that exits holding one leaves the app showing a client that
+        // is not there.
+        server.stop(expectingExit: true)
+        try await fixture.waitForNoClients()
     }
 
     // MARK: Helpers
@@ -344,6 +421,10 @@ final class MCPServerProcess {
     var stderrLines: [String] {
         stderrReader.text.split(separator: "\n").map(String.init)
     }
+
+    /// Whether the child is still running. Asserted on so "it disconnected" is never
+    /// confused with "it exited and the kernel closed the socket".
+    var processIsRunning: Bool { process.isRunning }
 
     /// Closes stdin, which is how an MCP client ends a stdio session, and waits
     /// for the process to exit — the server's promise that EOF ends the session.

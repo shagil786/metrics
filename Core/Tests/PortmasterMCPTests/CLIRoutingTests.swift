@@ -121,9 +121,7 @@ final class CLIRoutingTests: XCTestCase {
     /// work" test and fail this one, and it would also mean two gates had ruled on the
     /// same mutation.
     func testProxiedMutationReachesTheHostsBroker() async throws {
-        let hostContext = RecordingHostContext(text: "quit_app: done by the app")
-        let host = try makeHost(hostContext, in: self)
-        try host.host.start()
+        let host = try startRecordingHost(text: "quit_app: done by the app")
         let client = try await connect(to: host)
 
         let outcome = await client.call(
@@ -136,12 +134,12 @@ final class CLIRoutingTests: XCTestCase {
             "the answer must be the host's, not one the CLI invented"
         )
         XCTAssertEqual(
-            hostContext.calls.count, 1,
+            host.recordedCalls.count, 1,
             "exactly one call must arrive at the host — a second would mean two authorities"
         )
-        XCTAssertEqual(hostContext.calls.first?.name, "quit_app")
+        XCTAssertEqual(host.recordedCalls.first?.name, "quit_app")
         XCTAssertEqual(
-            hostContext.calls.first?.arguments,
+            host.recordedCalls.first?.arguments,
             ["id": "app:Somewhere", "reason": "because"],
             "the arguments must survive the relay unchanged"
         )
@@ -365,36 +363,143 @@ final class CLIRoutingTests: XCTestCase {
         )
     }
 
-    // MARK: - Helpers
+    /// The endpoint directory the environment names is honoured, and an unusable value is
+    /// ignored rather than believed.
+    ///
+    /// This is the seam that lets the spawned-binary suite point a real `portmaster-mcp`
+    /// at a host the test started, so it is worth pinning on its own: a regression here
+    /// is silent everywhere else, because every other routing test passes an explicit
+    /// directory and never consults the variable.
+    ///
+    /// The empty case is the half that matters. `URL(fileURLWithPath: "")` resolves to the
+    /// current working directory, so believing an empty value would send the CLI looking
+    /// for an endpoint file in a real place that has none — a "the app is not available"
+    /// that looks like a correct answer to a question nobody asked.
+    func testEndpointDirectoryOverrideIsHonouredAndEmptyIsIgnored() throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
 
-    /// A host on its own socket in its own directory, over `context`, stopped when the
-    /// test ends.
-    private func makeHost(
-        _ context: some MCPToolCalling,
-        in test: XCTestCase,
-        socketName: String = "mcp.sock"
-    ) throws -> HostFixture {
-        let directory = try test.makeTemporaryDirectory(prefix: "pm")
-        let socketURL = directory.appendingPathComponent(socketName)
-        let host = MCPHostServer(
-            socketURL: socketURL,
-            endpointDirectory: directory,
-            context: context
+        XCTAssertEqual(
+            MCPRouteSelector.endpointDirectoryFromEnvironment(
+                [MCPRouteSelector.endpointDirectoryVariable: harness.endpointDirectory.path]
+            )?.standardizedFileURL.path,
+            harness.endpointDirectory.standardizedFileURL.path,
+            "a named directory must be the one the CLI reads the endpoint from"
         )
-        test.addTeardownBlock {
-            // Started off the main thread: a teardown block blocks the thread it runs
-            // on, and `stop` is async.
-            let stopped = DispatchSemaphore(value: 0)
-            DispatchQueue.global(qos: .userInitiated).async {
-                Task {
-                    await host.stop()
-                    stopped.signal()
-                }
-            }
-            _ = stopped.wait(timeout: .now() + 30)
+        for unusable in ["", "   "] {
+            XCTAssertNil(
+                MCPRouteSelector.endpointDirectoryFromEnvironment(
+                    [MCPRouteSelector.endpointDirectoryVariable: unusable]
+                ),
+                "\(unusable.debugDescription) is not a directory, and must not become one"
+            )
         }
-        return HostFixture(host: host, directory: directory)
+        XCTAssertNil(
+            MCPRouteSelector.endpointDirectoryFromEnvironment([:]),
+            "unset means the per-user default, which is not this test's to read"
+        )
     }
+
+    /// A relayed call that never gets an answer must end anyway, and must say so.
+    ///
+    /// The failure this covers cannot be produced by closing the host: a host that quits
+    /// fails the next `write`, which is fast and obvious. What needs the bound is a host
+    /// that is *alive and silent* — the confirmation window waiting on a person, or a
+    /// tool wedged behind one. There the SDK's message loop is still receiving, so the
+    /// pending request is never resumed and only a deadline ends the wait.
+    func testRelayedCallThatNeverAnswersIsBoundedAndReportsIt() async throws {
+        let fixture = try startHost(context: StallingHostContext())
+        let client = try XCTUnwrap(
+            SocketMCPClient(endpointDirectory: fixture.directory),
+            "the host is up, so the client must connect"
+        )
+        let opened = await client.open()
+        XCTAssertTrue(opened, "a host that answers initialize must be reachable")
+        disconnectOnTeardown(client, in: self)
+
+        let began = Date()
+        let outcome = await client.call(name: "get_settings", arguments: [:])
+        let elapsed = Date().timeIntervalSince(began)
+
+        XCTAssertTrue(outcome.isError, outcome.text)
+        XCTAssertEqual(outcome.text, SocketMCPClient.unavailableText)
+        XCTAssertGreaterThan(
+            elapsed, SocketMCPClient.callTimeout * 0.5,
+            "the answer must have come from the bound, not from something failing early"
+        )
+        XCTAssertLessThan(
+            elapsed, SocketMCPClient.callTimeout * 4,
+            "the bound must be the cost of a failed call and no more"
+        )
+        XCTAssertFalse(
+            client.isConnected,
+            "a client that gave up must not keep claiming a session — it would strand one "
+                + "in the app's Settings"
+        )
+        // The host's own client list is deliberately *not* asserted here: it keeps the
+        // session until its own EOF drain finishes, and that drain is waiting on the very
+        // call that never answered — which is the host's policy to hold, not the client's
+        // to release. What the client owes is that it stopped holding the session open,
+        // which is the assertion above.
+    }
+
+    /// A host that accepts the connection and then never speaks MCP is not available.
+    ///
+    /// The shape the spec calls wedged, and the only one a handshake can rule out: the
+    /// token is right, so nothing is refused, and `initialize` is never answered. A probe
+    /// that waited on the app instead of bounding itself would sit here until the user
+    /// killed the CLI.
+    ///
+    /// The listener here is a raw descriptor rather than an `MCPHostServer`, because the
+    /// SDK's server always answers `initialize` — standing in for "answers" is the one
+    /// thing this test needs to *not* have.
+    func testAHostThatNeverSpeaksMCPIsAppNotAvailable() async throws {
+        let directory = try makeTemporaryDirectory(prefix: "pm")
+        let socketPath = directory.appendingPathComponent("mcp.sock")
+        let listener = try UnixSocketBinding.listen(path: socketPath.path)
+        addTeardownBlock { close(listener) }
+
+        let holdingOpen = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            let accepted = accept(listener, nil, nil)
+            guard accepted >= 0 else { return }
+            // Read the handshake — so the client's admission check sees no EOF, which is
+            // what "accepted" means — and then say nothing, ever.
+            var chunk = [UInt8](repeating: 0, count: 512)
+            _ = read(accepted, &chunk, chunk.count)
+            holdingOpen.signal()
+            Thread.sleep(forTimeInterval: 30)
+            close(accepted)
+        }
+        thread.start()
+
+        try EndpointFileStore.write(
+            EndpointFile(
+                socket: socketPath,
+                token: try EndpointFileStore.newToken(),
+                pid: ProcessInfo.processInfo.processIdentifier
+            ),
+            directory: directory
+        )
+
+        let client = SocketMCPClient(endpointDirectory: directory)
+        let opened = try XCTUnwrap(
+            client, "the connection is accepted, so the handshake is not refused"
+        )
+        XCTAssertEqual(
+            holdingOpen.wait(timeout: .now() + 5), .success,
+            "the fake host must have read the handshake before this means anything"
+        )
+
+        let reached = await opened.open()
+        XCTAssertFalse(
+            reached,
+            "an app that never answers initialize is not available, however healthy it looks"
+        )
+        XCTAssertFalse(opened.isConnected, "a failed probe must not leave a claimed session")
+    }
+
+    // MARK: - Helpers
 
     private func connect(to harness: MCPHostHarness) async throws -> SocketMCPClient {
         let client = try XCTUnwrap(
@@ -407,7 +512,7 @@ final class CLIRoutingTests: XCTestCase {
         return client
     }
 
-    private func connect(to fixture: HostFixture) async throws -> SocketMCPClient {
+    private func connect(to fixture: TestMCPHost) async throws -> SocketMCPClient {
         let client = try XCTUnwrap(
             SocketMCPClient(endpointDirectory: fixture.directory),
             "a started host must be connectable"
@@ -437,35 +542,6 @@ final class CLIRoutingTests: XCTestCase {
             }
             _ = done.wait(timeout: .now() + 30)
         }
-    }
-}
-
-/// A host, and the directory its endpoint file lives in.
-private struct HostFixture {
-    let host: MCPHostServer
-    let directory: URL
-}
-
-/// Stands in for the app's own call surface: records what arrived, answers with a
-/// canned outcome, and touches nothing on this machine.
-///
-/// A recording context rather than a real executor is what makes the relay observable.
-/// The app's own gate, broker and audit live behind *this* seam — replacing it is what
-/// makes the assertion "the call arrived with these arguments" mean something.
-private final class RecordingHostContext: MCPToolCalling, @unchecked Sendable {
-    private let lock = NSLock()
-    private var recorded: [(name: String, arguments: [String: String])] = []
-    private let text: String
-
-    init(text: String) { self.text = text }
-
-    var calls: [(name: String, arguments: [String: String])] {
-        lock.withLock { recorded }
-    }
-
-    func call(name: String, arguments: [String: String]) async -> ToolOutcome {
-        lock.withLock { recorded.append((name, arguments)) }
-        return ToolOutcome(text: text, isError: false)
     }
 }
 

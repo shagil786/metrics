@@ -171,26 +171,27 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// this file: a relayed call has one authority or it has none.
     public func call(name: String, arguments: [String: String]) async -> ToolOutcome {
         guard let client = mcpClient else { return Self.unavailable }
+        // A watchdog rather than a race between two tasks, and the difference is not a
+        // style choice. The SDK resumes a pending request when its *client* disconnects,
+        // not when a task is cancelled, so the only thing that can end this wait is a
+        // disconnect — and a `withTaskGroup` race would then wait for the abandoned call
+        // to unwind at scope exit, which is the very wait the deadline exists to end. An
+        // unstructured watchdog can fire and leave: the call ends when the app answers or
+        // when the client gives up, never because something is still winding down.
+        let watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.callTimeout))
+            // Cancelled means the call answered first and the `defer` below fired; this
+            // timer must not then close a session that is still serving.
+            guard !Task.isCancelled else { return }
+            await self?.abandon(tool: name)
+        }
+        defer { watchdog.cancel() }
+
         do {
-            let answer: (text: String, isError: Bool)? = try await Self.withDeadline(
-                Self.callTimeout
-            ) {
-                let replied = try await client.callTool(
-                    name: name, arguments: Self.payload(arguments)
-                )
-                return (text: Self.text(of: replied.content), isError: replied.isError ?? false)
-            }
-            guard let answer else {
-                // Presumed wedged rather than gone: stop pretending the session is
-                // usable, and say so once.
-                MCPDiagnostics.hostFailure(
-                    "a relayed MCP call did not answer in time",
-                    detail: "pid \(ProcessInfo.processInfo.processIdentifier) asked the app for \(name)"
-                )
-                await disconnect()
-                return Self.unavailable
-            }
-            return ToolOutcome(text: answer.text, isError: answer.isError)
+            let replied = try await client.callTool(
+                name: name, arguments: Self.payload(arguments)
+            )
+            return ToolOutcome(text: Self.text(of: replied.content), isError: replied.isError ?? false)
         } catch {
             // A throw here is a failed write or a JSON-RPC error, never a tool refusal:
             // a refusal arrives as `isError` data, which is the branch above. The
@@ -230,12 +231,24 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
         // connection up to the newline and the SDK's `initialize` goes out afterwards,
         // on a connection the host is already serving MCP on.
         let transport = UnixSocketTransport(socket: socket)
+        // The same watchdog as a call, for the same reason: a host that accepts the
+        // connection and then says nothing leaves `initialize` outstanding, and only a
+        // disconnect releases it. Racing it against a sleeping sibling would wait for the
+        // abandoned `connect` to unwind, which is the same wait.
+        let watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.probeTimeout))
+            guard !Task.isCancelled else { return }
+            await self?.discard(client)
+        }
+        defer { watchdog.cancel() }
+
         do {
-            let finished = try await Self.withDeadline(Self.probeTimeout) {
-                try await client.connect(transport: transport)
-                return true
-            }
-            guard finished == true else {
+            try await client.connect(transport: transport)
+            // The watchdog could have closed the descriptor in the same instant this
+            // returned. Claiming a session whose socket is gone would turn every later
+            // call into a failure rather than a hang, which is the right failure — but it
+            // is a failure the route had better not hand out in the first place.
+            guard socket.descriptor >= 0 else {
                 await discard(client)
                 return false
             }
@@ -313,28 +326,18 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
         return true
     }
 
-    /// One relayed call, bounded.
+    /// Ends a session that was answering and then stopped, on the way to answering the
+    /// caller.
     ///
-    /// A deadline rather than a `Task.sleep` race written at each call site: the SDK
-    /// resumes a pending request when its client disconnects and not when a task is
-    /// cancelled, so every caller of this needs the same answer to the same question —
-    /// what now — or it leaks a continuation per timeout.
-    private static func withDeadline<T: Sendable>(
-        _ seconds: TimeInterval,
-        _ body: @escaping @Sendable () async throws -> T
-    ) async throws -> T? {
-        try await withThrowingTaskGroup(of: T?.self) { group in
-            group.addTask { try await body() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                return nil
-            }
-            defer { group.cancelAll() }
-            // Whichever finishes first decides; `cancelAll` in the defer stops the other
-            // from outliving this, so a slow call cannot keep the CLI's session alive
-            // after it has already answered.
-            return try await group.next() ?? nil
-        }
+    /// `disconnect` is the whole mechanism: it is what releases the SDK's outstanding
+    /// request — which is why the call's `await` ends at all — and it is what stops the
+    /// next one from waiting at all, since a client with no session answers immediately.
+    private func abandon(tool name: String) async {
+        MCPDiagnostics.hostFailure(
+            "a relayed MCP call did not answer in time",
+            detail: "pid \(ProcessInfo.processInfo.processIdentifier) asked the app for \(name)"
+        )
+        await disconnect()
     }
 
     /// Closes a session that never opened, releasing anything the SDK left pending.

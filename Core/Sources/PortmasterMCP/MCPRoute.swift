@@ -62,6 +62,22 @@ public enum MCPRouteSelector {
     /// working, it is for one that is not.
     public static let onDemandVariable = "PORTMASTER_MCP"
 
+    /// Overrides which directory the endpoint file is read from.
+    ///
+    /// **Both environment variables are documented here and nowhere else**, because a
+    /// second copy of this list is how one of them quietly stops working.
+    ///
+    /// A test seam, and the reason a spawned `portmaster-mcp` can be pointed at a host a
+    /// test started: without it, the child reads the per-user `~/.portmaster`, which on a
+    /// developer machine is whichever app they happen to have running — so the whole
+    /// spawned-binary suite has to force the on-demand path to be deterministic at all.
+    /// With it, the same suite can drive **both** routes against a host it controls.
+    ///
+    /// Unset is the real per-user directory, so nothing about production changes, and
+    /// `select`'s own `endpointDirectory` parameter still wins over it: an explicit
+    /// argument is a caller being specific.
+    public static let endpointDirectoryVariable = "PORTMASTER_MCP_ENDPOINT_DIR"
+
     /// What the CLI says when it could not reach an app.
     ///
     /// Said about the socket rather than about Portmaster: every trigger here is
@@ -77,8 +93,14 @@ public enum MCPRouteSelector {
     /// healthy — that is the usual reason anyone sets it — and telling the user "no
     /// Portmaster answering on the socket" would be the one untrue thing the process
     /// says, pointing them away from the wedged app they were trying to route around.
+    ///
+    /// It does **not** claim Portmaster is up, because this branch never probes: it runs
+    /// before any socket work, which is the point of consulting the variable first. On a
+    /// machine with nothing running, "even though Portmaster may be up" is still true,
+    /// and the alternative — a probe just to justify the wording — would reintroduce the
+    /// wait the escape hatch exists to avoid. The user set the variable; they know why.
     public static let forcedNotice =
-        "portmaster-mcp: \(onDemandVariable)=on-demand, so this session is doing its own sweep even though Portmaster is up."
+        "portmaster-mcp: \(onDemandVariable)=on-demand, so this session is doing its own sweep even though Portmaster may be up."
 
     /// `.proxy` when a live, authenticated host answers; `.onDemand` when
     /// `PORTMASTER_MCP=on-demand` is set, the endpoint is unavailable, or the
@@ -90,10 +112,12 @@ public enum MCPRouteSelector {
     ///
     /// - Parameters:
     ///   - environment: read once, defaulted to the process's own. A parameter so a test
-    ///     can force the fallback without the test runner's environment deciding it.
-    ///   - endpointDirectory: where the endpoint file is. `nil` is the per-user
-    ///     `~/.portmaster`; a test must never pass `nil`, because that is the one place
-    ///     the token would be real.
+    ///     can force the fallback without the test runner's environment deciding it, and
+    ///     can name an endpoint directory via `endpointDirectoryVariable`.
+    ///   - endpointDirectory: where the endpoint file is. `nil` falls back to the
+    ///     environment's `endpointDirectoryVariable`, and then to the per-user
+    ///     `~/.portmaster`; a test must never leave it at that last one, because that is
+    ///     the only place the token would be real.
     public static func select(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         endpointDirectory: URL? = nil
@@ -106,7 +130,8 @@ public enum MCPRouteSelector {
         // stale one, a socket nothing is listening on, a refused token. They are one
         // answer to the only question a caller has, so they are collapsed before they
         // are returned.
-        if let client = SocketMCPClient(endpointDirectory: endpointDirectory),
+        let directory = endpointDirectory ?? endpointDirectoryFromEnvironment(environment)
+        if let client = SocketMCPClient(endpointDirectory: directory),
             await client.open()
         {
             return .proxy(client)
@@ -120,6 +145,20 @@ public enum MCPRouteSelector {
     static func isForcedOnDemand(_ environment: [String: String]) -> Bool {
         guard let value = environment[onDemandVariable] else { return false }
         return value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "on-demand"
+    }
+
+    /// The endpoint directory `environment` names, or `nil` for the per-user default.
+    ///
+    /// Empty and whitespace-only are treated as unset rather than as a path, because
+    /// `URL(fileURLWithPath: "")` does not fail: it resolves to the current working
+    /// directory, which names a real place that holds no endpoint file — a silent
+    /// "the app is not available" that reads like a correct answer to the wrong
+    /// question.
+    static func endpointDirectoryFromEnvironment(_ environment: [String: String]) -> URL? {
+        guard let raw = environment[endpointDirectoryVariable] else { return nil }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 
     /// One line, to stderr — never to stdout, which is the JSON-RPC channel, where a
