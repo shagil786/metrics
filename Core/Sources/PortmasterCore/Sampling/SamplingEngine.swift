@@ -52,6 +52,12 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
     private var lastNettopAt: Date = .distantPast
     private var lastPortPoll: Date = .distantPast
     private var lastLiveSampleAt: Date?
+    /// Set by `resumeOnce()` so the very next tick samples instead of taking the idle
+    /// branch. A flag rather than a timestamp, because the whole point is *not* to look
+    /// like user activity — a poll that stamped `lastLiveSampleAt` would keep a
+    /// menu-bar app sampling on its background cadence forever. Lives on the sampling
+    /// queue, set and cleared there, so it needs no lock.
+    private var resumeOnceRequested = false
     private var activityLedger: [pid_t: Date] = [:]
 
     public private(set) var cadence: SamplingCadence
@@ -124,6 +130,36 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
         reschedule()
     }
 
+    /// Takes **one** sample now, without recording that anyone did anything.
+    ///
+    /// For a caller that needs a reading rather than a user: an MCP tool call, a
+    /// screenshot request, anything that wants the machine's state and is not the
+    /// person using it. It clears the idle pause and queues a tick that samples even
+    /// though the idle window has elapsed — and it deliberately leaves
+    /// `lastLiveSampleAt` alone, so the *next* idle check still counts from the last
+    /// real activity and the engine pauses again on its own schedule.
+    ///
+    /// **`noteUserActivity()` is the other half and is not interchangeable.** Stamping
+    /// activity here would mean an assistant polling every few minutes could hold a
+    /// menu-bar app awake indefinitely, which is precisely the cost the idle pause
+    /// exists to avoid — paid by someone who never touched the app.
+    ///
+    /// Ordering, which is load-bearing: the flag is set **on the sampling queue,
+    /// immediately before the tick that consumes it**, so there is no window in which a
+    /// queued tick could reach the idle-pause guard first and return without sampling.
+    /// `isPaused` is a display flag and is cleared separately on the main queue; the
+    /// flag above, not that one, is what makes the tick sample.
+    public func resumeOnce() {
+        if isPaused {
+            DispatchQueue.main.async { [weak self] in self?.isPaused = false }
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.resumeOnceRequested = true
+            self.tick()
+        }
+    }
+
     /// Called by the app on user activity (NSWorkspace notifications upstream);
     /// unpauses sampling after idle pause.
     public func noteUserActivity() {
@@ -163,9 +199,15 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
     }
     private func tick() {
         // Idle pause: no visible surface + no activity for a while → stop polling.
-        if let last = lastLiveSampleAt,
-           !isSurfaceVisible,
-           Date().timeIntervalSince(last) > idlePauseAfter {
+        //
+        // A one-shot resume consumes the request rather than the branch: the tick it
+        // asked for samples, and the tick after it is back under the ordinary rule, so
+        // `resumeOnce()` cannot become a way to stay awake. See `resumeOnce`.
+        if resumeOnceRequested {
+            resumeOnceRequested = false
+        } else if let last = lastLiveSampleAt,
+                  !isSurfaceVisible,
+                  Date().timeIntervalSince(last) > idlePauseAfter {
             if !isPaused {
                 DispatchQueue.main.async { [weak self] in self?.isPaused = true }
             }
