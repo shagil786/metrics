@@ -147,8 +147,13 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
     /// Ordering, which is load-bearing: the flag is set **on the sampling queue,
     /// immediately before the tick that consumes it**, so there is no window in which a
     /// queued tick could reach the idle-pause guard first and return without sampling.
-    /// `isPaused` is a display flag and is cleared separately on the main queue; the
-    /// flag above, not that one, is what makes the tick sample.
+    /// The flag on the sampling queue, not `isPaused`, is what makes the tick sample.
+    ///
+    /// **`isPaused` is display state, and is corrected from inside that tick.** It is
+    /// cleared here so the UI does not show a paused engine as running mid-sample, and
+    /// the tick then sets it again from the condition its *next* tick will see — which,
+    /// for an idle app, is paused. So the flag reports what the engine will do rather
+    /// than what the last tick did, and it is never a minute behind the behaviour.
     public func resumeOnce() {
         if isPaused {
             DispatchQueue.main.async { [weak self] in self?.isPaused = false }
@@ -178,6 +183,22 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Internals
 
+    /// Applies, now, the pause state the next tick will act on.
+    ///
+    /// Read from the same condition `tick()` uses rather than assumed, so a visible
+    /// surface (which keeps sampling) is not mislabelled as idle. The flag is display
+    /// state for the UI; it never gates a sample, which is why it can be corrected here
+    /// without touching the timer the engine runs on.
+    private func reportPauseStateForNextTick() {
+        let willIdle = lastLiveSampleAt.map {
+            !isSurfaceVisible && Date().timeIntervalSince($0) > idlePauseAfter
+        } ?? false
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isPaused != willIdle else { return }
+            self.isPaused = willIdle
+        }
+    }
+
     private func reschedule() {
         stop()
         let interval = currentInterval()
@@ -205,6 +226,12 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
         // `resumeOnce()` cannot become a way to stay awake. See `resumeOnce`.
         if resumeOnceRequested {
             resumeOnceRequested = false
+            // This tick sampled without recording activity, so the *next* one is back
+            // under the idle rule and will produce nothing. Say so now, rather than
+            // leaving `isPaused` cleared for as long as the next tick takes to notice:
+            // on a gentle cadence's 60-second background interval that is a minute of
+            // the app reporting that it is sampling when it is not.
+            reportPauseStateForNextTick()
         } else if let last = lastLiveSampleAt,
                   !isSurfaceVisible,
                   Date().timeIntervalSince(last) > idlePauseAfter {

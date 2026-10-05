@@ -88,10 +88,15 @@ public struct LiveDataProvider: DataProvider {
     ///
     /// One nudge and one wait, then the caller decides with a single
     /// `requireReadable`: a wake that did not land is refused in the same words as one
-    /// that was never tried, so the client learns the same thing either way. The wait
-    /// exists because `refreshNow()` schedules a tick rather than running one — the
-    /// reading cannot be there the instant the nudge returns — and it is a wait for
-    /// that one tick, not a second attempt to answer.
+    /// that was never tried, so the client learns the same thing either way.
+    ///
+    /// The wait exists because the nudge the app supplies is `SamplingEngine.resumeOnce()`,
+    /// which **queues one tick on the engine's sampling queue and returns** — it samples
+    /// only after the sweep and the publish that follows it, so the reading cannot be
+    /// there the instant the nudge returns. It is a wait for that one tick, not a second
+    /// attempt to answer. (`resumeOnce()` rather than a plain forced tick is the app's
+    /// choice, not this function's: it queues the tick *without* stamping user activity,
+    /// so a poll cannot keep an idle app awake. See its doc for why that matters.)
     ///
     /// - Parameters:
     ///   - stale: the reading that could not be answered with. A new reading is any

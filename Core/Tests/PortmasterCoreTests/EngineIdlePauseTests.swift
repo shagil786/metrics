@@ -76,7 +76,13 @@ final class EngineIdlePauseTests: XCTestCase {
             resumed, first,
             "a one-shot resume must produce a reading even while the idle window has elapsed"
         )
-        XCTAssertTrue(waitUntil({ !engine.isPaused }), "and clear the paused flag it was showing")
+        // The flag is display state and the tick corrects it: this resume produced one
+        // reading and left the engine exactly as it found it, so it must report itself
+        // paused again rather than claiming to sample for another cadence interval.
+        XCTAssertTrue(
+            waitUntil { engine.isPaused },
+            "a one-shot resume must leave the engine reporting that it will not sample again"
+        )
 
         // …and the next idle window must still be able to pause it. This tick lands
         // *inside* the window the resume would have bought, so a stamped
