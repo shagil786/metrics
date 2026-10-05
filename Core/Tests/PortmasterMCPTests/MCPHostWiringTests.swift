@@ -326,6 +326,143 @@ final class MCPHostWiringTests: XCTestCase {
         }
     }
 
+    // MARK: - Reading a mirrored snapshot
+
+    /// Both sides of the freshness boundary, because the app cannot be asked to
+    /// produce an old reading on demand and the rule is a number someone will want to
+    /// move: `maximumReadingAge` seconds is the oldest a reading may be and still be
+    /// answered with, and one second past it is a refusal that names the age.
+    func testAMirroredReadingIsAnsweredUntilItIsTooOld() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let fresh = try LiveDataProvider.requireReadable(
+            Self.snapshot(), now: now
+        )
+        XCTAssertEqual(fresh.at, Self.snapshot().at, "a just-published reading is answerable")
+
+        // Exactly at the bound, and one second past it: the boundary is inclusive, so
+        // a sampler that pauses for exactly one interval still answers.
+        XCTAssertNoThrow(
+            try LiveDataProvider.requireReadable(
+                Self.snapshot(at: now.addingTimeInterval(-LiveDataProvider.maximumReadingAge)),
+                now: now
+            ),
+            "a reading exactly at the bound is still current enough to report"
+        )
+        do {
+            _ = try LiveDataProvider.requireReadable(
+                Self.snapshot(at: now.addingTimeInterval(-LiveDataProvider.maximumReadingAge - 1)),
+                now: now
+            )
+            XCTFail("a reading past the bound must not be reported as current")
+        } catch let error as MCPToolError {
+            XCTAssertTrue(error.message.contains("idle"), error.message)
+            XCTAssertTrue(
+                error.message.contains("2 minutes"),
+                "the refusal must name how old the reading is: \(error.message)"
+            )
+        }
+    }
+
+    /// The bound is derived from the app's own cadences, so it is stated as one rather
+    /// than asserted by a test that would have to know the number twice.
+    func testTheFreshnessBoundIsLongerThanTheSlowestBackgroundCadence() {
+        XCTAssertGreaterThan(
+            LiveDataProvider.maximumReadingAge, 60,
+            "the slowest background cadence samples every 60s, so a bound under that "
+            + "would refuse a reading the app published one interval ago"
+        )
+    }
+
+    /// The app's own throw site is `LiveDataProvider.requireReadable`, which is what
+    /// makes this contract about the app and not about a test's own closure: both
+    /// refusals it can raise are the library's, and neither can be worded here.
+    func testTheAppPathRefusesWithTheLibrarysOwnSentences() throws {
+        // Cold: nothing published at all.
+        do {
+            _ = try LiveDataProvider.requireReadable(.empty, now: Date())
+            XCTFail("an app that has published nothing must refuse")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(
+                error, MCPToolError.samplerNotReady,
+                "a cold sampler must be refused in OnDemandProvider's sentence"
+            )
+            XCTAssertEqual(error.message, OnDemandProvider.notReadyMessage)
+        }
+
+        // Idle: something published, but long ago.
+        let now = Date()
+        let stale = Self.snapshot(at: now.addingTimeInterval(-3_600))
+        do {
+            _ = try LiveDataProvider.requireReadable(stale, now: now)
+            XCTFail("an hour-old reading must not be reported as current")
+        } catch let error as MCPToolError {
+            XCTAssertTrue(
+                error.message.contains("60 minutes"),
+                "the refusal must name how old the reading is: \(error.message)"
+            )
+        }
+    }
+
+    /// A preference write must not need the main thread, and the app's hop to its own
+    /// actor must be a suspension rather than a block.
+    ///
+    /// The assertion is made from a detached task, so it fails if `setPreference`
+    /// ever requires the caller's thread to be the main one — which is what a
+    /// `MainActor.assumeIsolated` inside the provider would have needed, and what the
+    /// app's `await MainActor.run` no longer does. `LiveDataProvider`'s seam is `async`
+    /// for exactly this reason.
+    func testAPreferenceWriteDoesNotNeedTheMainThread() async throws {
+        let ranOnMainThread = MainThreadProbe()
+        let provider = LiveDataProvider(
+            snapshot: { throw MCPToolError.samplerNotReady },
+            alerts: { AlertsSnapshot(source: .live, alerts: []) },
+            history: { UnavailableHistoryReading(message: "no history") },
+            settings: { Self.settingsReporting(mode: .off) },
+            applyPreference: { _, _ in ranOnMainThread.record() },
+            stopApp: { _, _ in StopReport(results: [:]) },
+            stopContainerNamed: { _ in StopReport(results: [:]) },
+            stopProject: { _ in StopReport(results: [:]) }
+        )
+
+        try await Task.detached(priority: .userInitiated) { [provider] in
+            try await provider.setPreference(key: "temperatureUnit", value: "celsius")
+        }.value
+
+        XCTAssertEqual(ranOnMainThread.count, 1, "the write must reach the app")
+        XCTAssertFalse(
+            ranOnMainThread.anyOnMainThread,
+            "a preference write must not be pinned to the main thread"
+        )
+    }
+
+    /// A confirmed mutation presents the instant the broker owns the request, not up
+    /// to a polling interval later.
+    ///
+    /// `onQueued` makes the two the same step, so the window opens from inside
+    /// `request`. What is observable here is that a presenter which answers
+    /// immediately is always matched — with the answer dropped as "an answer to
+    /// nothing" the call would instead end at its budget, and the test below would
+    /// see a timeout rather than an action.
+    func testAPresenterCanAnswerTheInstantItIsCalled() async throws {
+        let provider = StubProvider()
+        let broker = ConfirmationBroker(timeout: 5)
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach, present: { request in
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        let outcome = await context.call(name: "quit_app", arguments: ["id": "app:Chrome"])
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertEqual(
+            provider.quitAppCallCount, 1,
+            "an approval given the moment the window opened must be matched, not dropped"
+        )
+    }
+
     // MARK: - Helpers
 
     /// The host context over a provider and a disposable directory.
@@ -373,6 +510,34 @@ final class MCPHostWiringTests: XCTestCase {
         )
     }
 
+    /// A reading published at `at`.
+    ///
+    /// Built through the model initializer rather than by copying a fixture and moving
+    /// its `at`, because `at` is a `let`: the freshness rule is about the instant a
+    /// reading claims to be from, and a fixture whose system sample claims a different
+    /// one would be a reading that lies about itself.
+    private static func snapshot(
+        at: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    ) -> ObservationSnapshot {
+        ObservationSnapshot(
+            at: at,
+            system: SystemSample(
+                at: at,
+                cpu: SystemCPU(
+                    totalPercent: 12, userPercent: 8, systemPercent: 4,
+                    idlePercent: 88, corePercents: [8, 4], coreCount: 2
+                ),
+                memory: SystemMemory(
+                    totalBytes: 16_000_000_000, usedBytes: 8_000_000_000,
+                    pressureLevel: .normal, pressureRatio: 0.5, swapBytes: nil,
+                    freeBytes: 8_000_000_000, appBytes: nil, wiredBytes: nil,
+                    compressedBytes: nil
+                )
+            ),
+            processes: [], ports: [], services: [], rollups: []
+        )
+    }
+
     /// One settings payload, with the mutation mode named by the caller so a test
     /// can show which value came from where.
     private static func settingsReporting(mode: MCPMutationMode) -> SettingsSnapshot {
@@ -403,6 +568,17 @@ final class MCPHostWiringTests: XCTestCase {
     private func auditOutcomes(_ directory: URL) throws -> [String] {
         try auditEntries(directory).compactMap { $0["outcome"] as? String }
     }
+}
+
+/// Where the app's preference write ran, and how many times.
+private final class MainThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var threads: [Bool] = []
+
+    func record() { lock.withLock { threads.append(Thread.isMainThread) } }
+
+    var count: Int { lock.withLock { threads.count } }
+    var anyOnMainThread: Bool { lock.withLock { threads.contains(true) } }
 }
 
 /// What a person was asked, in order. The stand-in for the confirmation window:

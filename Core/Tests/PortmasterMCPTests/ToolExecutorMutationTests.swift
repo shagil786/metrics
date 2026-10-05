@@ -144,7 +144,7 @@ final class ToolExecutorMutationTests: XCTestCase {
         addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         let provider = OnDemandProvider(preferencesDefaults: defaults, appRunning: { false })
         do {
-            try provider.setPreference(key: "retention", value: "days30")
+            try await provider.setPreference(key: "retention", value: "days30")
             XCTFail("Only allowlisted preferences may be changed")
         } catch let error as MCPToolError {
             XCTAssertEqual(error.message, refusal)

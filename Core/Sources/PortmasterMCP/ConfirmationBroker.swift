@@ -42,8 +42,10 @@ public enum ApprovalOutcome: Equatable, Sendable {
 /// The approval state machine between an AI client's request to change something
 /// and the change actually happening.
 ///
-/// It does not present anything — whoever shows the prompt watches `pending` and
-/// calls `decide`. What it owns is the part that has to be right no matter how
+/// It does not present anything — it says when a request is *waiting*, and whoever
+/// shows the prompt calls `decide`. `request`'s `onQueued` is that notification and
+/// nothing more: the broker still draws nothing, opens no window, and knows nothing
+/// about a UI. What it owns is the part that has to be right no matter how
 /// impatient or unlucky the caller is:
 ///
 /// - **Nothing hangs, and nothing throws.** Every accepted request ends in
@@ -161,7 +163,28 @@ public actor ConfirmationBroker {
     /// broker remembers it, so a late answer to a decided request cannot land on a
     /// later one. `UUID()` is the default and nothing in the slice regenerates ids,
     /// which is what makes that hold.
-    public func request(_ request: MCPApprovalRequest) async -> ApprovalOutcome {
+    ///
+    /// `onQueued` is called once, on this actor, immediately after the entry is in
+    /// `queue` and its budget is armed — which is the only moment at which a
+    /// presenter can be *sure* its answer will be matched. `decide` ignores an answer
+    /// for an id the broker does not hold, which is right for a stale answer and
+    /// exactly wrong for one that arrives first; a presenter that opens a window
+    /// before registering therefore races its own approval. The callback removes the
+    /// race by making "queued" and "shown" the same step.
+    ///
+    /// **It must not block.** It runs on the actor, so anything slow in it delays
+    /// every other approval, including `decide` calls that are trying to unblock a
+    /// request already waiting. Hop to another actor and return.
+    ///
+    /// - Parameters:
+    ///   - request: what to ask a person about.
+    ///   - onQueued: shows the question, once the broker owns it. `nil` is a caller
+    ///     that will not present — and therefore has to answer the request itself,
+    ///     because nothing else will.
+    public func request(
+        _ request: MCPApprovalRequest,
+        onQueued: (@Sendable () -> Void)? = nil
+    ) async -> ApprovalOutcome {
         // Two live entries sharing an id would make `decide` ambiguous — a
         // stale answer could be delivered to the wrong caller — so the second
         // caller is told no instead of being queued behind an id it cannot be told
@@ -201,6 +224,9 @@ public actor ConfirmationBroker {
                 await Self.wait(until: entry.deadline, clock: clock)
                 expire(entry)
             }
+            // After the budget is armed, so the time spent opening the window is
+            // inside the caller's budget rather than added to it. See `onQueued`.
+            onQueued?()
         }
     }
 

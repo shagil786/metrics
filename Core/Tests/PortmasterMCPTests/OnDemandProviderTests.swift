@@ -776,7 +776,7 @@ final class OnDemandProviderTests: XCTestCase {
 
     // MARK: Preferences
 
-    func testSetPreferenceAppOpenDenies() throws {
+    func testSetPreferenceAppOpenDenies() async throws {
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
             preferencesDefaults: try makePreferencesDefaults(),
@@ -784,7 +784,7 @@ final class OnDemandProviderTests: XCTestCase {
         )
 
         do {
-            try provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
+            try await provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
             XCTFail("A running app holds preferences in memory and would clobber an external write")
         } catch let error as MCPToolError {
             XCTAssertEqual(
@@ -796,7 +796,7 @@ final class OnDemandProviderTests: XCTestCase {
     }
 
     /// A read-modify-write of the app's blob must leave every sibling field alone.
-    func testSetPreferenceWritesAllowlistedFieldOnly() throws {
+    func testSetPreferenceWritesAllowlistedFieldOnly() async throws {
         let defaults = try makePreferencesDefaults()
         var seeded = AppPreferences(menuBarMetric: .networkDown)
         seeded.presentation.networkUnit = .bits
@@ -809,7 +809,7 @@ final class OnDemandProviderTests: XCTestCase {
             appRunning: { false }
         )
 
-        try provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
+        try await provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
 
         let reloaded = AppPreferences.load(from: defaults)
         XCTAssertEqual(reloaded.presentation.temperatureUnit, .fahrenheit, "the requested field changed")
@@ -824,7 +824,7 @@ final class OnDemandProviderTests: XCTestCase {
         XCTAssertEqual(reloaded.retention, .days3, "unrelated preferences survive the write")
     }
 
-    func testSetPreferenceInvalidValueThrows() throws {
+    func testSetPreferenceInvalidValueThrows() async throws {
         let defaults = try makePreferencesDefaults()
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
@@ -834,7 +834,7 @@ final class OnDemandProviderTests: XCTestCase {
 
         for (key, value) in [("temperatureUnit", "kelvin"), ("compact", "yes"), ("cpuScale", "total")] {
             do {
-                try provider.setPreference(key: key, value: value)
+                try await provider.setPreference(key: key, value: value)
                 XCTFail("\(key)=\(value) must be rejected rather than stored")
             } catch let error as MCPToolError {
                 XCTAssertEqual(error.message, "Invalid value '\(value)' for '\(key)'.")
@@ -846,7 +846,7 @@ final class OnDemandProviderTests: XCTestCase {
         )
     }
 
-    func testSetPreferenceRejectsKeyOutsideTheAllowlist() throws {
+    func testSetPreferenceRejectsKeyOutsideTheAllowlist() async throws {
         let defaults = try makePreferencesDefaults()
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
@@ -855,7 +855,7 @@ final class OnDemandProviderTests: XCTestCase {
         )
 
         do {
-            try provider.setPreference(key: "retention", value: "days30")
+            try await provider.setPreference(key: "retention", value: "days30")
             XCTFail("Only allowlisted preferences may be changed")
         } catch let error as MCPToolError {
             XCTAssertTrue(error.message.contains("retention"), error.message)
@@ -871,7 +871,7 @@ final class OnDemandProviderTests: XCTestCase {
     /// One rule for every key: trimmed, then matched without regard to case.
     /// A client echoing a label back must not fail for a reason a user can see,
     /// and a value that is not on the list must still be refused.
-    func testSetPreferenceValuesAreCaseInsensitiveAndTrimmed() throws {
+    func testSetPreferenceValuesAreCaseInsensitiveAndTrimmed() async throws {
         let defaults = try makePreferencesDefaults()
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
@@ -879,11 +879,11 @@ final class OnDemandProviderTests: XCTestCase {
             appRunning: { false }
         )
 
-        try provider.setPreference(key: "temperatureUnit", value: "  Fahrenheit ")
-        try provider.setPreference(key: "networkUnit", value: "BITS")
-        try provider.setPreference(key: "cpuScale", value: "PerMac")
-        try provider.setPreference(key: "temperatureSource", value: "GPU")
-        try provider.setPreference(key: "compact", value: " TRUE ")
+        try await provider.setPreference(key: "temperatureUnit", value: "  Fahrenheit ")
+        try await provider.setPreference(key: "networkUnit", value: "BITS")
+        try await provider.setPreference(key: "cpuScale", value: "PerMac")
+        try await provider.setPreference(key: "temperatureSource", value: "GPU")
+        try await provider.setPreference(key: "compact", value: " TRUE ")
 
         let reloaded = AppPreferences.load(from: defaults)
         XCTAssertEqual(reloaded.presentation.temperatureUnit, .fahrenheit)
@@ -901,7 +901,7 @@ final class OnDemandProviderTests: XCTestCase {
     /// The provider therefore has no `mcpMode` branch to reach, and reaching it
     /// directly gets the ordinary not-a-preference refusal. The write itself is
     /// pinned where it happens, in `ToolExecutorMutationTests`.
-    func testSetPreferenceMcpModeIsNotTheProvidersToWrite() throws {
+    func testSetPreferenceMcpModeIsNotTheProvidersToWrite() async throws {
         let defaults = try makePreferencesDefaults()
         let provider = OnDemandProvider(
             snapshotSource: stubSnapshotSourceWithoutReading(),
@@ -910,7 +910,7 @@ final class OnDemandProviderTests: XCTestCase {
         )
 
         do {
-            try provider.setPreference(key: "mcpMode", value: "allowSession")
+            try await provider.setPreference(key: "mcpMode", value: "allowSession")
             XCTFail("The provider must not write the MCP server's own mutation policy")
         } catch let error as MCPToolError {
             // One message, not two: the refusal is the executor's own sentence,

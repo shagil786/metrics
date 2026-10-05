@@ -202,5 +202,11 @@ public protocol DataProvider: Sendable {
     func quitApp(id: String, force: Bool) async throws -> StopReport
     func stopContainer(id: String) async throws -> StopReport
     func stopProject(id: String) async throws -> StopReport
-    func setPreference(key: String, value: String) throws
+    /// `async` so a host whose preferences live on another actor can hand on to it by
+    /// suspending. It was synchronous, and the only implementations either did the
+    /// work inline or bridged to a main actor with a blocking hop — a hop that is
+    /// correct until something on that actor waits for a tool call, and then a
+    /// deadlock. Reads that must not block are declared `throws`; this one is declared
+    /// for the opposite reason.
+    func setPreference(key: String, value: String) async throws
 }

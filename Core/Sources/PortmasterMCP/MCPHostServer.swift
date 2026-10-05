@@ -163,6 +163,16 @@ public final class MCPHostServer: @unchecked Sendable {
     /// orphans the first instance's socket; without this check, the instance that lost
     /// would delete the endpoint file of the one that won, and every CLI would fall back
     /// to spawning its own server.
+    ///
+    /// **It must never block.** This runs on the app's quit path, and the one thing an
+    /// app-hosted caller does from another actor while this is in flight is write a
+    /// preference through `LiveDataProvider`'s `applyPreference` — which suspends onto
+    /// the main actor. If `stop()` were made synchronous (blocking its caller while the
+    /// accept thread is joined), a main actor waiting for that write and a main actor
+    /// this call is waiting on would be the same thread, and the app would deadlock at
+    /// quit. Every wait below therefore suspends (`withCheckedContinuation`), and the
+    /// wait on the accept thread is itself handed to a global queue rather than
+    /// performed on the caller's actor.
     public func stop() async {
         let shutdown = lock.withLock { () -> (
             Int32, Int32, Int32, DispatchSemaphore, (dev: dev_t, ino: ino_t)?
@@ -231,13 +241,14 @@ public final class MCPHostServer: @unchecked Sendable {
 
     /// Called with every accepted socket, synchronously, before it is served.
     ///
-    /// **Test-only, and set before `start()`.** It exists for the one property of an
+    /// **Test-only.** It exists for the one property of an
     /// accepted descriptor that nothing outside the process can observe: whether its
     /// writes are prevented from raising `SIGPIPE`. A missing `SO_NOSIGPIPE` has no
     /// crash report and no log line — it terminates the app — so the only way to keep
     /// that honest is to read the option off the descriptor the host actually
-    /// accepted. `nil` in production, so the accept path costs one optional read per
-    /// connection and nothing per sample.
+    /// accepted. Set at any time — the accept loop reads it per connection, so a test
+    /// may install it after `start()` — and `nil` in production, so the accept path
+    /// costs one optional read per connection and nothing per sample.
     var onSocketAccepted: (@Sendable (UnixSocket) -> Void)? {
         get { lock.withLock { socketAcceptedObserver } }
         set { lock.withLock { socketAcceptedObserver = newValue } }

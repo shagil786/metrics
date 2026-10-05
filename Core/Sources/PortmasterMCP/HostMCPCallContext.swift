@@ -54,9 +54,10 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// - Parameters:
     ///   - provider: the app's own data. `LiveDataProvider` in production.
     ///   - broker: where a request waits for its answer.
-    ///   - present: shows the question to a person. Called only once the broker is
-    ///     holding the request, so an answer that comes back immediately cannot be
-    ///     dropped as an answer to nothing.
+    ///   - present: shows the question to a person. Handed to `request` as the
+    ///     broker's `onQueued` callback, so it runs at the one moment its answer is
+    ///     guaranteed to be matched — and without the polling an approximation of
+    ///     that moment would need.
     ///   - loadSettings: re-reads the mutation policy per call, so changing the mode
     ///     takes effect without restarting anything.
     ///   - appRunning: probed per call, because `allowSession` is a grant that lasts
@@ -132,36 +133,17 @@ public struct HostMCPCallContext: MCPToolCalling {
 
     /// Puts `request` to a person and waits for the broker's answer.
     ///
-    /// The order is the whole subtlety. `ConfirmationBroker.decide` matches by id and
-    /// *ignores* an answer for an id it does not hold — which is the right behaviour
-    /// for a stale answer, and exactly wrong for an answer that arrives before the
-    /// entry exists. So the request is handed to the presenter only once the broker
-    /// has it: a person who approves a window the instant it appears has their
-    /// approval delivered, instead of being ignored and then waiting out the whole
-    /// budget.
+    /// The order is the whole subtlety, and it is now the broker's to guarantee:
+    /// `ConfirmationBroker.decide` matches by id and *ignores* an answer for an id it
+    /// does not hold — right for a stale answer, exactly wrong for one that arrives
+    /// first. Handing `present` to `request` as its `onQueued` callback makes "the
+    /// broker owns it" and "a person is being asked" the same step, so an approval
+    /// given the instant the window appears is matched rather than dropped, and no
+    /// confirmation pays a polling interval before its window opens.
     private func confirm(_ request: MCPApprovalRequest) async -> ApprovalOutcome {
-        let answer = Task { await broker.request(request) }
-        await waitUntilHeld(request.id)
-        present(request)
-        return await answer.value
+        let present = self.present
+        return await broker.request(request) { present(request) }
     }
-
-    /// Waits for the broker to own `id`, or gives up and presents anyway.
-    ///
-    /// Bounded on purpose: the broker registers the entry as soon as its own actor
-    /// runs `request`, so this is a formality in the normal case. The bound is there
-    /// so a broker that somehow never registers cannot hold the call open before the
-    /// caller's own budget has even started — a request the presenter never sees
-    /// times out at the broker's deadline either way.
-    private func waitUntilHeld(_ id: UUID) async {
-        for _ in 0..<Self.registrationPolls {
-            if await broker.pending.contains(where: { $0.id == id }) { return }
-            try? await Task.sleep(for: .milliseconds(Self.registrationPollMilliseconds))
-        }
-    }
-
-    static let registrationPolls = 100
-    static let registrationPollMilliseconds = 5
 
     /// The question a person is shown, in their terms.
     ///

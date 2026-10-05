@@ -565,7 +565,7 @@ public struct ToolExecutor: Sendable {
                     message: "Missing argument: \(arguments["key"] == nil ? "key" : "value")"
                 )
             }
-            return try setPreference(key: key, value: value)
+            return try await setPreference(key: key, value: value)
 
         // Unreachable while the catalog and this switch stay in step: `execute`
         // refuses any name the catalog does not declare, and every declared name
@@ -604,7 +604,9 @@ public struct ToolExecutor: Sendable {
     /// blob, because the server has to be able to read and write it whether or not
     /// the UI is running. Everything else goes to the provider, which owns the
     /// meaning of each value and rejects the ones it cannot apply.
-    private func setPreference(key: String, value: String) throws -> PreferencePayload {
+    private func setPreference(
+        key: String, value: String
+    ) async throws -> PreferencePayload {
         guard Self.allowedPreferenceKeys.contains(key) else {
             // Naming the rejected key and the allowlist back: a caller that guessed
             // a key learns what it may try instead, and a caller that did not learn
@@ -636,7 +638,7 @@ public struct ToolExecutor: Sendable {
             return PreferencePayload(key: key, value: mode.rawValue)
         }
 
-        try provider.setPreference(key: key, value: value)
+        try await provider.setPreference(key: key, value: value)
         return PreferencePayload(key: key, value: value)
     }
 

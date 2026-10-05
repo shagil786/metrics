@@ -403,13 +403,19 @@ final class LiveDataProviderTests: XCTestCase {
 
     /// A key outside the allowlist is refused with the words the on-demand path
     /// uses, built from the executor's own list — and it never reaches the app.
-    func testSetPreferenceRejectsAKeyOutsideTheAllowlist() throws {
+    func testSetPreferenceRejectsAKeyOutsideTheAllowlist() async throws {
         let mutations = RecordedMutations()
         let provider = makeProvider(PublishedSnapshot(Self.snapshot()), mutations: mutations)
 
-        XCTAssertThrowsError(try provider.setPreference(key: "alertsEnabled", value: "false")) { error in
+        // `do`/`catch` rather than `XCTAssertThrowsError`: that takes a synchronous
+        // autoclosure, and `setPreference` is `async` so a host can hand a write to
+        // another actor by suspending rather than by blocking one.
+        do {
+            try await provider.setPreference(key: "alertsEnabled", value: "false")
+            XCTFail("a key outside the allowlist must be refused")
+        } catch let error as MCPToolError {
             XCTAssertEqual(
-                error as? MCPToolError,
+                error,
                 MCPToolError(
                     message: "Preference 'alertsEnabled' cannot be changed via MCP. Allowed: "
                         + ToolExecutor.allowedPreferenceKeysDescription() + "."
@@ -426,15 +432,16 @@ final class LiveDataProviderTests: XCTestCase {
     /// An unusable value is refused in the same words too: one client can reach
     /// either provider, so a value this path rejects cannot be applied by the app
     /// while the other path rejects it.
-    func testSetPreferenceRejectsAnInvalidValueWithSliceOneWording() throws {
+    func testSetPreferenceRejectsAnInvalidValueWithSliceOneWording() async throws {
         let mutations = RecordedMutations()
         let provider = makeProvider(PublishedSnapshot(Self.snapshot()), mutations: mutations)
 
-        XCTAssertThrowsError(
-            try provider.setPreference(key: "temperatureUnit", value: "kelvin")
-        ) { error in
+        do {
+            try await provider.setPreference(key: "temperatureUnit", value: "kelvin")
+            XCTFail("a value no case matches must be refused")
+        } catch let error as MCPToolError {
             XCTAssertEqual(
-                error as? MCPToolError,
+                error,
                 MCPToolError(message: "Invalid value 'kelvin' for 'temperatureUnit'.")
             )
         }
@@ -457,7 +464,7 @@ final class LiveDataProviderTests: XCTestCase {
         XCTAssertEqual(container, StopReport(results: ["abc123": "stopped"]))
         let project = try await provider.stopProject(id: "/Users/dev/code/api")
         XCTAssertEqual(project, StopReport(results: ["5150": "stopped"]))
-        try provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
+        try await provider.setPreference(key: "temperatureUnit", value: "fahrenheit")
 
         XCTAssertEqual(mutations.apps, [RecordedMutations.AppStop(id: "app:Chrome", force: true)])
         XCTAssertEqual(mutations.containers, ["abc123"])

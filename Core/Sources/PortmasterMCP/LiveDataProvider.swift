@@ -19,11 +19,72 @@ import PortmasterCore
 
 /// `DataProvider` over the running app's published snapshot.
 public struct LiveDataProvider: DataProvider {
+    /// The oldest a reading the app has published may be and still be answered with.
+    ///
+    /// **A bound, not a preference.** The app's sampler pauses when nothing is on
+    /// screen (`AppModel.surfaceAppeared`/`Disappeared`), so the newest reading can be
+    /// minutes or hours old while the tool surface is perfectly happy. Answering from
+    /// it would report a machine state that stopped being true, with no marker on it
+    /// — and `get_system_overview`'s payload carries an `at`, which a client can read
+    /// but is not obliged to.
+    ///
+    /// 120 s is chosen against the app's own cadences rather than picked: the slowest
+    /// background cadence is 60 s (`SamplingCadence.gentle`), so this is two of them
+    /// plus a sampling pause's slack — comfortably longer than any live or background
+    /// gap, and far short of "hours". Below it, a reading is current enough that a
+    /// client acting on it is acting on the machine it is looking at; above it, the
+    /// honest answer is that there is no current reading.
+    public static let maximumReadingAge: TimeInterval = 120
+
+    /// The refusal for a published reading that is older than `maximumReadingAge`.
+    ///
+    /// Names the age rather than saying "stale", because the two things a client can do
+    /// with a stale reading are nothing (come back later) and everything (act on a
+    /// machine that has moved on), and only the age says which. Says the sampler is
+    /// idle because that is what it is — Portmaster is running, and has simply paused
+    /// sampling because there is nothing on screen.
+    public static func staleReading(age: TimeInterval) -> MCPToolError {
+        MCPToolError(
+            message: "Portmaster's most recent reading is \(ageDescription(age)) old, and its "
+                + "sampler is idle, so no reading that current is available."
+        )
+    }
+
+    /// Whether a published reading may be answered with.
+    ///
+    /// Two refusals, and they are different facts: a sampler that has published
+    /// **nothing** (`snapshot.at == .distantPast`, which is what `ObservationSnapshot.empty`
+    /// carries) and a sampler that published **something too old**. The first is
+    /// `samplerNotReady`'s sentence and the second is its own, and both are here rather
+    /// than in the app's closure so a host cannot word either of them differently.
+    ///
+    /// `now` is a parameter for the same reason every other clock in this module is: a
+    /// test can sit on either side of the boundary without waiting two minutes.
+    public static func requireReadable(
+        _ snapshot: ObservationSnapshot, now: Date = Date()
+    ) throws -> ObservationSnapshot {
+        guard snapshot.at != .distantPast else { throw MCPToolError.samplerNotReady }
+        let age = now.timeIntervalSince(snapshot.at)
+        guard age <= maximumReadingAge else { throw staleReading(age: age) }
+        return snapshot
+    }
+
+    /// An age in words a person would use, so the refusal reads as a fact about the
+    /// sampler rather than as a number of seconds.
+    static func ageDescription(_ age: TimeInterval) -> String {
+        let seconds = Int(age.rounded())
+        if seconds >= 120 {
+            let minutes = Int((Double(seconds) / 60).rounded())
+            return "\(minutes) minute\(minutes == 1 ? "" : "s")"
+        }
+        return "\(seconds) second\(seconds == 1 ? "" : "s")"
+    }
+
     private let snapshotSource: @Sendable () async throws -> ObservationSnapshot
     private let alertsSource: @Sendable () -> AlertsSnapshot
     private let history: LazyHistory
     private let settingsSource: @Sendable () -> SettingsSnapshot
-    private let applyPreference: @Sendable (String, String) throws -> Void
+    private let applyPreference: @Sendable (String, String) async throws -> Void
     private let stopApp: @Sendable (String, Bool) async throws -> StopReport
     private let stopContainerNamed: @Sendable (String) async throws -> StopReport
     private let stopProject: @Sendable (String) async throws -> StopReport
@@ -38,12 +99,20 @@ public struct LiveDataProvider: DataProvider {
     ///   - settings: the app's current preferences, read on demand.
     ///   - stopping: how mutations reach the app's `StopCoordinator` and settings
     ///     writes.
+    /// `applyPreference` is `async` rather than synchronous so a host whose
+    /// preferences live on another actor can hand on to it by *suspending* — with
+    /// `await MainActor.run { … }` — instead of blocking a thread until the main actor
+    /// is free. A synchronous seam forces one of two bad shapes: a
+    /// `MainActor.assumeIsolated` that is a runtime trap if the invariant ever
+    /// changes, or a `DispatchQueue.main.sync` that deadlocks the moment anything on
+    /// the main actor waits for a tool call. Neither is a risk worth carrying for a
+    /// preference write that happens once per user instruction.
     public init(
         snapshot: @escaping @Sendable () async throws -> ObservationSnapshot,
         alerts: @escaping @Sendable () -> AlertsSnapshot,
         history: @escaping @Sendable () -> any HistoryReading,
         settings: @escaping @Sendable () -> SettingsSnapshot,
-        applyPreference: @escaping @Sendable (String, String) throws -> Void,
+        applyPreference: @escaping @Sendable (String, String) async throws -> Void,
         stopApp: @escaping @Sendable (String, Bool) async throws -> StopReport,
         stopContainerNamed: @escaping @Sendable (String) async throws -> StopReport,
         stopProject: @escaping @Sendable (String) async throws -> StopReport
@@ -193,14 +262,14 @@ public struct LiveDataProvider: DataProvider {
     /// writer, so there is nothing to race: the write is the same one the Settings
     /// screen makes. `mcpMode` still never reaches this method — the executor owns
     /// that key end to end, and `apply` refuses it on both paths.
-    public func setPreference(key: String, value: String) throws {
+    public func setPreference(key: String, value: String) async throws {
         // `validate` raises the two refusals the on-demand path uses — a key
         // outside the executor's allowlist, and a value no enum case matches —
         // with the same wording, from the same code, built from the same
         // allowlist. It is a check, not a write: nothing is handed on unless it
         // passes.
         try PreferencesStore.validate(key: key, value: value)
-        try applyPreference(key, value)
+        try await applyPreference(key, value)
     }
 
     // MARK: Stops

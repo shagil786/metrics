@@ -519,7 +519,7 @@ public struct OnDemandProvider: DataProvider {
     /// only place that writes it. A second implementation here would be reachable
     /// only by a caller that bypassed the tool surface, and its two copies of the
     /// invalid-value message had already begun to disagree.
-    public func setPreference(key: String, value: String) throws {
+    public func setPreference(key: String, value: String) async throws {
         guard !appRunning() else {
             throw MCPToolError(message: Self.appRunningMessage)
         }
