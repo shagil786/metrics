@@ -522,13 +522,15 @@ private struct MCPConfirmationView: View {
                 for: request.kind, arguments: request.arguments, targets: []
             )).fixedSize(horizontal: false, vertical: true)
             ScrollView {
-                // The same list the sheet shows, over the same `StopTarget`. Whether
-                // these processes are asked to close first is the *client's* `force`, and
-                // the sentence underneath comes from `MCPApprovalCopy` — so a forced quit
-                // cannot show "will be asked to close" under a heading that says it will
-                // not ask at all.
+                // The same list the sheet shows, over the same `StopTarget`. What will
+                // happen to these processes is the *client's* `force`; whether a force
+                // quit is still on offer is not on offer at all here — the answer has
+                // gone back to the AI client, and the only thing a client gets for a
+                // survivor is a "still running" line.
                 StopTargetMemberList(
-                    target: target, asksBeforeQuitting: !request.force
+                    target: target,
+                    asksBeforeQuitting: !request.force,
+                    forceOfferPossible: false
                 )
             }
         } else {

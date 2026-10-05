@@ -231,31 +231,83 @@ final class MCPApprovalPresentationTests: XCTestCase {
         )
     }
 
-    /// The two sentences that sit next to each other on the window have to agree.
-    /// Before this was pinned, a `force: true` quit said "without asking it to save
-    /// first" above a list that said "processes will be asked to close" — the same
-    /// screen contradicting itself about the same processes.
+    /// The two sentences that sit next to each other on the window have to agree, and
+    /// the notice has to agree with what the window *can do* — which is a different
+    /// question from what it will do.
+    ///
+    /// Two facts, not one. A graceful stop is asked politely whether or not a force quit
+    /// is still reachable afterwards: the sheet offers one for whatever survives, and the
+    /// MCP window cannot, because its answer has already gone back to the AI client and
+    /// the only thing a client gets for a survivor is a "still running" line. Collapsing
+    /// the two into one flag made the window promise an offer it cannot deliver — and
+    /// with `force: true` left a notice saying processes "will be asked to close"
+    /// directly under a heading saying they will not be.
+    func testTheSaveYourWorkSentenceSaysWhatWillHappenAndWhatIsStillOffered() {
+        let forced = MCPApprovalCopy.saveWorkNotice(
+            asksBeforeQuitting: false, forceOfferPossible: false
+        )
+        XCTAssertTrue(forced.contains("without asking them to close"), forced)
+        XCTAssertFalse(
+            forced.contains("asked to close"), "it contradicts itself: \(forced)"
+        )
+
+        let gracefulWithOffer = MCPApprovalCopy.saveWorkNotice(
+            asksBeforeQuitting: true, forceOfferPossible: true
+        )
+        XCTAssertTrue(gracefulWithOffer.contains("asked to close"), gracefulWithOffer)
+        XCTAssertTrue(
+            gracefulWithOffer.contains("force quit is offered separately"),
+            gracefulWithOffer
+        )
+
+        let gracefulWithoutOffer = MCPApprovalCopy.saveWorkNotice(
+            asksBeforeQuitting: true, forceOfferPossible: false
+        )
+        XCTAssertTrue(
+            gracefulWithoutOffer.contains("asked to close"), gracefulWithoutOffer
+        )
+        XCTAssertFalse(
+            gracefulWithoutOffer.contains("force quit is offered"),
+            "nothing can be offered once the answer has gone back: \(gracefulWithoutOffer)"
+        )
+    }
+
+    /// The whole truth table, so no combination can drift into promising something.
+    func testNoCombinationOfTheTwoFactsPromisesAnOfferOrAPolitenessItDoesNotHave() {
+        for asksBeforeQuitting in [true, false] {
+            for forceOfferPossible in [true, false] {
+                let notice = MCPApprovalCopy.saveWorkNotice(
+                    asksBeforeQuitting: asksBeforeQuitting,
+                    forceOfferPossible: forceOfferPossible
+                )
+                XCTAssertEqual(
+                    notice.contains("asked to close"), asksBeforeQuitting, notice
+                )
+                XCTAssertEqual(
+                    notice.contains("force quit is offered"),
+                    asksBeforeQuitting && forceOfferPossible,
+                    notice
+                )
+            }
+        }
+    }
+
+    /// The heading and the notice under it describe the same processes, so a forced quit
+    /// has to be a forced quit in both.
     func testAForcedQuitDoesNotAlsoSayProcessesWillBeAskedToClose() {
         let detail = MCPApprovalCopy.detail(
             for: .quitApp,
             arguments: ["id": "app:Chrome", "force": "true"],
             targets: ["Chrome — PID 100"]
         )
-        let notice = MCPApprovalCopy.saveWorkNotice(force: true)
+        let notice = MCPApprovalCopy.saveWorkNotice(
+            asksBeforeQuitting: !MCPApprovalRequest.forcesQuit(["force": "true"]),
+            forceOfferPossible: false
+        )
         XCTAssertTrue(detail.contains("without asking it to save first"), detail)
         XCTAssertFalse(
             notice.contains("asked to close"), "the notice contradicts the sentence: \(notice)"
         )
-        XCTAssertFalse(
-            notice.contains("force quit is offered"),
-            "nothing can be offered after the answer has gone back: \(notice)"
-        )
-    }
-
-    func testAGracefulQuitStillOffersTheForceQuitAfterwards() {
-        let notice = MCPApprovalCopy.saveWorkNotice(force: false)
-        XCTAssertTrue(notice.contains("asked to close"), notice)
-        XCTAssertTrue(notice.contains("force quit is offered separately"), notice)
     }
 
     /// One reader of `force`, so the sentence and the window's own behaviour cannot be

@@ -167,20 +167,35 @@ public enum MCPApprovalCopy {
         Set(shown) != Set(resolved)
     }
 
-    /// The sentence under a stop's list, saying what is about to happen to those
-    /// processes.
+    /// The sentence under a stop's list: what will happen to those processes, and whether
+    /// a force quit is still reachable afterwards.
     ///
-    /// Its own function rather than a string in the view because it has to agree with
-    /// `detail`'s: a forced quit says "without asking it to save first", and a list
-    /// beneath it claiming "processes will be asked to close" is the same screen
-    /// contradicting itself about the same processes. Which of the two is true depends
-    /// entirely on the client's `force`, so both are asked of one place.
-    public static func saveWorkNotice(force: Bool) -> String {
-        force
-            ? "Save your work first. Portmaster will quit these processes immediately, "
-                + "without asking them to close."
-            : "Save your work first. Processes will be asked to close; force quit is "
-                + "offered separately if they keep running."
+    /// **Two facts, not one.** `asksBeforeQuitting` is what the stop will do; whether a
+    /// force quit is *still on the table* afterwards is a separate question, and it has a
+    /// different answer in each place the list is shown. The sheet offers one for whatever
+    /// survives; a window whose answer has already gone back to the AI client cannot offer
+    /// anything — the only thing a client gets for a survivor is a "still running" line —
+    /// so it must not say one is coming. Reading the second fact out of the first is how
+    /// the graceful MCP window came to promise an offer it cannot deliver.
+    ///
+    /// A function rather than a string in the view because it also has to agree with
+    /// `detail`: a forced quit says "without asking it to save first" above it, and a
+    /// notice beneath that saying processes "will be asked to close" is the same screen
+    /// contradicting itself about the same processes.
+    public static func saveWorkNotice(
+        asksBeforeQuitting: Bool, forceOfferPossible: Bool
+    ) -> String {
+        guard asksBeforeQuitting else {
+            // No offer to mention either way: nothing is asked, so there is nothing left
+            // running that an offer would apply to.
+            return "Save your work first. Portmaster will quit these processes "
+                + "immediately, without asking them to close."
+        }
+        guard forceOfferPossible else {
+            return "Save your work first. Processes will be asked to close."
+        }
+        return "Save your work first. Processes will be asked to close; force quit is "
+            + "offered separately if they keep running."
     }
 
     /// Said when the membership changed between showing the list and pressing Approve.
