@@ -33,6 +33,10 @@ targets:
         product: Sparkle
       - package: PortmasterCore
         product: PortmasterCore
+      # The app hosts the MCP server itself (App/MCPHostController.swift), so it
+      # links the module the CLI is built from rather than a second copy of it.
+      - package: PortmasterCore
+        product: PortmasterMCP
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.portmaster.app

@@ -229,6 +229,21 @@ public final class MCPHostServer: @unchecked Sendable {
     /// process quietly using a core.
     var liveReaderCount: Int { lock.withLock { liveReaders } }
 
+    /// Called with every accepted socket, synchronously, before it is served.
+    ///
+    /// **Test-only, and set before `start()`.** It exists for the one property of an
+    /// accepted descriptor that nothing outside the process can observe: whether its
+    /// writes are prevented from raising `SIGPIPE`. A missing `SO_NOSIGPIPE` has no
+    /// crash report and no log line — it terminates the app — so the only way to keep
+    /// that honest is to read the option off the descriptor the host actually
+    /// accepted. `nil` in production, so the accept path costs one optional read per
+    /// connection and nothing per sample.
+    var onSocketAccepted: (@Sendable (UnixSocket) -> Void)? {
+        get { lock.withLock { socketAcceptedObserver } }
+        set { lock.withLock { socketAcceptedObserver = newValue } }
+    }
+    private var socketAcceptedObserver: (@Sendable (UnixSocket) -> Void)?
+
     // MARK: - Accepting
 
     private func startAcceptLoop(_ listener: Int32) throws {
@@ -279,6 +294,9 @@ public final class MCPHostServer: @unchecked Sendable {
                 return
             }
             let socket = UnixSocket(accepted)
+            // Outside the lock: the observer is a test's, and a test that blocks
+            // here would block `stop()` behind it.
+            lock.withLock { socketAcceptedObserver }?(socket)
             guard lock.withLock({ running }) else {
                 socket.close()
                 return

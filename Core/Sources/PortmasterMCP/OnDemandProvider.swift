@@ -68,30 +68,40 @@ public struct OnDemandProvider: DataProvider {
 
     /// Said when no app in the reading answers to an id.
     ///
-    /// `static` and shared: a client can reach this provider or `LiveDataProvider`
-    /// for the same tool, and the two refusals must be the same sentence.
-    static func appNotFound(_ id: String) -> MCPToolError {
+    /// `static`, shared and public: a client can reach this provider, the app-hosted
+    /// one, or both for the same tool, and the refusals must be the same sentence.
+    /// Public because the app's own stop closures refuse through it — see
+    /// `App/MCPHostController.swift` — and a second copy of the wording written in the
+    /// app is exactly how one question gets two answers.
+    public static func appNotFound(_ id: String) -> MCPToolError {
         MCPToolError(message: "App not found: \(id)")
     }
 
     /// Said when an app is in the reading but none of its processes is.
     ///
-    /// `static` and shared, like `appNotFound`: an app that has stopped but is
-    /// still listed is a different fact from one that is not listed at all, and
-    /// both providers have to be able to say it.
-    static func noRunningProcessesMessage(for appName: String) -> MCPToolError {
+    /// `static`, shared and public, like `appNotFound`: an app that has stopped but
+    /// is still listed is a different fact from one that is not listed at all, and
+    /// both the on-demand provider and the app's own closures have to be able to say
+    /// it.
+    public static func noRunningProcessesMessage(for appName: String) -> MCPToolError {
         MCPToolError(message: "No running processes found for \(appName).")
     }
 
     /// Said when a project id matches no process, quoted because it is a path and
     /// a path is more use to a caller when they can see which one was missing.
-    static func noRunningProcessesMessage(forProject id: String) -> MCPToolError {
+    ///
+    /// Public and shared with the app's stop closures for the reason
+    /// `appNotFound` gives: one fact, one sentence, whichever provider answered.
+    public static func noRunningProcessesMessage(forProject id: String) -> MCPToolError {
         MCPToolError(message: "No running processes found for project '\(id)'.")
     }
 
     /// Said when an id or a name matches no container in the reading. Reported
     /// rather than passed on as a stop that was never attempted.
-    static func containerNotFound(_ id: String) -> MCPToolError {
+    ///
+    /// Public and shared, for the reason `appNotFound` gives — and used by
+    /// `DockerContainerStop`, which both providers stop containers through.
+    public static func containerNotFound(_ id: String) -> MCPToolError {
         MCPToolError(message: "Container not found: \(id)")
     }
 
@@ -100,7 +110,11 @@ public struct OnDemandProvider: DataProvider {
     ///
     /// Three refusals rather than one because three different things are wrong,
     /// and only the first two are facts about the machine the sample observed.
-    static func dockerUnavailableMessage(
+    ///
+    /// Public because `DockerContainerStop` — which both providers stop containers
+    /// through — refuses with it, and the app's own container closure is that
+    /// function's caller.
+    public static func dockerUnavailableMessage(
         _ availability: DockerAvailability, container id: String
     ) -> MCPToolError? {
         switch availability {
@@ -539,64 +553,21 @@ public struct OnDemandProvider: DataProvider {
 
     /// Stops a container through the docker CLI.
     ///
-    /// Not through the process list: a snapshot has no container-to-pid
-    /// attribution, and matching a container to a same-named process would be a
-    /// guess about something the caller then acts on. So this runs the one
-    /// command that stops a container — `docker stop -- <id>`, fixed argv, the id
-    /// as exactly one element and after `--` so an id that starts with `-` cannot
-    /// be read as a flag. No shell is involved, so shell metacharacters in an id
-    /// are characters, not commands.
-    ///
-    /// The outcome is docker's own: exit 0 is a stop, a non-zero exit is reported
-    /// with what docker said. An id that is not in the snapshot is reported as not
-    /// found rather than passed on as a stop that was never attempted.
+    /// The reading is this provider's; the stop itself is `DockerContainerStop`,
+    /// which the app-hosted path runs too — see there for why there is one copy of
+    /// the command rather than two. Only the "nothing is known yet" refusal is this
+    /// provider's, because only it is the one that collected the reading.
     public func stopContainer(id: String) async throws -> StopReport {
         let snapshot = try await snapshot(forceRefresh: true)
         guard let docker = snapshot.docker else {
             throw MCPToolError(message: Self.dockerNotKnownMessage)
         }
-        // Availability first: with the daemon down or docker absent there is no
-        // container list to match against, and no stop to attempt.
-        if let refusal = Self.dockerUnavailableMessage(docker.availability, container: id) {
-            throw refusal
-        }
-        guard docker.containers.contains(where: { $0.id == id || $0.name == id }) else {
-            throw Self.containerNotFound(id)
-        }
-        guard let executable = dockerExecutable() else {
-            // The sample said docker was there; it is not now.
-            throw Self.dockerCommandUnavailableMessage(container: id)
-        }
-
-        let outcome: CommandOutcome
-        do {
-            outcome = try await processRunner.run(
-                executable: executable,
-                arguments: ["stop", "--", id],
-                timeout: Self.dockerStopTimeout
-            )
-        } catch {
-            throw MCPToolError.wrapping(error, subsystem: "docker")
-        }
-        // Formatted through `StopReport` so a container stop and a pid stop read
-        // the same way in the payload.
-        let status: StopCoordinator.Outcome.Status = outcome.exitCode == 0
-            ? .stopped
-            : .failed(message: Self.dockerFailureMessage(outcome))
-        return StopReport(results: [id: StopReport.value(for: status)])
-    }
-
-    /// Docker's own explanation, first line, or the exit status when docker said
-    /// nothing. Never replaced with a guess about what went wrong.
-    private static func dockerFailureMessage(_ outcome: CommandOutcome) -> String {
-        let firstLine = outcome.standardError
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .first
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let firstLine, !firstLine.isEmpty else {
-            return "docker exited with status \(outcome.exitCode) and said nothing."
-        }
-        return firstLine
+        return try await DockerContainerStop.stop(
+            container: id,
+            in: docker,
+            runner: processRunner,
+            executable: dockerExecutable
+        )
     }
 
     /// Signals the confirmed targets and reports each pid's outcome.

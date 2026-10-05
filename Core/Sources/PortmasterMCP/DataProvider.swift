@@ -136,6 +136,17 @@ public struct MCPToolError: Error, Equatable, Sendable {
         self.message = message
     }
 
+    /// What an app-hosted provider throws when its sampler has published nothing.
+    ///
+    /// `LiveDataProvider` passes whatever its `snapshot` closure throws straight
+    /// through, so the app's own closure owns the wording of the one refusal every
+    /// caller eventually meets — and a second copy of that sentence is how a client
+    /// reads two different explanations for the same fact, one per provider it can
+    /// reach. It is a constant here so the app cannot write it out: the value *is*
+    /// the on-demand path's `notReadyMessage`, by construction rather than by
+    /// agreement, and `MCPHostWiringTests` pins it against both.
+    public static let samplerNotReady = MCPToolError(message: OnDemandProvider.notReadyMessage)
+
     /// A failure whose message is safe to show the caller verbatim, naming the
     /// subsystem it came from.
     ///

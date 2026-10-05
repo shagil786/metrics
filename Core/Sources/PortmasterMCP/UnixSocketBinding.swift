@@ -109,30 +109,25 @@ enum UnixSocketBinding {
     /// The client's half of the binding, and `nil` rather than a throw because "there
     /// is no app here" is an answer a caller acts on, not a failure to recover from.
     ///
-    /// `SO_NOSIGPIPE` is set on the way out, and it is not optional polish. A write to a
-    /// socket whose peer has gone raises `SIGPIPE`, whose default action terminates the
-    /// process — so without this, a CLI whose Portmaster quit between two tool calls
-    /// would die mid-conversation instead of returning the tool error, which is the one
-    /// thing slice 2 promises cannot happen.
+    /// **Both ends of an `AF_UNIX` pair get `SO_NOSIGPIPE`, and they get it from
+    /// `UnixSocket.init` rather than from here.** A write to a socket whose peer has
+    /// gone raises `SIGPIPE`, whose default action terminates the process. For this
+    /// side that means a CLI whose Portmaster quit between two tool calls would die
+    /// mid-conversation instead of returning the tool error, which is the one thing
+    /// slice 2 promises cannot happen. For the host's side the same write kills the
+    /// *app*: a client that disappears while the app is answering takes Portmaster
+    /// down with it.
     ///
-    /// **Client side only, and the host is not covered by this.** `MCPHostServer`
-    /// accepts descriptors from its own listener, so this function — and this
-    /// `setsockopt` — are never on that path: a client that disappears while the app is
-    /// writing a reply leaves the app's `write` to raise `SIGPIPE` and terminate it.
-    /// That is a pre-existing gap on the host side rather than something this task
-    /// changed, and it is carried to the host's own work with the same reasoning:
-    /// `SO_NOSIGPIPE` belongs on **both** ends of an `AF_UNIX` pair, and a socket type
-    /// is the only place both ends are in reach of the same helper.
+    /// The host's descriptors never come through this function — `MCPHostServer`
+    /// accepts them from its own listener — so a `setsockopt` here could never have
+    /// covered them. That gap was open until `UnixSocket` took the option over, and
+    /// it is why the option lives in the socket type rather than at either call site:
+    /// one type is the only place from which both ends are reachable.
     static func connect(path: String) -> UnixSocket? {
         guard var address = try? socketAddress(path: path) else { return nil }
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return nil }
 
-        var enabled: Int32 = 1
-        setsockopt(
-            descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
-            socklen_t(MemoryLayout.size(ofValue: enabled))
-        )
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
@@ -143,7 +138,8 @@ enum UnixSocketBinding {
             return nil
         }
         // Ownership moves to the socket, whose `close` is idempotent — so every failure
-        // path above can close freely and this one must not.
+        // path above can close freely and this one must not. Its `init` is also where
+        // `SO_NOSIGPIPE` is set, which is why nothing above configures the descriptor.
         return UnixSocket(descriptor)
     }
 

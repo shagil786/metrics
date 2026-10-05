@@ -49,6 +49,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var welcomeWindow: NSWindow?
     @MainActor let updates = UpdateController()
+    /// The app as an MCP host. Owned here because this delegate owns the app's other
+    /// long-lived machinery (status item, shortcuts, extra windows) and the host has
+    /// to start and stop with the process rather than with a surface.
+    @MainActor let mcpHost = MCPHostController()
+    /// Set while a quit is waiting for the host to release its socket.
+    @MainActor private var mcpShutdown: Task<Void, Never>?
     @MainActor private(set) var statusItems: StatusItemController?
     @MainActor private(set) var shortcuts: GlobalShortcuts?
 
@@ -57,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItems = StatusItemController(model: AppModel.shared)
         shortcuts = GlobalShortcuts(model: AppModel.shared)
         PortmasterShortcuts.updateAppShortcutParameters()
+        // Once per launch, not per surface: the host is a socket, not a window.
+        mcpHost.start()
         // User activity unpauses sampling after the idle pause.
         let center = NSWorkspace.shared.notificationCenter
         activityCancellable = center.addObserver(
@@ -86,9 +94,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppModel.shared.audioControls.stopAll()
     }
 
+    /// Quitting waits for the MCP host to let go of its socket.
+    ///
+    /// `applicationWillTerminate` cannot `await`, and `MCPHostServer.stop` has to:
+    /// it closes every admitted connection, waits for the accept thread, and only
+    /// then unlinks the socket and the endpoint file. Stopping it in a task that the
+    /// app does not wait for would leave a socket file behind on every ordinary quit
+    /// — which `EndpointFileStore.read` rejects as stale anyway, so nothing would be
+    /// broken, only untidy. Terminating later and replying when the host is down is
+    /// the AppKit-blessed way to finish the job before the process goes away, and the
+    /// wait is bounded by `MCPHostServer`'s own shutdown deadline.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard mcpShutdown == nil else { return .terminateLater }
+        mcpShutdown = Task { @MainActor [weak self] in
+            await self?.mcpHost.stop()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     /// Native hosting keeps Settings reachable from all accessory-app surfaces.
     @MainActor @objc func openSettingsWindow() {
         statusItems?.close()
+        // Re-read the MCP policy for the settings rows: a client can change it
+        // through `set_preference`, which writes the file without reaching the
+        // controller, and the row showing "Off" after the user granted a session
+        // would be a stale lie.
+        mcpHost.refreshFromSettings()
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 620), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
             window.title = "Settings"; window.isReleasedWhenClosed = false

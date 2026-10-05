@@ -445,21 +445,15 @@ public struct ToolExecutor: Sendable {
         // check and is then looked up untrimmed would make the audit line
         // disagree with what was actually acted on. Absent and blank are the
         // same failure to a caller, so both report a missing argument.
-        var normalized = arguments
-        for argument in tool.arguments {
-            guard let value = normalized[argument.name] else {
-                if argument.required {
-                    return ToolOutcome(
-                        text: "Missing argument: \(argument.name)", isError: true
-                    )
-                }
-                continue
-            }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty || !argument.required else {
-                return ToolOutcome(text: "Missing argument: \(argument.name)", isError: true)
-            }
-            normalized[argument.name] = trimmed
+        //
+        // Also not private: `HostMCPCallContext` normalizes before it puts a
+        // mutation to a person and before it records a refused attempt, and it must
+        // be the same normalization — an approval question quoting `" celsius "`
+        // and an audit line recording `celsius` would be two answers about one
+        // request.
+        let normalized = Self.normalizing(arguments, for: tool)
+        if let missing = Self.firstMissingRequiredArgument(in: normalized, for: tool) {
+            return ToolOutcome(text: "Missing argument: \(missing)", isError: true)
         }
 
         let isMutation = tool.effect == .mutation
@@ -647,6 +641,38 @@ public struct ToolExecutor: Sendable {
     }
 
     // MARK: Argument parsing
+
+    /// `arguments` with every declared value trimmed.
+    ///
+    /// Absent and blank are the same failure to a caller, so both report a missing
+    /// argument — but only for a *required* one, since an absent optional is not a
+    /// failure at all and must stay absent rather than become `""`.
+    static func normalizing(
+        _ arguments: [String: String], for tool: ToolDefinition
+    ) -> [String: String] {
+        var normalized = arguments
+        for argument in tool.arguments {
+            guard let value = normalized[argument.name] else { continue }
+            normalized[argument.name] = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return normalized
+    }
+
+    /// The first required argument `arguments` is missing or has left blank, or
+    /// `nil` when every required one is there.
+    ///
+    /// Checked after `normalizing` so a blank value is recognised as blank rather
+    /// than as a string of whitespace the tool would go on to parse.
+    static func firstMissingRequiredArgument(
+        in arguments: [String: String], for tool: ToolDefinition
+    ) -> String? {
+        for argument in tool.arguments where argument.required {
+            guard let value = arguments[argument.name], !value.isEmpty else {
+                return argument.name
+            }
+        }
+        return nil
+    }
 
     private static func id(_ arguments: [String: String]) -> String {
         arguments["id"] ?? ""

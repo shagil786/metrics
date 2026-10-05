@@ -15,7 +15,16 @@ import PortmasterCore
 /// lock serializes the read-modify-write. That lock is not incidental: two MCP
 /// calls setting two different preferences concurrently would otherwise each
 /// read the same blob and the second write would erase the first one's field.
-final class PreferencesStore: @unchecked Sendable {
+///
+/// **The type is public and only `apply` and `validate` are public methods**, because
+/// the app writes its preferences through its own `AppModel.prefs` rather than through
+/// this store: it holds the decoded blob in memory and saves it on every change, so a
+/// write behind its back would be overwritten by the next thing the user does. What
+/// the app needs from here is the *mapping* — which value means which field, and the
+/// refusals for values that mean nothing — and that must be the same mapping the
+/// on-demand path validates against. A second switch in the app is how one key gets
+/// accepted by one provider and refused by the other.
+public final class PreferencesStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let lock = NSLock()
 
@@ -78,7 +87,7 @@ final class PreferencesStore: @unchecked Sendable {
     /// would be free to drift from `apply`, which is exactly what this file's
     /// refusals exist to prevent. The refusals below are `apply`'s own, so there is
     /// one answer to "can this be applied" in the module.
-    static func validate(key: String, value: String) throws {
+    public static func validate(key: String, value: String) throws {
         var scratch = AppPreferences()
         try apply(key: key, value: value, to: &scratch)
     }
@@ -92,7 +101,7 @@ final class PreferencesStore: @unchecked Sendable {
     /// rejected. Anything looser would be guessing at the caller's intent;
     /// anything stricter would make a client that echoes a label back fail for
     /// no reason a user can see.
-    static func apply(key: String, value: String, to preferences: inout AppPreferences) throws {
+    public static func apply(key: String, value: String, to preferences: inout AppPreferences) throws {
         func invalid() -> MCPToolError {
             MCPToolError(message: "Invalid value '\(value)' for '\(key)'.")
         }

@@ -6,7 +6,13 @@ let package = Package(
     name: "PortmasterCore",
     platforms: [.macOS(.v14)],
     products: [
-        .library(name: "PortmasterCore", targets: ["PortmasterCore"])
+        .library(name: "PortmasterCore", targets: ["PortmasterCore"]),
+        // Exported so the app can *be* the MCP host rather than only shipping the
+        // CLI: `MCPHostServer`, the tool surface and the approval broker are all
+        // here, and `App/MCPHostController.swift` is the app's side of them. Until
+        // slice 2's app wiring this was reachable only by the executable and its
+        // tests, which is why it needed no product.
+        .library(name: "PortmasterMCP", targets: ["PortmasterMCP"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.12.1"),

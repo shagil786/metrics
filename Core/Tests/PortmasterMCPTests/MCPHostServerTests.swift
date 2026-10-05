@@ -492,6 +492,35 @@ final class MCPHostServerTests: XCTestCase {
         )
     }
 
+    /// A write to a socket whose peer has gone raises `SIGPIPE`, whose default
+    /// action terminates the process. On the client side that kills a CLI and is
+    /// reported as a tool error; on this side it kills Portmaster — a client that
+    /// disconnected between the host reading a request and writing the reply
+    /// would take the whole app down with it, mid-sample, with nothing in the log.
+    ///
+    /// Asserted at the bits, on the descriptor the host actually accepted, because
+    /// no other symptom exists: the missing option produces no crash report, no
+    /// failed assertion and no wrong answer — only a process that is gone.
+    func testAnAcceptedSocketCannotRaiseSIGPIPE() async throws {
+        let harness = try MCPHostHarness.make(self)
+        try harness.start()
+        let observations = SIGPIPEObservations()
+        harness.host.onSocketAccepted = { socket in
+            observations.record(socket.suppressesSIGPIPE)
+        }
+
+        let client = try harness.connectRawSocket()
+        addTeardownBlock { close(client) }
+
+        try await Self.eventually(timeout: 5) { observations.count > 0 }
+        XCTAssertEqual(observations.count, 1, "one connection, one accepted socket")
+        XCTAssertTrue(
+            observations.allSuppressed,
+            "SO_NOSIGPIPE must be set on an accepted socket, or a client that hangs up "
+            + "mid-reply terminates the app"
+        )
+    }
+
     // MARK: - Helpers
 
     /// What a rejected connection must produce: nothing at all, and then an end of
@@ -845,4 +874,20 @@ private final class SocketOutcome: @unchecked Sendable {
     private var settledSend = false
 
     func settleSend() { lock.withLock { settledSend = true } }
+}
+
+/// What the host saw of `SO_NOSIGPIPE` on the descriptors it accepted.
+///
+/// Handed to the host's test-only observer, which is called from the accept
+/// thread, so the results come back across a lock rather than through a
+/// variable the test thread would have to hope was written yet.
+private final class SIGPIPEObservations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Bool] = []
+
+    func record(_ suppressed: Bool) { lock.withLock { results.append(suppressed) } }
+
+    var count: Int { lock.withLock { results.count } }
+
+    var allSuppressed: Bool { lock.withLock { !results.isEmpty && results.allSatisfy { $0 } } }
 }
