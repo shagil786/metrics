@@ -404,6 +404,40 @@ final class ConfirmationBrokerTests: XCTestCase {
 
     // MARK: - What a presenter can count down to
 
+    /// A window that closes with two requests behind it has to answer exactly those two,
+    /// and `queuedCount` cannot say which two they are — `pending` holds at most the one
+    /// being presented. So the ids of the whole queue have to be readable, in order: a
+    /// close that swept "whatever is queued" would also sweep a request that arrived in
+    /// the gap between the snapshot and the answer.
+    func testQueuedIDsNamesEveryWaitingRequestInOrder() async throws {
+        let broker = ConfirmationBroker(timeout: 5)
+        let empty = await broker.queuedIDs
+        XCTAssertEqual(empty, [], "nothing is waiting")
+
+        let first = makeRequest(summary: "Quit Mail?")
+        let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
+        let (firstBox, _) = start(broker, first)
+        let (secondBox, _) = start(broker, second)
+        await waitForQueued(broker, 2)
+
+        let queued = await broker.queuedIDs
+        XCTAssertEqual(queued, [first.id, second.id], "oldest first, and every one of them")
+
+        await broker.decide(id: second.id, outcome: .approved)
+        let secondOutcome = try await waitForOutcome(secondBox)
+        XCTAssertEqual(secondOutcome, .approved)
+        let afterDecidingOne = await broker.queuedIDs
+        XCTAssertEqual(
+            afterDecidingOne, [first.id],
+            "answering one must not lose track of the other"
+        )
+
+        await broker.decide(id: first.id, outcome: .denied(reason: "no"))
+        _ = try await waitForOutcome(firstBox)
+        let drained = await broker.queuedIDs
+        XCTAssertEqual(drained, [], "an answered request leaves the queue")
+    }
+
     /// A presenter shows the remaining budget, and the only honest source for that is
     /// the deadline the budget task was armed with. A presenter that counted from its
     /// own arrival would be measuring a different clock: the budget starts when the

@@ -105,7 +105,9 @@ public enum MCPApprovalCopy {
         switch kind {
         case .quitApp:
             let id = named(arguments["id"], fallback: "an app the client did not name")
-            let forced = (arguments["force"] ?? "").lowercased() == "true"
+            // The same reader `MCPApprovalRequest.force` uses, so the sentence and the
+            // window's behaviour cannot be built from two ideas of what was asked.
+            let forced = MCPApprovalRequest.forcesQuit(arguments)
             return forced
                 ? "Quit every process of \(id) without asking it to save first."
                 : "Quit every process of \(id), asking each to close cleanly first."
@@ -144,6 +146,41 @@ public enum MCPApprovalCopy {
             !trimmed.isEmpty
         else { return fallback }
         return trimmed
+    }
+
+    /// Whether an approval given to `shown` covers the membership `resolved` describes.
+    ///
+    /// The question the window has to ask itself when Approve is pressed, and the reason
+    /// it cannot simply compare against whatever is on screen: the window re-resolves the
+    /// list as it ticks, so its live copy is already a second old. What has to be
+    /// compared is the list that was **shown** — frozen when the person first saw it —
+    /// against the one the executor will act on, because that is the pair the shared
+    /// sentence ("only the processes listed above will be stopped") is about.
+    ///
+    /// A *smaller* list re-asks as well as a larger one. What is stopped must be what
+    /// was approved, and a helper that exited on its own has not turned an approval of
+    /// three processes into an approval of two.
+    ///
+    /// Order-insensitive: order is `ConfirmedStopPlan`'s to choose, and the same pids in
+    /// a different order are the same membership.
+    public static func needsReconfirmation(shown: [Int32], resolved: [Int32]) -> Bool {
+        Set(shown) != Set(resolved)
+    }
+
+    /// The sentence under a stop's list, saying what is about to happen to those
+    /// processes.
+    ///
+    /// Its own function rather than a string in the view because it has to agree with
+    /// `detail`'s: a forced quit says "without asking it to save first", and a list
+    /// beneath it claiming "processes will be asked to close" is the same screen
+    /// contradicting itself about the same processes. Which of the two is true depends
+    /// entirely on the client's `force`, so both are asked of one place.
+    public static func saveWorkNotice(force: Bool) -> String {
+        force
+            ? "Save your work first. Portmaster will quit these processes immediately, "
+                + "without asking them to close."
+            : "Save your work first. Processes will be asked to close; force quit is "
+                + "offered separately if they keep running."
     }
 
     /// Said when the membership changed between showing the list and pressing Approve.
@@ -207,6 +244,17 @@ public enum MCPApprovalCopy {
     /// that Portmaster is reporting rather than passing on. Neither is consent.
     public static let closedReason =
         "Portmaster's confirmation window was closed without an answer, so this action was not taken."
+
+    /// Said to the requests that were still queued when the window was closed, and which
+    /// no person ever saw.
+    ///
+    /// Its own sentence rather than `closedReason`'s, because that one describes a request
+    /// that was on screen and dismissed — "closed without an answer" is not what happened
+    /// to the two behind it, and an AI client told it was shown a prompt nobody saw is
+    /// being told something untrue.
+    public static let dismissedUnseenReason =
+        "Portmaster's confirmation window was closed before these requests were shown, "
+        + "so they were not taken."
 
     /// Said when no window could be shown at all.
     ///

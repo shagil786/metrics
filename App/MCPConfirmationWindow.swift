@@ -30,8 +30,11 @@
 //     twice — the second attempt finding processes already gone and reporting a failure
 //     for a stop that had worked.
 //  4. **The list cannot change under an approval.** That fresh recomputation is also why
-//     the membership is re-resolved when Approve is pressed: if it moved, the person is
-//     shown the new list and asked again rather than having their "yes" stretched over
+//     the membership is re-resolved when Approve is pressed and compared against the
+//     *frozen* list the person was shown (`state.shownTarget`) rather than against the
+//     live one: the window re-resolves as it ticks, so its own copy is already a second
+//     old by the time the button is pressed. If the fresh membership differs, the person
+//     is shown the new list and asked again rather than having their "yes" stretched over
 //     processes they never saw. The window's copy claims this, so it has to be true.
 //  5. **Deny is the default.** Closing the window — the button, the red dot, a quit —
 //     answers the request with a reason instead of leaving it to time out, and the
@@ -100,20 +103,28 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
         return true
     }
 
-    /// Puts the window on screen, if it is not already there.
+    /// Brings the window forward for a request that is newly on screen.
     ///
     /// Called from `reconcile` rather than only from `present`, because the window can be
     /// closed while a request is still waiting — the person closes it, which answers that
     /// request but not the next one, and the next one's `present` has already been called
     /// by the time it is queued behind the first. Raising here rather than at the call
     /// site is what keeps that from leaving a request waiting behind a closed window.
+    ///
+    /// **Forward even when the window is already visible.** A visible window that is not
+    /// key is behind something else — the person switched away, or another app took
+    /// focus — and a prompt they cannot see is one they cannot answer, while the request
+    /// spends the client's budget waiting. `isKeyWindow` is false for every window of an
+    /// inactive app, which is exactly the case worth raising for.
+    ///
+    /// **Only when a different request is adopted**, never on every tick: a person reading
+    /// the list must not have the app activated out from under them once a second.
     private func raise() {
-        guard let window, !window.isVisible else { return }
+        guard let window, !window.isVisible || !window.isKeyWindow else { return }
         window.makeKeyAndOrderFront(nil)
         // Accessory-app ordering rule, the same one `openMainWindow` documents: the app
         // is never active, so ordering front alone can leave the window under whatever
-        // the user was using. Raised only when hidden, so a burst of queued requests
-        // activates the app once rather than once each.
+        // the user was using.
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -125,6 +136,10 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
     /// asking about a request that is already refused would be a lie.
     func dismiss() {
         state.request = nil
+        // Cleared with it, so the close this triggers has nothing to answer. The queue was
+        // already emptied by the caller before it asked for this; leaving the ids behind
+        // would make the close path re-decide a queue that no longer exists.
+        state.queuedIDs = []
         stopTicking()
         close()
     }
@@ -174,11 +189,17 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
             let head = await broker.pending.first
             let queued = await broker.queuedCount
             let deadline = await broker.pendingDeadline
+            // The whole queue's ids, not just its size, because closing the window has to
+            // answer the requests it told the person were waiting — and only those. Read
+            // here rather than at close time, where a request that arrived in between
+            // would be swept along with them.
+            let queuedIDs = await broker.queuedIDs
 
             state.remaining = deadline.map { $0.timeIntervalSinceNow } ?? 0
             // `queuedCount` includes the request on screen, which the window is already
             // showing; what a person needs to know is how many are behind it.
             state.queued = max(0, queued - 1)
+            state.queuedIDs = queuedIDs
 
             guard let head, refusalsLeft > 0 else {
                 stopTicking()
@@ -197,10 +218,18 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
             case .shown(let resolved):
                 let changed = state.request?.id != head.id
                 state.request = head
+                // Display follows the reading: the list on screen is the current truth.
                 state.stopTarget = resolved.stopTarget
                 state.targets = resolved.targets
-                if changed { state.note = nil }
-                raise()
+                if changed {
+                    state.note = nil
+                    // The approval baseline is frozen here and *only* here. Refreshing it
+                    // on later ticks would compare an approval against a list that had
+                    // already moved — which is the exact hole
+                    // `MCPApprovalCopy.needsReconfirmation` exists to close.
+                    state.shownTarget = resolved.stopTarget
+                    raise()
+                }
                 return
             }
         }
@@ -236,12 +265,28 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
             Task { await decideNow(request.id, .denied(reason: reason)) }
             return
         case .shown(let resolved):
-            // Compared by pid, in order: identity is rechecked by the coordinator
-            // anyway, so what matters is *which* processes, not their start times.
-            if let before = state.stopTarget, let after = resolved.stopTarget,
-                before.members.map({ $0.pid }) != after.members.map({ $0.pid }) {
-                state.stopTarget = resolved.stopTarget
+            // Against the **frozen shown list**, not `state.stopTarget`: that one is
+            // refreshed on every tick, so by the time this button is pressed it already
+            // includes anything that appeared since — and an approval given to the list on
+            // screen would then cover a process nobody saw. What is compared is what the
+            // person was shown, against what the executor will act on.
+            //
+            // A nil baseline means there is nothing to have drifted from, so it cannot
+            // re-ask; that is unreachable for a stop (an unresolvable one is refused, not
+            // shown) and harmless where it is.
+            let shown = state.shownTarget ?? resolved.stopTarget
+            if let shown, let after = resolved.stopTarget,
+                MCPApprovalCopy.needsReconfirmation(
+                    shown: shown.members.map { $0.pid },
+                    resolved: after.members.map { $0.pid }
+                ) {
+                state.stopTarget = after
                 state.targets = resolved.targets
+                // The new list is now the one being approved: the person is being shown it
+                // and asked about *it*, so it becomes the baseline. Left frozen at the
+                // original instead, an app that gains a process every few seconds could
+                // never be approved at all — bounded only by the 60-second budget.
+                state.shownTarget = after
                 state.note = MCPApprovalCopy.listChangedNotice
                 return
             }
@@ -272,30 +317,39 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
 
     /// Closing the window is a refusal, because nobody answered.
     ///
-    /// The request on screen is refused with its own reason, and anything still queued
-    /// behind it is refused with the same words rather than left to time out. That second
-    /// half is deliberate: nothing will raise this window again for a request that was
-    /// already waiting when the person dismissed it, so a burst of three would otherwise
-    /// leave two callers hanging for 60 seconds each and the person never asked. A
-    /// request that arrives *after* this is a new arrival, and its own `present` raises a
-    /// window for it.
+    /// The request on screen is refused with `closedReason` — shown, then dismissed.
+    /// Anything the window had *told the person* was waiting behind it is refused with
+    /// `dismissedUnseenReason`, because nothing will raise this window again for a
+    /// request that was already queued when the person dismissed it, and leaving two
+    /// callers to time out for 60 seconds each would be a worse answer than an honest one.
     ///
-    /// Only ever reached with something on screen: `decideNow` clears the request first,
-    /// so the close this controller performs after a decision has nothing left to refuse
-    /// and the answer that already went to the broker stands.
+    /// **Answered by id, from the snapshot the window was displaying**, not by
+    /// `cancelAll`. `pending` holds at most one request, so the count could not say which
+    /// they were; and a blanket sweep read at close time would also catch a request that
+    /// arrived in the gap — mid-warm, on its way to raising a window of its own — and
+    /// refuse it as if a person had looked at it and said no.
+    ///
+    /// Only reached with something on screen: `decideNow` clears the request first, so the
+    /// close this controller performs after a decision has nothing left to refuse, and the
+    /// answer that already went to the broker stands.
     func windowWillClose(_ notification: Notification) {
         stopTicking()
-        guard let broker else { return }
         let dismissed = state.request?.id
+        let queued = state.queuedIDs
         state.request = nil
         state.note = nil
+        guard let broker else { return }
         Task {
             if let dismissed {
                 await broker.decide(
                     id: dismissed, outcome: MCPApprovalCopy.outcome(for: .closed)
                 )
             }
-            await broker.cancelAll(reason: MCPApprovalCopy.closedReason)
+            for id in queued where id != dismissed {
+                await broker.decide(
+                    id: id, outcome: .denied(reason: MCPApprovalCopy.dismissedUnseenReason)
+                )
+            }
         }
     }
 
@@ -395,14 +449,25 @@ final class MCPApprovalState: ObservableObject {
     /// The request on screen, or `nil` when there is nothing to decide — which is also
     /// what stops a close from answering a request that has already been answered.
     @Published fileprivate(set) var request: MCPApprovalRequest?
-    /// Set for a quit or a project; `nil` for a container or a preference.
+    /// The membership as the current reading describes it — what is on screen, and it
+    /// moves: a process that appears appears here on the next tick.
     @Published fileprivate(set) var stopTarget: AppModel.StopTarget?
+    /// The membership frozen when this request was put on screen, which is what an
+    /// approval of it covers. Written on adoption and on a re-ask, never by the tick that
+    /// refreshes `stopTarget`.
+    @Published fileprivate(set) var shownTarget: AppModel.StopTarget?
     /// One line per affected thing for the kinds with no process list.
     @Published fileprivate(set) var targets: [String] = []
     /// Seconds left of the client's budget, as the broker computed it.
     @Published fileprivate(set) var remaining: TimeInterval = 0
     /// How many requests are waiting behind this one.
     @Published fileprivate(set) var queued: Int = 0
+    /// Those requests by id, as of the last read of the broker.
+    ///
+    /// Not published — the view shows the count, and publishing an array nobody draws
+    /// would re-render the window for nothing. Kept because closing the window has to
+    /// answer *these* requests and not whatever is queued by the time the answer lands.
+    fileprivate var queuedIDs: [UUID] = []
     /// Why the person is being asked again, when they are.
     @Published fileprivate(set) var note: String?
 }
@@ -457,10 +522,14 @@ private struct MCPConfirmationView: View {
                 for: request.kind, arguments: request.arguments, targets: []
             )).fixedSize(horizontal: false, vertical: true)
             ScrollView {
-                // The same list the sheet shows, over the same `StopTarget`, with the
-                // force-quit sentence left out because nothing can be offered after an
-                // answer has already gone back to the AI client.
-                StopTargetMemberList(target: target, offersForceAfterwards: false)
+                // The same list the sheet shows, over the same `StopTarget`. Whether
+                // these processes are asked to close first is the *client's* `force`, and
+                // the sentence underneath comes from `MCPApprovalCopy` — so a forced quit
+                // cannot show "will be asked to close" under a heading that says it will
+                // not ask at all.
+                StopTargetMemberList(
+                    target: target, asksBeforeQuitting: !request.force
+                )
             }
         } else {
             ScrollView {

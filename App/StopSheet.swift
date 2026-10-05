@@ -1,5 +1,6 @@
 import SwiftUI
 import PortmasterCore
+import PortmasterMCP
 
 struct StopSheet: View {
     @EnvironmentObject private var model: AppModel
@@ -73,14 +74,14 @@ struct StopSheet: View {
 /// ports and the promises about identity are the substance of the confirmation, and a
 /// second rendering of them is a second promise about what will be stopped.
 ///
-/// - Parameter offersForceAfterwards: whether a force quit can still be offered once
-///   this stop finishes. True for the sheet, which offers one for whatever is left.
-///   False for the MCP window, where the answer has already gone back to the AI client
-///   and there is nothing left to offer — and a window that promised a force quit it
-///   cannot deliver would be the one untrue sentence in this view.
+/// - Parameter asksBeforeQuitting: whether these processes are asked to close before
+///   they are quit. True for the sheet and for a graceful stop. False for the MCP
+///   window's forced quit, where the client's `force` means they are not — and where
+///   saying otherwise would put "processes will be asked to close" directly under a
+///   heading that says "without asking it to save first".
 struct StopTargetMemberList: View {
     let target: AppModel.StopTarget
-    var offersForceAfterwards = true
+    var asksBeforeQuitting = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -99,9 +100,9 @@ struct StopTargetMemberList: View {
             if let project = target.project { Text("Project: \(project)").font(.caption).textSelection(.enabled) }
             Text("Only the processes listed above will be stopped. Portmaster checks their identity again; any new processes require a new confirmation.")
                 .font(.caption).foregroundStyle(.secondary)
-            Text(offersForceAfterwards
-                 ? "Save your work first. Processes will be asked to close; force quit is offered separately if they keep running."
-                 : "Save your work first. Processes will be asked to close before they are quit.")
+            // The sentence is `MCPApprovalCopy`'s so it cannot disagree with the one
+            // above it about the same processes.
+            Text(MCPApprovalCopy.saveWorkNotice(force: !asksBeforeQuitting))
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(10).cardBackground(cornerRadius: 8)
     }

@@ -78,7 +78,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let confirmation = MCPConfirmationWindow()
         mcpConfirmationWindow = confirmation
         mcpHost.confirmationWindow = confirmation
-        //
         // Weak, and the only thing a nil delegate can cost is a request that waits out
         // its budget: `Self.shared` is set at launch and never cleared, so a nil here
         // means the app is already on its way out — and `MCPHostController.stop` has

@@ -6,7 +6,10 @@ import Foundation
 /// in plain language, because the whole point of the gate is that the person
 /// approving it can tell what they are approving.
 public struct MCPApprovalRequest: Identifiable, Sendable {
-    public enum Kind: String, Sendable {
+    /// `CaseIterable` so a test can walk every kind without keeping its own list: a
+    /// fifth kind added here, with no fifth tool to match it, would otherwise slip
+    /// through assertions written against a mirror somebody remembered to update.
+    public enum Kind: String, CaseIterable, Sendable {
         case quitApp
         case stopContainer
         case stopProject
@@ -41,6 +44,21 @@ public struct MCPApprovalRequest: Identifiable, Sendable {
         self.detail = detail
         self.arguments = arguments
     }
+
+    /// Whether these arguments ask for a quit that does not ask the processes to close
+    /// first.
+    ///
+    /// `static` as well as instance so the copy that *says* it and the window that
+    /// *behaves* as if it are one reader of one argument: two parsers of `force` would
+    /// put "without asking it to save first" above a list of processes the window is
+    /// about to ask politely.
+    public static func forcesQuit(_ arguments: [String: String]) -> Bool {
+        (arguments["force"] ?? "").lowercased() == "true"
+    }
+
+    /// Whether this request quits without asking first. Read from `arguments`, which is
+    /// where the client's `force` arrives — a sentence cannot be asked this question.
+    public var force: Bool { Self.forcesQuit(arguments) }
 }
 
 /// What a confirmed request resolved to. Every request resolves to exactly one of
@@ -168,6 +186,16 @@ public actor ConfirmationBroker {
     /// from the presenter's own arrival would overstate it, because the budget starts
     /// when the request is *made* and the window's own opening time is inside it.
     public var pendingDeadline: Date? { queue.first?.deadline }
+
+    /// The ids of every request waiting an answer, oldest first.
+    ///
+    /// `pending` cannot be this: it holds at most the request being presented, so a
+    /// presenter that has to answer *what is queued* — a window closing with two
+    /// requests behind it — has nothing to name them by. Read this at the moment of the
+    /// decision rather than from whatever is queued afterwards: a request that arrives
+    /// in the gap belongs to the next window, and answering it as if it had been
+    /// dismissed is the one thing a close must not do.
+    public var queuedIDs: [UUID] { queue.map(\.request.id) }
 
     /// Suspends until this request is decided, denied in bulk, or times out. Every
     /// accepted request returns an outcome, so nothing about this call can fail —

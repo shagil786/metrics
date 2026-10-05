@@ -41,9 +41,7 @@ final class MCPApprovalPresentationTests: XCTestCase {
             MCPApprovalCopy.summary(for: .setPreference),
             "Change a Portmaster preference"
         )
-        let headings = MCPApprovalRequest.Kind.allCasesForTests.map {
-            MCPApprovalCopy.summary(for: $0)
-        }
+        let headings = MCPApprovalRequest.Kind.allCases.map(MCPApprovalCopy.summary(for:))
         XCTAssertEqual(
             Set(headings).count, headings.count,
             "two kinds must not share one heading: \(headings)"
@@ -202,8 +200,90 @@ final class MCPApprovalPresentationTests: XCTestCase {
                 "\(tool.name) is shown with no heading"
             )
         }
-        XCTAssertEqual(kinds.count, MCPApprovalRequest.Kind.allCasesForTests.count)
-        XCTAssertEqual(mutations, MCPApprovalRequest.Kind.allCasesForTests.count)
+        XCTAssertEqual(kinds.count, MCPApprovalRequest.Kind.allCases.count)
+        XCTAssertEqual(mutations, MCPApprovalRequest.Kind.allCases.count)
+    }
+
+    /// The case that made this function exist: a helper spawned twenty seconds into a
+    /// sixty-second deliberation is on the list the executor will stop, and was not on
+    /// the list the person was shown — so the approval does not cover it.
+    func testAListThatGrewAfterItWasShownMustBeAskedAboutAgain() {
+        let shown: [Int32] = [100, 101]
+        XCTAssertTrue(
+            MCPApprovalCopy.needsReconfirmation(shown: shown, resolved: [100, 101, 250]),
+            "a process that appeared after the list was shown needs a new approval"
+        )
+        XCTAssertTrue(
+            MCPApprovalCopy.needsReconfirmation(shown: shown, resolved: [101]),
+            "a list that lost a process changed too: what is stopped is not what was shown"
+        )
+    }
+
+    func testTheSameMembershipNeedsNoSecondApproval() {
+        let shown: [Int32] = [101, 100]
+        XCTAssertFalse(
+            MCPApprovalCopy.needsReconfirmation(shown: shown, resolved: [100, 101]),
+            "order is not membership: the same pids are the same list"
+        )
+        XCTAssertFalse(
+            MCPApprovalCopy.needsReconfirmation(shown: [], resolved: []),
+            "no processes either way is no change"
+        )
+    }
+
+    /// The two sentences that sit next to each other on the window have to agree.
+    /// Before this was pinned, a `force: true` quit said "without asking it to save
+    /// first" above a list that said "processes will be asked to close" — the same
+    /// screen contradicting itself about the same processes.
+    func testAForcedQuitDoesNotAlsoSayProcessesWillBeAskedToClose() {
+        let detail = MCPApprovalCopy.detail(
+            for: .quitApp,
+            arguments: ["id": "app:Chrome", "force": "true"],
+            targets: ["Chrome — PID 100"]
+        )
+        let notice = MCPApprovalCopy.saveWorkNotice(force: true)
+        XCTAssertTrue(detail.contains("without asking it to save first"), detail)
+        XCTAssertFalse(
+            notice.contains("asked to close"), "the notice contradicts the sentence: \(notice)"
+        )
+        XCTAssertFalse(
+            notice.contains("force quit is offered"),
+            "nothing can be offered after the answer has gone back: \(notice)"
+        )
+    }
+
+    func testAGracefulQuitStillOffersTheForceQuitAfterwards() {
+        let notice = MCPApprovalCopy.saveWorkNotice(force: false)
+        XCTAssertTrue(notice.contains("asked to close"), notice)
+        XCTAssertTrue(notice.contains("force quit is offered separately"), notice)
+    }
+
+    /// One reader of `force`, so the sentence and the window's own behaviour cannot be
+    /// built from two different ideas of what the client asked for.
+    func testTheRequestKnowsWhetherItIsForced() {
+        XCTAssertTrue(makeRequest(arguments: ["id": "app:Chrome", "force": "true"]).force)
+        XCTAssertTrue(
+            makeRequest(arguments: ["id": "app:Chrome", "force": "TRUE"]).force,
+            "the executor reads the argument case-insensitively, so this does too"
+        )
+        XCTAssertFalse(makeRequest(arguments: ["id": "app:Chrome", "force": "false"]).force)
+        XCTAssertFalse(makeRequest(arguments: ["id": "app:Chrome"]).force)
+        XCTAssertFalse(makeRequest(arguments: ["id": "app:Chrome", "force": "yes"]).force)
+    }
+
+    /// Refusing queued work the person never saw needs its own words: `closedReason`
+    /// describes a request that was on screen and dismissed, and that is not what
+    /// happened to the ones behind it.
+    func testTheNeverShownCaseHasItsOwnReason() {
+        XCTAssertFalse(MCPApprovalCopy.dismissedUnseenReason.isEmpty)
+        XCTAssertNotEqual(
+            MCPApprovalCopy.dismissedUnseenReason, MCPApprovalCopy.closedReason,
+            "a request nobody saw was not 'shown and dismissed'"
+        )
+        XCTAssertTrue(
+            MCPApprovalCopy.dismissedUnseenReason.contains("not taken"),
+            MCPApprovalCopy.dismissedUnseenReason
+        )
     }
 
     // MARK: - What else the window says
@@ -392,9 +472,12 @@ final class MCPApprovalPresentationTests: XCTestCase {
     private func makeRequest(
         kind: MCPApprovalRequest.Kind = .quitApp,
         summary: String = "Quit app:Chrome?",
-        detail: String = "Quit every process of app:Chrome, asking each to close cleanly first."
+        detail: String = "Quit every process of app:Chrome, asking each to close cleanly first.",
+        arguments: [String: String] = [:]
     ) -> MCPApprovalRequest {
-        MCPApprovalRequest(kind: kind, summary: summary, detail: detail)
+        MCPApprovalRequest(
+            kind: kind, summary: summary, detail: detail, arguments: arguments
+        )
     }
 
     /// Puts a request on the broker in its own task, so the test can ask whether it
@@ -448,12 +531,4 @@ final class MCPApprovalPresentationTests: XCTestCase {
 private enum ApprovalTestFailure: Error {
     case neverPresented
     case neverReturned
-}
-
-private extension MCPApprovalRequest.Kind {
-    /// Every kind the type can hold, so a test can cover the set rather than a list
-    /// somebody remembered to update.
-    static var allCasesForTests: [MCPApprovalRequest.Kind] {
-        [.quitApp, .stopContainer, .stopProject, .setPreference]
-    }
 }

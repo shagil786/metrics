@@ -36,6 +36,18 @@ public struct LiveDataProvider: DataProvider {
     /// gap, and far short of "hours". Below it, a reading is current enough that a
     /// client acting on it is acting on the machine it is looking at; above it, the
     /// honest answer is that there is no current reading.
+    ///
+    /// **It must stay above `ConfirmationBroker.defaultTimeout` (60 s), and that is a
+    /// safety constraint rather than a taste one.** The confirmation window shows the
+    /// membership from this reading and re-resolves it when Approve is pressed; the
+    /// executor then stops the membership from *its own* read. If this bound were below
+    /// the broker's budget, a stop approved at second 59 would hit a reading `stopApp`
+    /// considered too old, which wakes the sampler and resolves from a *different*
+    /// snapshot — so the window would compare one list and the executor would signal
+    /// another, and "only the processes listed above will be stopped" would be false with
+    /// every test in this module still green. Nothing here can assert the ordering (this
+    /// is a constant and `ConfirmationBroker`'s is an actor); it is the reason the
+    /// confirmation window's re-resolve and this age bound agree by construction.
     public static let maximumReadingAge: TimeInterval = 120
 
     /// The refusal for a published reading that is older than `maximumReadingAge`.
