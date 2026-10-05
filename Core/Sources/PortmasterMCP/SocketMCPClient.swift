@@ -83,15 +83,49 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
 
     /// How long one relayed call may take.
     ///
-    /// Derived from the read budget a legitimately slow live read is allowed to spend,
-    /// so a cold snapshot is never mistaken for a dead app — the same derivation
-    /// `MCPStdioRunner.eofDrainTimeout` makes, for the same reason: a cap under the
-    /// budget silently loses the slowest call anyone actually makes.
-    static let callTimeout: TimeInterval = MCPStdioRunner.eofDrainTimeout
+    /// **The longest legitimate wait this client must survive, plus a margin.** A relayed
+    /// call is not only a read: under `confirmEach` a mutation reaches the app, the app
+    /// asks a person, and the answer comes back only when they decide. That wait is the
+    /// broker's own budget — `ConfirmationBroker.defaultTimeout` — and a person deciding
+    /// is not slow *relative to a tool*, they are slow relative to everything. So the
+    /// bound is that wait plus what a live read may spend
+    /// (`OnDemandProvider.defaultSnapshotTimeout`), plus a margin.
+    ///
+    /// Both are referenced, not restated, so the three budgets cannot drift apart: this
+    /// is a formula over two numbers that each have their own owner.
+    ///
+    /// The margin is what absorbs the parts of a relayed call that are nobody's declared
+    /// budget — the app's own per-call gate, the provider's acquisition, queueing behind
+    /// another pending decision — without which the sum above would be exactly the
+    /// slowest *designed* case and every small addition past it would be a truncation.
+    ///
+    /// Exceeding this does not report what happened. The watchdog disconnects and answers
+    /// with `unavailableText`, which says Portmaster is not running — so a bound set below
+    /// a legitimate wait does not merely lose a slow call, it tells the user a falsehood
+    /// and sends them looking at an app that is running perfectly well. That is why the
+    /// margin exists and why there is a test asserting this is at least the broker's budget
+    /// plus the read budget: someone shortening either of those should meet a failure here
+    /// rather than in a user's face.
+    static let callTimeout: TimeInterval =
+        ConfirmationBroker.defaultTimeout
+        + OnDemandProvider.defaultSnapshotTimeout
+        + relayedCallMargin
+
+    /// Slack on top of the two declared budgets. See `callTimeout`.
+    static let relayedCallMargin: TimeInterval = 5
 
     /// The connected descriptor. Kept rather than reconnected per call, and closed by
     /// `disconnect()`.
     private let socket: UnixSocket
+
+    /// The wait `call` enforces on this client.
+    ///
+    /// A copy of `callTimeout` rather than the constant itself, so that proving the
+    /// watchdog *fires* does not cost the real duration: a stalled call against the
+    /// production bound would sit for 75 seconds to demonstrate a five-second timer.
+    /// Internal init only, because the duration is policy and policy lives in one place —
+    /// a public caller naming its own bound would be a second policy.
+    private let callBudget: TimeInterval
 
     /// Guards the two pieces of state below. The lock is not about the socket — it is
     /// about a caller on one task and a shutdown on another, which is the whole of what
@@ -124,7 +158,14 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// Not throwing is the design, not a convenience: a CLI's startup path has exactly
     /// one fallback, and an `NSError` about a socket would tempt a caller into
     /// surfacing it to an agent as though the agent had done something wrong.
-    public init?(endpointDirectory: URL? = nil) {
+    public convenience init?(endpointDirectory: URL? = nil) {
+        self.init(endpointDirectory: endpointDirectory, callBudget: Self.callTimeout)
+    }
+
+    /// The same client, with the wait `call` enforces stated explicitly. Test-only; see
+    /// `callBudget`.
+    init?(endpointDirectory: URL?, callBudget: TimeInterval) {
+        self.callBudget = callBudget
         // Absent, undecodable, wrong-shaped or stale: `read` does not tell those apart,
         // and a caller could not act differently on each.
         guard let endpoint = EndpointFileStore.read(directory: endpointDirectory),
@@ -178,8 +219,11 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
         // to unwind at scope exit, which is the very wait the deadline exists to end. An
         // unstructured watchdog can fire and leave: the call ends when the app answers or
         // when the client gives up, never because something is still winding down.
+        // The budget read out here rather than inside the closure, so the timer does not
+        // need `self` for a value that can never change.
+        let budget = callBudget
         let watchdog = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.callTimeout))
+            try? await Task.sleep(for: .seconds(budget))
             // Cancelled means the call answered first and the `defer` below fired; this
             // timer must not then close a session that is still serving.
             guard !Task.isCancelled else { return }

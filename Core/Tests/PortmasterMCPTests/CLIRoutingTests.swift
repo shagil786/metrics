@@ -25,6 +25,10 @@ import XCTest
 
 final class CLIRoutingTests: XCTestCase {
 
+    /// The bound the stalled-call test gives its client. Small enough to prove a timer
+    /// fired, large enough that the call is genuinely dispatched before it expires.
+    static let stallBudget: TimeInterval = 0.5
+
     // MARK: - Not available
 
     /// No endpoint file means no app, and no app means slice 1's path with nothing
@@ -410,7 +414,11 @@ final class CLIRoutingTests: XCTestCase {
     func testRelayedCallThatNeverAnswersIsBoundedAndReportsIt() async throws {
         let fixture = try startHost(context: StallingHostContext())
         let client = try XCTUnwrap(
-            SocketMCPClient(endpointDirectory: fixture.directory),
+            // A budget of the test's choosing, not the production one: what is under test
+            // is that the watchdog fires and says so, and the production bound's *value*
+            // is pinned separately by `testRelayedCallBoundOutlastsTheConfirmationWindow`
+            // — because that value is 75 seconds of real waiting.
+            SocketMCPClient(endpointDirectory: fixture.directory, callBudget: Self.stallBudget),
             "the host is up, so the client must connect"
         )
         let opened = await client.open()
@@ -424,11 +432,11 @@ final class CLIRoutingTests: XCTestCase {
         XCTAssertTrue(outcome.isError, outcome.text)
         XCTAssertEqual(outcome.text, SocketMCPClient.unavailableText)
         XCTAssertGreaterThan(
-            elapsed, SocketMCPClient.callTimeout * 0.5,
+            elapsed, Self.stallBudget * 0.5,
             "the answer must have come from the bound, not from something failing early"
         )
         XCTAssertLessThan(
-            elapsed, SocketMCPClient.callTimeout * 4,
+            elapsed, Self.stallBudget * 4,
             "the bound must be the cost of a failed call and no more"
         )
         XCTAssertFalse(
@@ -498,6 +506,40 @@ final class CLIRoutingTests: XCTestCase {
         )
         XCTAssertFalse(opened.isConnected, "a failed probe must not leave a claimed session")
     }
+
+    /// The relayed bound must be able to outlast what the app makes it wait for.
+///
+/// This is a comparison, not a measurement, and deliberately so: the thing being protected
+/// is a number nobody runs to find out. A relayed `quit_app` under `confirmEach` reaches
+/// the app, the app asks a person, and the answer arrives when they decide — a wait bounded
+/// by `ConfirmationBroker.defaultTimeout`, not by anything in this process. A client whose
+/// bound is shorter fires first, disconnects, and answers "Portmaster isn't running", which
+/// is false and points at an app that is running perfectly.
+///
+/// So the assertion is a floor, not an equality: a larger bound is fine (it costs nothing
+/// but a slow failure), a smaller one is the trap. Whoever shortens either budget — the
+/// broker's, or the read budget underneath it — meets this failure instead of a bug report.
+func testRelayedCallBoundOutlastsTheConfirmationWindow() {
+    XCTAssertGreaterThanOrEqual(
+        SocketMCPClient.callTimeout,
+        ConfirmationBroker.defaultTimeout + OnDemandProvider.defaultSnapshotTimeout,
+        """
+        the relayed bound must cover a person's decision plus a live read; at \
+        \(SocketMCPClient.callTimeout)s it does not, so a slow answer under confirmEach \
+        would be reported as a missing app
+        """
+    )
+    XCTAssertGreaterThan(
+        SocketMCPClient.relayedCallMargin, 0,
+        "the sum of two declared budgets is exactly the slowest designed case; a margin is "
+            + "what keeps the next undocumented cost past it from truncating a call"
+    )
+    // And the refusal a client gives when it gives up must not name a cause it cannot know.
+    XCTAssertTrue(
+        SocketMCPClient.unavailableText.contains("isn't running"),
+        "this is the message a truncated call produces, which is why the bound above matters"
+    )
+}
 
     // MARK: - Helpers
 
