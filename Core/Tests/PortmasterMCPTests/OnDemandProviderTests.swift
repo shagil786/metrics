@@ -762,7 +762,7 @@ final class OnDemandProviderTests: XCTestCase {
             settingsDirectory: directory
         )
 
-        let snapshot = provider.settingsSnapshot()
+        let snapshot = await provider.settingsSnapshot()
 
         XCTAssertEqual(snapshot.temperatureUnit, "fahrenheit")
         XCTAssertEqual(snapshot.networkUnit, "bits")

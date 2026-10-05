@@ -481,7 +481,7 @@ final class LiveDataProviderTests: XCTestCase {
     func testSettingsSnapshotReturnsTheAppsValue() async throws {
         let provider = makeProvider(PublishedSnapshot(Self.snapshot()))
 
-        let settings = provider.settingsSnapshot()
+        let settings = await provider.settingsSnapshot()
 
         XCTAssertEqual(settings.temperatureUnit, "fahrenheit")
         XCTAssertEqual(settings.networkUnit, "bits")

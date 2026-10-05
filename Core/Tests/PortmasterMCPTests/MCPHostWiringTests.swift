@@ -373,6 +373,21 @@ final class MCPHostWiringTests: XCTestCase {
         )
     }
 
+    /// The refusal's wording switches to minutes at the bound, and switches *because of*
+    /// the bound: a literal in `ageDescription` would keep answering "2 minutes" for a
+    /// rule that had moved to, say, 90 seconds.
+    func testTheAgeWordingTurnsOverAtTheSameNumberAsTheRule() {
+        XCTAssertEqual(
+            LiveDataProvider.ageDescription(LiveDataProvider.maximumReadingAge - 1),
+            "119 seconds"
+        )
+        XCTAssertEqual(
+            LiveDataProvider.ageDescription(LiveDataProvider.maximumReadingAge), "2 minutes"
+        )
+        XCTAssertEqual(LiveDataProvider.ageDescription(1), "1 second")
+        XCTAssertEqual(LiveDataProvider.ageDescription(0), "0 seconds")
+    }
+
     /// The app's own throw site is `LiveDataProvider.requireReadable`, which is what
     /// makes this contract about the app and not about a test's own closure: both
     /// refusals it can raise are the library's, and neither can be worded here.
@@ -461,6 +476,84 @@ final class MCPHostWiringTests: XCTestCase {
             provider.quitAppCallCount, 1,
             "an approval given the moment the window opened must be matched, not dropped"
         )
+    }
+
+    // MARK: - Waking a quiet sampler
+
+    /// A reading older than the bound is not the end of the answer: the app owns the
+    /// sampler, and `SamplingEngine` pauses itself after five idle minutes — the
+    /// normal state of a menu-bar app. So the host nudges it once and waits for that
+    /// one tick.
+    ///
+    /// Both halves are here because they are different code paths: a wake that lands
+    /// answers, and a wake that does not is refused in the same words as one that was
+    /// never tried — with exactly one nudge either way, since a second attempt is how a
+    /// "wake the sampler" feature turns into a retry loop.
+    func testAStaleMirrorIsWokenOnceAndAnsweredFromTheNewReading() async throws {
+        let stale = Self.snapshot(at: Date().addingTimeInterval(-600))
+        let fresh = Self.snapshot(at: Date())
+        let nudges = WakeCounter()
+        let clock = WakeCounter()
+
+        let woken = await LiveDataProvider.wake(
+            replacing: stale,
+            budget: 1,
+            nudge: {
+                nudges.record()
+                // The tick is scheduled, not synchronous: the reading lands on a later
+                // poll, which is the whole reason the wake waits at all.
+                clock.record(fresh)
+            },
+            latest: { clock.newest }
+        )
+
+        XCTAssertEqual(nudges.count, 1, "one nudge, one attempt")
+        XCTAssertEqual(woken.at, fresh.at)
+        XCTAssertNoThrow(try LiveDataProvider.requireReadable(woken))
+    }
+
+    /// A sampler that does not answer the nudge is refused for being idle, and only
+    /// after the budget — with the age named, because that is what tells a client
+    /// whether to come back.
+    func testAMirrorThatStaysStaleIsRefusedAfterOneWake() async throws {
+        let stale = Self.snapshot(at: Date().addingTimeInterval(-600))
+        let nudges = WakeCounter()
+
+        let woken = await LiveDataProvider.wake(
+            replacing: stale,
+            budget: 0.1,
+            nudge: { nudges.record() },
+            latest: { stale }
+        )
+
+        XCTAssertEqual(nudges.count, 1, "a wake that did not land must not be retried")
+        XCTAssertEqual(woken.at, stale.at, "nothing newer arrived, so the old reading stands")
+        do {
+            _ = try LiveDataProvider.requireReadable(woken)
+            XCTFail("a reading that survived the wake must not be reported as current")
+        } catch let error as MCPToolError {
+            XCTAssertTrue(error.message.contains("idle"), error.message)
+            XCTAssertTrue(error.message.contains("10 minutes"), error.message)
+        }
+    }
+
+    /// A cold sampler gets the same one wake, because `refreshNow()` is the right
+    /// answer to "nothing published yet" too: the app has started, and asking it to
+    /// tick is cheaper than telling a client the sampler is still starting when a tick
+    /// is one call away.
+    func testAColdSamplerIsWokenRatherThanRefused() async throws {
+        let fresh = Self.snapshot(at: Date())
+        let nudges = WakeCounter()
+
+        let woken = await LiveDataProvider.wake(
+            replacing: .empty,
+            budget: 1,
+            nudge: { nudges.record() },
+            latest: { fresh }
+        )
+
+        XCTAssertEqual(nudges.count, 1)
+        XCTAssertNoThrow(try LiveDataProvider.requireReadable(woken))
     }
 
     // MARK: - Helpers
@@ -567,6 +660,25 @@ final class MCPHostWiringTests: XCTestCase {
     /// rather than about the shape of the log.
     private func auditOutcomes(_ directory: URL) throws -> [String] {
         try auditEntries(directory).compactMap { $0["outcome"] as? String }
+    }
+}
+
+/// How many times a nudge was asked for, and what it produced.
+private final class WakeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nudges = 0
+    private var readings: [ObservationSnapshot] = []
+
+    func record() { lock.withLock { nudges += 1 } }
+
+    /// Records the reading a tick would have produced, in order.
+    func record(_ reading: ObservationSnapshot) { lock.withLock { readings.append(reading) } }
+
+    var count: Int { lock.withLock { nudges } }
+
+    /// The newest reading recorded, or `.empty` while none has landed.
+    var newest: ObservationSnapshot {
+        lock.withLock { readings.max(by: { $0.at < $1.at }) } ?? .empty
     }
 }
 

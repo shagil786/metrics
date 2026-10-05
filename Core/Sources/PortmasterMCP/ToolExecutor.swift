@@ -542,7 +542,7 @@ public struct ToolExecutor: Sendable {
             return AlertsPayload(try await provider.activeAlerts())
 
         case "get_settings":
-            return provider.settingsSnapshot()
+            return await provider.settingsSnapshot()
 
         case "quit_app":
             return try await provider.quitApp(id: Self.id(arguments), force: Self.flag(arguments))

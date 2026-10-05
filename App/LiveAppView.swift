@@ -4,27 +4,31 @@
 // controller decides *when* the host runs, and this type is *what* the tools answer
 // with. It also keeps the eight provider closures together with the three rules they
 // obey, rather than interleaved with socket lifecycle.
+
 import Foundation
 import PortmasterCore
 import PortmasterMCP
-//
-// The app's published state, mirrored for the MCP tool path, plus the mutations that
-// only the app may perform.
+
+/// The app's published state, for the MCP tool path, plus the mutations that only the
+/// app may perform.
 ///
-/// `LiveDataProvider` reads three things from the app — the latest snapshot, the
-/// current alerts, the current preferences — and **two of its three closures are
-/// synchronous**. A synchronous read of main-actor state has exactly two options:
-/// block the main thread, or read a copy. Blocking is the wrong one: an MCP call
-/// would sit behind whatever the UI is doing, and a socket thread that can make the
-/// main thread wait is a deadlock waiting for a busy frame. So the three values are
-/// mirrored into a lock-protected box, updated on the main actor, and every closure
-/// reads the box.
+/// Every read **publishes from the app first and then reads a lock-protected copy**, so
+/// a tool call answers with what Portmaster holds at the moment it was asked and never
+/// with a copy that some scheduler may not have refreshed. The copy is what makes that
+/// safe to do on every read: the main-actor hop happens outside the lock, so concurrent
+/// calls do not queue behind each other while holding it, and all three values are read
+/// together rather than one hop each.
 ///
-/// That is not a weaker answer. The app publishes these on the main actor and nothing
-/// else writes them, so the mirror holds the value the hop would have returned; the
-/// only difference is that a read does not wait for an update that is in flight.
+/// That replaced a `Combine` subscription that kept a copy current on every
+/// `@Published` write. It looks cheaper until it is measured: the app publishes five
+/// times per sample tick, so it ran five times a tick, for the life of the process, to
+/// keep fresh something read a handful of times a minute — and it could still be behind,
+/// because nothing observed a client connecting. Publishing on read has no schedule to
+/// keep and nothing to be stale by.
 final class LiveAppView: @unchecked Sendable {
 
+    /// The copy. One lock for all three values, so a reader cannot see a snapshot from
+    /// one instant and preferences from another.
     private let lock = NSLock()
     private var currentSnapshot: ObservationSnapshot = .empty
     private var currentAlerts: AlertsSnapshot = AlertsSnapshot(source: .live, alerts: [])
@@ -41,7 +45,7 @@ final class LiveAppView: @unchecked Sendable {
         self.loadMode = loadMode
     }
 
-    // MARK: Mirroring (main actor)
+    // MARK: Publishing (main actor)
 
     /// Copies whatever the app is holding right now.
     @MainActor
@@ -63,44 +67,70 @@ final class LiveAppView: @unchecked Sendable {
         lock.withLock { currentHistory = history }
     }
 
-    // MARK: Reading (any thread)
+    /// The one publish nothing asked for: what the app holds at launch, so the box is
+    /// not empty before the first client. Every other publish belongs to the read that
+    /// needs it.
+    @MainActor
+    func publishInitialState() {
+        publishFromModel()
+    }
 
-    /// The app's latest published reading, if it is recent enough to answer with.
+    // MARK: Reading (publishes first, then answers off the main actor)
+
+    /// The app's newest reading, woken into existence if it had gone quiet.
     ///
-    /// Both refusals are `LiveDataProvider`'s, and neither is worded here: a cold
-    /// sampler and a sampler that has gone idle are different facts with different
-    /// sentences, and this app cannot word either of them — a host that invents its
-    /// own refusal is how a client reads two explanations for one condition. The
-    /// mirror is not trimmed or aged by hand, so the freshness rule is the library's
-    /// one rule for both providers.
+    /// Three steps, and each earns its place:
     ///
-    /// **The hop is the slow path, not the fast one.** Mirroring only runs while a
-    /// client is connected (`MCPHostController.scheduleMirrorPass`), which makes the
-    /// first read of a session the one case where the mirror can still hold what the
-    /// app published before anyone asked — so a mirror that cannot answer is
-    /// refreshed from the app and asked again, and only then refused. Without this a
-    /// client connecting ten minutes after launch could be told "the sampler is still
-    /// starting" by a mirror that had not been touched since launch.
+    /// 1. **Publish from the app**, so the answer is what Portmaster holds now. A copy
+    ///    kept by a scheduler would be a step behind by construction, and how far
+    ///    behind depends on whether that scheduler ran.
+    /// 2. **Ask the app whether that reading is fresh enough** — `LiveDataProvider`'s
+    ///    rule, not this file's, so both providers judge a reading the same way.
+    /// 3. **If it is not, wake the sampler and wait once.** `SamplingEngine` pauses
+    ///    itself after five idle minutes, which is the normal state of a menu-bar app
+    ///    nobody is looking at; a refusal there would break every snapshot-backed tool
+    ///    on a healthy app. One nudge, one bounded wait, and then the same freshness
+    ///    rule decides — so a sampler that does not answer is refused for being idle
+    ///    whether or not the host tried.
     func snapshot() async throws -> ObservationSnapshot {
+        await MainActor.run { publishFromModel() }
         if let readable = try? LiveDataProvider.requireReadable(lock.withLock { currentSnapshot }) {
             return readable
         }
+        let woken = await LiveDataProvider.wake(
+            replacing: lock.withLock { currentSnapshot },
+            // Both hops are main-actor reads of the app: the nudge is the engine's own
+            // API, and the reading is `AppModel`'s published copy. Published back into
+            // the box once at the end so `alerts` and the settings payload are not left
+            // describing the state before the wake.
+            nudge: {
+                await MainActor.run {
+                    AppModel.shared.engine.noteUserActivity()
+                    AppModel.shared.engine.refreshNow()
+                }
+            },
+            latest: { await MainActor.run { AppModel.shared.snapshot } }
+        )
         await MainActor.run { publishFromModel() }
-        return try LiveDataProvider.requireReadable(lock.withLock { currentSnapshot })
+        return try LiveDataProvider.requireReadable(woken)
     }
 
-    func alerts() -> AlertsSnapshot { lock.withLock { currentAlerts } }
+    /// The app's current alerts, published fresh and then read.
+    func alerts() async -> AlertsSnapshot {
+        await MainActor.run { publishFromModel() }
+        return lock.withLock { currentAlerts }
+    }
 
-    /// The app's preferences as `get_settings` reports them.
+    /// The app's preferences as `get_settings` reports them, published fresh and read.
     ///
     /// **The mutation mode is read from the policy file on every call, not from the
-    /// mirror.** A client that just changed it through `set_preference` must see its
-    /// own change in the very next `get_settings`, and the mirror is only refreshed
-    /// when the app publishes something or Settings opens — so mirroring the mode
-    /// would let the server report a policy the file no longer holds. The read is one
-    /// small JSON file, on a tool call a client has already asked for.
-    func settingsSnapshot() -> SettingsSnapshot {
-        Self.settings(from: lock.withLock { currentPreferences }, mode: loadMode())
+    /// copy.** A client that just changed it through `set_preference` must see its own
+    /// change in the very next `get_settings`, and the executor enforces that same file
+    /// — a copy of the mode could disagree with the policy actually being applied. The
+    /// read is one small JSON file, on a tool call the client has already asked for.
+    func settingsSnapshot() async -> SettingsSnapshot {
+        await MainActor.run { publishFromModel() }
+        return Self.settings(from: lock.withLock { currentPreferences }, mode: loadMode())
     }
 
     /// The app's history, opened on the first history question and kept.
@@ -177,8 +207,8 @@ final class LiveAppView: @unchecked Sendable {
     /// `projectStopTarget` rather than `OnDemandProvider.projectSummaries(from:)`, which
     /// is what the summaries a client *reads* come from: project membership is a fact
     /// about processes that change every second, and the app's live snapshot is the
-    /// authority for which ones are in a project now. Rebuilding it from the mirror
-    /// would add a second definition that could only ever be staler.
+    /// authority for which ones are in a project now. Rebuilding it from a copy of the
+    /// app's own snapshot would add a second definition that could only ever be staler.
     func stopProject(id: String) async throws -> StopReport {
         try await Self.refusePreviewData()
         let target = await AppModel.shared.projectStopTarget(id)
@@ -260,7 +290,7 @@ final class LiveAppView: @unchecked Sendable {
         )
     }
 
-    /// A value to hold before the app has published anything. Never reported: the
-    /// controller mirrors before it starts serving, and the mode is read per call.
+    /// A value to hold before the app has published anything. Never reported: every read
+    /// publishes from the app first, and the mutation mode is read from the file.
     private static let placeholderPreferences = AppPreferences()
 }

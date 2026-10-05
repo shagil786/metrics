@@ -18,13 +18,11 @@
 //
 // Three properties this file has to keep:
 //
-//  1. **Nothing here runs per sample.** The host starts once; mirroring is one
-//     Combine subscription that *coalesces* — at most one pass in flight, and none at
-//     all while no client is connected, so a burst of `@Published` writes (every
-//     sample tick writes five) costs one copy rather than five, and an idle app costs
-//     none. The one read that can still touch the main actor is a snapshot the mirror
-//     could not answer (`LiveAppView.snapshot`), and it hops once and re-reads. A
-//     feature with nobody on it costs one bound socket and one thread in `poll`.
+//  1. **Nothing here runs per sample.** There is no subscription to the app's
+//     `@Published` state at all: every read publishes from the app when it is asked
+//     (`LiveAppView`), so the cost is one main-actor hop per tool call and zero per
+//     tick. A feature with nobody calling it costs one bound socket and one thread
+//     parked in `poll`.
 //  2. **The app is the writer.** Preference writes go through `AppModel.prefs`, so
 //     the running app cannot clobber itself, and no `MCPSettings` file is written
 //     behind the app's back — `mcpMode` is intercepted by the executor before the
@@ -35,7 +33,6 @@
 //     rejected by `EndpointFileStore.read`'s pid check, but the honest thing is to
 //     clean up rather than to rely on being caught.
 
-import Combine
 import Foundation
 import os
 import PortmasterCore
@@ -94,9 +91,6 @@ final class MCPHostController: ObservableObject {
     private let broker = ConfirmationBroker()
     private let live: LiveAppView
     private var host: MCPHostServer?
-    private var mirror: AnyCancellable?
-    /// Whether a mirror pass is already queued. See `scheduleMirrorPass`.
-    private var mirrorPassPending = false
 
     init(directory: URL? = nil) {
         self.directory = directory
@@ -117,7 +111,12 @@ final class MCPHostController: ObservableObject {
     /// whether launch already ran it cannot end up with two.
     func start() {
         guard host == nil else { return }
-        startMirroring()
+        // Nothing is scheduled after this: a read publishes for itself. What is needed
+        // once, at launch, is the mode Settings shows and the history reader, whose
+        // store cannot change under the app afterwards.
+        refreshFromSettings()
+        live.publishInitialState()
+        live.publishHistory(makeHistory())
         let started = MCPHostServer(
             socketURL: Self.socketURL(in: directory),
             endpointDirectory: directory,
@@ -183,7 +182,7 @@ final class MCPHostController: ObservableObject {
         mode = MCPSettings.load(directory: directory).mode
     }
 
-    /// Republishes who is connected, and makes sure the mirror is current.
+    /// Republishes who is connected.
     ///
     /// Called rather than polled: the host holds the live list, and Settings is the
     /// only reader, so a timer would wake a menu-bar app once a second to update a
@@ -191,15 +190,8 @@ final class MCPHostController: ObservableObject {
     /// it calls `refreshFromSettings()` — a client can connect, ask and disconnect
     /// entirely between two openings, so the list has to be read at the moment it is
     /// shown.
-    ///
-    /// The mirror pass matters as much as the list here: mirroring is skipped while no
-    /// client is connected (see `scheduleMirrorPass`), so the moment a client
-    /// connects is the moment the mirror has to be brought up to date — otherwise the
-    /// first tool call of the first session could read a snapshot from before it
-    /// connected.
     func refreshClients() {
         clients = host?.connectedClients() ?? []
-        if !clients.isEmpty { scheduleMirrorPass() }
     }
 
     /// Changes the mutation policy and persists it.
@@ -266,15 +258,15 @@ final class MCPHostController: ObservableObject {
     /// Every closure hands on to `live` and nothing else: the app is the sampler,
     /// the app is the writer, and the app's own coordinator is what signals a pid.
     /// Bound once as a local rather than captured through `self`, so the eight
-    /// closures reference the mirror rather than the controller — and so no closure
+    /// closures reference the state box rather than the controller — and so no closure
     /// can reach back into the controller from a socket thread.
     private func makeProvider() -> LiveDataProvider {
         let live = self.live
         return LiveDataProvider(
             snapshot: { try await live.snapshot() },
-            alerts: { live.alerts() },
+            alerts: { await live.alerts() },
             history: { live.history() },
-            settings: { live.settingsSnapshot() },
+            settings: { await live.settingsSnapshot() },
             // The app owns the write, so the app is what writes.
             applyPreference: { key, value in try await live.applyPreference(key: key, value: value) },
             stopApp: { id, force in try await live.stopApp(id: id, force: force) },
@@ -309,6 +301,8 @@ final class MCPHostController: ObservableObject {
     ///
     /// Decided here rather than in the factory because the store is already open by
     /// the time this runs, and `LazyHistory` only needs a way to reach the same one.
+    /// The one thing that is *not* published per read: the store's availability cannot
+    /// change under the app, so a reader built once is the whole story.
     private func makeHistory() -> @Sendable () -> any HistoryReading {
         if let store = AppModel.shared.historyStore {
             let reading = StoreHistoryReading(store: store)
@@ -317,57 +311,5 @@ final class MCPHostController: ObservableObject {
         let message = AppModel.shared.historyError
             ?? "Could not open the local history database."
         return { UnavailableHistoryReading(message: message) }
-    }
-
-    /// Keeps the mirror current for as long as the controller is alive.
-    ///
-    /// One subscription, installed once at `start`, plus a first copy.
-    ///
-    /// It is subscribed to `objectWillChange`, which fires on *every* `@Published`
-    /// mutation — and the per-sample sink alone writes five of them, so an
-    /// uncoalesced subscription would copy a whole `ObservationSnapshot` once per
-    /// sample tick, for the life of the process, whether or not anything on the
-    /// machine was reading it. Hence `scheduleMirrorPass`, which is where the two
-    /// rules live: one pass at a time, and none while nobody is connected.
-    func startMirroring() {
-        guard mirror == nil else { return }
-        refreshFromSettings()
-        live.publishHistory(makeHistory())
-        live.publishFromModel()
-        // `objectWillChange` rather than the three publishers: one subscription for
-        // three values, and any future `@Published` on the model keeps the mirror
-        // honest without touching this file.
-        mirror = AppModel.shared.objectWillChange
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.scheduleMirrorPass() }
-    }
-
-    /// Queues at most one mirror pass, and only when someone could read it.
-    ///
-    /// Coalescing because the notifications arrive in bursts and a pass reads a value
-    /// that is the same for all of them: five writes inside one sample tick need one
-    /// copy, and the pass runs *after* the turn that wrote them, so it sees the last
-    /// one. The flag is cleared inside the task rather than before it, so a change
-    /// that lands while a pass is in flight queues the next one instead of being
-    /// dropped — losing the *last* notification before the next tick is how a mirror
-    /// ends up one tick stale forever.
-    ///
-    /// Gating on a connected client because the mirror exists only to be read: with
-    /// nobody connected there is no caller to answer, and this is the difference
-    /// between a menu-bar app that samples all day and one that also copies a
-    /// snapshot on every tick for nobody. `refreshClients()` re-arms it the moment a
-    /// client is there, so nothing is ever read from a mirror that was switched off.
-    private func scheduleMirrorPass() {
-        guard !mirrorPassPending else { return }
-        guard host?.connectedClients().isEmpty == false else { return }
-        mirrorPassPending = true
-        // `@Published` fires *before* the value changes, so the copy cannot happen
-        // inside the notification: one main-actor turn later — after the setters have
-        // returned — is when the new values are visible.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.live.publishFromModel()
-            self.mirrorPassPending = false
-        }
     }
 }

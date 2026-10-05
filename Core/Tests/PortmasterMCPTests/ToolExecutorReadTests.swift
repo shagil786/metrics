@@ -186,7 +186,10 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return stopReport
     }
 
-    func setPreference(key: String, value: String) throws {
+    /// `async`, like the protocol requirement. A synchronous function is a legal
+    /// witness for it, so leaving this one out compiles and reads as though the
+    /// provider's seam were still synchronous — which it is not.
+    func setPreference(key: String, value: String) async throws {
         try enter("setPreference")
         lastPreferenceKey = key
         lastPreferenceValue = value

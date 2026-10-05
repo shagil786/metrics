@@ -198,7 +198,11 @@ public protocol DataProvider: Sendable {
     /// `.notSampledYet` and returns the sample for `.noSensors` and `.available`.
     func temperaturesFans() async throws -> ThermalSample
     func activeAlerts() async throws -> AlertsSnapshot
-    func settingsSnapshot() -> SettingsSnapshot
+    /// `async` because a host answers this from state it publishes — the app's own
+    /// preferences, read on its actor — and a synchronous seam would force it to
+    /// block that actor or answer from a copy that can be stale. `onDemand` reads a
+    /// blob off disk and is `async` only because the requirement is.
+    func settingsSnapshot() async -> SettingsSnapshot
     func quitApp(id: String, force: Bool) async throws -> StopReport
     func stopContainer(id: String) async throws -> StopReport
     func stopProject(id: String) async throws -> StopReport

@@ -490,7 +490,7 @@ public struct OnDemandProvider: DataProvider {
     /// preferences file this build cannot read — a caller who just wrote a
     /// preference and reads back defaults is looking at this, not at a lost
     /// write. Task 8's README limitations should say so.
-    public func settingsSnapshot() -> SettingsSnapshot {
+    public func settingsSnapshot() async -> SettingsSnapshot {
         let preferences = self.preferences.load()
         return SettingsSnapshot(
             temperatureUnit: preferences.presentation.temperatureUnit.rawValue,

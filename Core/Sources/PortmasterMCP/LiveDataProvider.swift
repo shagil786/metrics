@@ -26,7 +26,9 @@ public struct LiveDataProvider: DataProvider {
     /// minutes or hours old while the tool surface is perfectly happy. Answering from
     /// it would report a machine state that stopped being true, with no marker on it
     /// — and `get_system_overview`'s payload carries an `at`, which a client can read
-    /// but is not obliged to.
+    /// but is not obliged to. Past this bound the host asks the app for a reading
+    /// (`wake`) rather than refusing; the bound is what the answer is judged by once
+    /// that has been tried.
     ///
     /// 120 s is chosen against the app's own cadences rather than picked: the slowest
     /// background cadence is 60 s (`SamplingCadence.gentle`), so this is two of them
@@ -50,6 +52,65 @@ public struct LiveDataProvider: DataProvider {
         )
     }
 
+    /// How long a reading the host cannot use gets to be replaced after it wakes the
+    /// sampler.
+    ///
+    /// Bounded because a tool call is a caller waiting: the client's own budget for a
+    /// relayed call is the broker's 60 s plus `OnDemandProvider.defaultSnapshotTimeout`
+    /// plus a margin, and a wake that overran that would turn a sampler that is slow
+    /// into a CLI reporting that Portmaster is not running — a falsehood the client
+    /// cannot distinguish from a real outage. Five seconds is long enough for the tick
+    /// `refreshNow()` schedules (a process sweep, an `lsof` port scan, and the publish
+    /// that follows them on the main queue) and short enough to sit inside the margin
+    /// rather than eat it.
+    public static let wakeBudget: TimeInterval = 5
+
+    /// How often the wake re-reads while that tick is in flight.
+    ///
+    /// A poll rather than a subscription, because the caller needs one answer at a
+    /// deadline, not a stream of updates it has to filter.
+    static let wakePollInterval: TimeInterval = 0.05
+
+    /// Wakes the app's sampler once and waits, bounded, for a newer reading.
+    ///
+    /// **The right answer to a mirror this old is not a refusal.** The app owns the
+    /// sampler, so the host that cannot answer can ask it for a reading — and
+    /// `SamplingEngine` pauses itself after five idle minutes, which is the normal
+    /// state of a menu-bar app nobody is looking at. Refusing there would make every
+    /// snapshot-backed tool fail on a perfectly healthy app.
+    ///
+    /// One nudge and one wait, then the caller decides with a single
+    /// `requireReadable`: a wake that did not land is refused in the same words as one
+    /// that was never tried, so the client learns the same thing either way. The wait
+    /// exists because `refreshNow()` schedules a tick rather than running one — the
+    /// reading cannot be there the instant the nudge returns — and it is a wait for
+    /// that one tick, not a second attempt to answer.
+    ///
+    /// - Parameters:
+    ///   - stale: the reading that could not be answered with. A new reading is any
+    ///     one stamped later; `.distantPast` therefore matches the first real one.
+    ///   - budget: how long that tick gets.
+    ///   - nudge: asks the app to sample now. Called exactly once.
+    ///   - latest: the app's newest reading, asked repeatedly until one is newer.
+    /// - Returns: the newest reading seen, which may be `stale` itself.
+    public static func wake(
+        replacing stale: ObservationSnapshot,
+        budget: TimeInterval = wakeBudget,
+        nudge: () async -> Void,
+        latest: @escaping @Sendable () async -> ObservationSnapshot
+    ) async -> ObservationSnapshot {
+        await nudge()
+        let deadline = Date().addingTimeInterval(budget)
+        var newest = stale
+        while Date() < deadline {
+            let reading = await latest()
+            if reading.at > newest.at { newest = reading }
+            if newest.at > stale.at { return newest }
+            try? await Task.sleep(for: .milliseconds(Int(wakePollInterval * 1_000)))
+        }
+        return newest
+    }
+
     /// Whether a published reading may be answered with.
     ///
     /// Two refusals, and they are different facts: a sampler that has published
@@ -71,9 +132,14 @@ public struct LiveDataProvider: DataProvider {
 
     /// An age in words a person would use, so the refusal reads as a fact about the
     /// sampler rather than as a number of seconds.
+    ///
+    /// Switches to minutes at `maximumReadingAge` — read from the constant rather than
+    /// written as a literal, because a literal here is a second number that could be
+    /// moved without this file noticing and the refusal would start reading "61
+    /// seconds" where the rule is two minutes.
     static func ageDescription(_ age: TimeInterval) -> String {
         let seconds = Int(age.rounded())
-        if seconds >= 120 {
+        if TimeInterval(seconds) >= maximumReadingAge {
             let minutes = Int((Double(seconds) / 60).rounded())
             return "\(minutes) minute\(minutes == 1 ? "" : "s")"
         }
@@ -81,9 +147,9 @@ public struct LiveDataProvider: DataProvider {
     }
 
     private let snapshotSource: @Sendable () async throws -> ObservationSnapshot
-    private let alertsSource: @Sendable () -> AlertsSnapshot
+    private let alertsSource: @Sendable () async -> AlertsSnapshot
     private let history: LazyHistory
-    private let settingsSource: @Sendable () -> SettingsSnapshot
+    private let settingsSource: @Sendable () async -> SettingsSnapshot
     private let applyPreference: @Sendable (String, String) async throws -> Void
     private let stopApp: @Sendable (String, Bool) async throws -> StopReport
     private let stopContainerNamed: @Sendable (String) async throws -> StopReport
@@ -109,9 +175,9 @@ public struct LiveDataProvider: DataProvider {
     /// preference write that happens once per user instruction.
     public init(
         snapshot: @escaping @Sendable () async throws -> ObservationSnapshot,
-        alerts: @escaping @Sendable () -> AlertsSnapshot,
+        alerts: @escaping @Sendable () async -> AlertsSnapshot,
         history: @escaping @Sendable () -> any HistoryReading,
-        settings: @escaping @Sendable () -> SettingsSnapshot,
+        settings: @escaping @Sendable () async -> SettingsSnapshot,
         applyPreference: @escaping @Sendable (String, String) async throws -> Void,
         stopApp: @escaping @Sendable (String, Bool) async throws -> StopReport,
         stopContainerNamed: @escaping @Sendable (String) async throws -> StopReport,
@@ -235,7 +301,7 @@ public struct LiveDataProvider: DataProvider {
     /// app owns which of its alerts are current, and a provider that reordered them
     /// would be reporting a different set of alerts than the one the user sees.
     public func activeAlerts() async throws -> AlertsSnapshot {
-        alertsSource()
+        await alertsSource()
     }
 
     // MARK: Settings
@@ -244,9 +310,11 @@ public struct LiveDataProvider: DataProvider {
     ///
     /// Answered from the app rather than from a preferences blob decoded here: the
     /// app holds the decoded preferences in memory, so it is the only reader that
-    /// sees an unsaved change and the only writer that will not lose one.
-    public func settingsSnapshot() -> SettingsSnapshot {
-        settingsSource()
+    /// sees an unsaved change and the only writer that will not lose one. The seam is
+    /// `async` so the app can answer from its actor at the moment it is asked, rather
+    /// than from a mirror of itself that a moment later no longer holds the answer.
+    public func settingsSnapshot() async -> SettingsSnapshot {
+        await settingsSource()
     }
 
     /// Changes one allowlisted preference, through the app.
