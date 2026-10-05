@@ -13,25 +13,7 @@ struct StopSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Label(target.isProject ? "Quit project" : "Stop processes", systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 6) {
-                Text("\(target.name) · \(target.members.count) processes")
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(target.members) { member in
-                            Text("\(member.name) — PID \(member.pid)\(member.startedAt == nil ? " (identity unavailable; will skip)" : "")")
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(maxHeight: 150)
-                if !target.ports.isEmpty {
-                    Text("Listening ports: \(Array(Set(target.ports.map(\.port))).sorted().map { ":\($0)" }.joined(separator: ", "))")
-                }
-                if let project = target.project { Text("Project: \(project)").font(.caption).textSelection(.enabled) }
-                Text("Only the processes listed above will be stopped. Portmaster checks their identity again; any new processes require a new confirmation.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("Save your work first. Processes will be asked to close; force quit is offered separately if they keep running.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }.padding(10).cardBackground(cornerRadius: 8)
+            StopTargetMemberList(target: target)
             Divider()
             if phase == .running {
                 HStack { ProgressView().controlSize(.small); Text("Stopping \(target.name)…") }
@@ -81,5 +63,46 @@ struct StopSheet: View {
             outcomes.merge(results) { _, new in new }
             phase = .done; model.engine.refreshNow()
         }
+    }
+}
+
+/// The confirmed membership of a stop, and the two sentences about what stopping it
+/// means — shared with `MCPConfirmationWindow` rather than copied.
+///
+/// A person agreeing to a stop has to see the same list in both places: the list, the
+/// ports and the promises about identity are the substance of the confirmation, and a
+/// second rendering of them is a second promise about what will be stopped.
+///
+/// - Parameter offersForceAfterwards: whether a force quit can still be offered once
+///   this stop finishes. True for the sheet, which offers one for whatever is left.
+///   False for the MCP window, where the answer has already gone back to the AI client
+///   and there is nothing left to offer — and a window that promised a force quit it
+///   cannot deliver would be the one untrue sentence in this view.
+struct StopTargetMemberList: View {
+    let target: AppModel.StopTarget
+    var offersForceAfterwards = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(target.name) · \(target.members.count) processes")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(target.members) { member in
+                        Text("\(member.name) — PID \(member.pid)\(member.startedAt == nil ? " (identity unavailable; will skip)" : "")")
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(maxHeight: 150)
+            if !target.ports.isEmpty {
+                Text("Listening ports: \(Array(Set(target.ports.map(\.port))).sorted().map { ":\($0)" }.joined(separator: ", "))")
+            }
+            if let project = target.project { Text("Project: \(project)").font(.caption).textSelection(.enabled) }
+            Text("Only the processes listed above will be stopped. Portmaster checks their identity again; any new processes require a new confirmation.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(offersForceAfterwards
+                 ? "Save your work first. Processes will be asked to close; force quit is offered separately if they keep running."
+                 : "Save your work first. Processes will be asked to close before they are quit.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding(10).cardBackground(cornerRadius: 8)
     }
 }

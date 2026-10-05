@@ -152,50 +152,51 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// snapshot, and the confirmation window is where that would be shown. A prompt
     /// that guessed at membership would be showing a person a list the stop may not
     /// act on.
+    ///
+    /// The detail line comes from `MCPApprovalCopy` with no targets, because that is the
+    /// same function the window calls *with* them: one set of words for a change, whether
+    /// it is being asked or shown, so the two cannot drift into describing different
+    /// actions. The arguments ride along because the window needs them to resolve the
+    /// membership this approval will cover — `force` and the id are not recoverable from
+    /// the sentence.
     static func request(
         for tool: ToolDefinition, arguments: [String: String]
     ) -> MCPApprovalRequest {
         let id = arguments["id"] ?? ""
-        let force = (arguments["force"] ?? "false").lowercased() == "true"
+        let kind: MCPApprovalRequest.Kind
+        let summary: String
         switch tool.name {
         case "quit_app":
-            return MCPApprovalRequest(
-                kind: .quitApp,
-                summary: "Quit \(id)?",
-                detail: force
-                    ? "Quit every process of \(id) without asking it to save first."
-                    : "Quit every process of \(id), asking each to close cleanly first."
-            )
+            kind = .quitApp
+            summary = "Quit \(id)?"
         case "stop_container":
-            return MCPApprovalRequest(
-                kind: .stopContainer,
-                summary: "Stop container \(id)?",
-                detail: "Run 'docker stop \(id)', which asks the container's own entrypoint to shut down."
-            )
+            kind = .stopContainer
+            summary = "Stop container \(id)?"
         case "stop_project":
-            return MCPApprovalRequest(
-                kind: .stopProject,
-                summary: "Stop project \(id)?",
-                detail: "Quit every process belonging to \(id), asking each to close cleanly first."
-            )
+            kind = .stopProject
+            summary = "Stop project \(id)?"
         case "set_preference":
-            let key = arguments["key"] ?? ""
-            let value = arguments["value"] ?? ""
-            return MCPApprovalRequest(
-                kind: .setPreference,
-                summary: "Change \(key) to \(value)?",
-                detail: "Change Portmaster's \(key) preference to \(value)."
-            )
+            kind = .setPreference
+            summary = "Change \(arguments["key"] ?? "") to \(arguments["value"] ?? "")?"
         default:
             // Unreachable for any declared mutation; a mutation added to the catalog
             // without a case here is asked about generically rather than silently,
-            // because a prompt with no name in it is not one a person can answer.
+            // because a prompt with no name in it is not one a person can answer. The
+            // kind is the one whose copy needs no target list, so the window can still
+            // show it without inventing targets it does not have.
             return MCPApprovalRequest(
                 kind: .setPreference,
                 summary: "Run \(tool.name)?",
-                detail: "An AI client asked Portmaster to run \(tool.name)."
+                detail: "An AI client asked Portmaster to run \(tool.name).",
+                arguments: arguments
             )
         }
+        return MCPApprovalRequest(
+            kind: kind,
+            summary: summary,
+            detail: MCPApprovalCopy.detail(for: kind, arguments: arguments, targets: []),
+            arguments: arguments
+        )
     }
 
     // MARK: - Running, refusing, recording

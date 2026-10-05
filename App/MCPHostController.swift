@@ -72,6 +72,14 @@ final class MCPHostController: ObservableObject {
     /// distinguish "no window" from "a window that does nothing", and this one has to.
     var approvalPresenter: ((MCPApprovalRequest) -> Void)?
 
+    /// The window `presentConfirmation` puts requests in, when there is one.
+    ///
+    /// Not `approvalPresenter`'s job to own: the presenter is a seam that can be absent
+    /// (a headless launch, a test), and the rule that a request nobody can answer must be
+    /// answered at once belongs with the broker rather than inside whatever the app
+    /// happened to install. `nil` is that case, and it is answered like any other.
+    @MainActor var confirmationWindow: MCPConfirmationWindow?
+
     @Published private(set) var status: MCPHostStatus = .notRunning
     /// The MCP server's own mutation policy, mirrored for display.
     ///
@@ -153,6 +161,11 @@ final class MCPHostController: ObservableObject {
     func stop() async {
         // First, so nothing is left waiting on a person who is already leaving.
         await broker.cancelAll(reason: Self.quittingReason)
+        // Then the window goes with them: the pending requests are already answered, so a
+        // window still asking about one would offer a button that goes nowhere. Its own
+        // close path cannot double-answer — `decide` ignores an id the broker no longer
+        // holds.
+        confirmationWindow?.dismiss()
         guard let host else {
             status = .notRunning
             return
@@ -284,10 +297,74 @@ final class MCPHostController: ObservableObject {
     /// wait followed by a refusal nobody asked for in time.
     private func presentToUser(_ request: MCPApprovalRequest) {
         guard let approvalPresenter else {
-            Task { await broker.decide(id: request.id, outcome: .denied(reason: Self.noPresenterReason)) }
+            denyNow(request, reason: Self.noPresenterReason)
             return
         }
         approvalPresenter(request)
+    }
+
+    /// Puts `request` in `confirmationWindow`, or answers it here.
+    ///
+    /// Async because of the warm, and the warm is not optional. The window resolves the
+    /// membership an approval would cover from the app's published reading, and the
+    /// executor recomputes that membership from a *fresh* one once the approval arrives —
+    /// so asking about a list read ten minutes ago would let an approval cover processes
+    /// the person was never shown, with the window's own copy ("only the processes listed
+    /// above") making the claim. Waking the sampler first is what makes that promise
+    /// true; `resumeOnce` rather than `noteUserActivity`, for the reason
+    /// `LiveAppView.snapshot` gives — a tool call is not a person at the keyboard, and it
+    /// must not hold a menu-bar app sampling on its background cadence.
+    ///
+    /// Bounded by the wake budget, and inside the broker's own 60 seconds rather than
+    /// added to them: the budget was armed when the request was queued, and this window
+    /// opening is part of what that budget pays for.
+    @MainActor
+    func presentConfirmation(_ request: MCPApprovalRequest) async {
+        // Only a stop needs a reading. A preference change depends on the user's
+        // preferences, not on a sampler, so it is never held up by one that is asleep —
+        // and never refused by one that cannot be woken.
+        if Self.needsReading(request) {
+            do {
+                _ = try await live.snapshot()
+            } catch let error as MCPToolError {
+                // The same refusal the tool would have given, at once. `notReadyMessage`
+                // is `OnDemandProvider`'s, so a client cannot be told "no reading yet"
+                // here and something else by the proxied path.
+                denyNow(request, reason: error.message)
+                return
+            } catch {
+                denyNow(request, reason: "\(error.localizedDescription)")
+                return
+            }
+        }
+        guard let confirmationWindow, confirmationWindow.present(request, broker: broker) else {
+            // A window that would not open is a refusal, not a wait: nobody is going to
+            // answer a prompt that is not on screen.
+            denyNow(request, reason: MCPApprovalCopy.couldNotPresentReason)
+            return
+        }
+    }
+
+    /// Whether resolving this request depends on the app's current reading.
+    ///
+    /// A quit and a project are decided by which processes exist right now, so they are
+    /// refused when no reading can be had. A container stop and a preference change are
+    /// not: the first is docker's business and the second is the preferences blob's, and
+    /// both would be refused by their own path with their own words if they could not be
+    /// performed.
+    static func needsReading(_ request: MCPApprovalRequest) -> Bool {
+        switch request.kind {
+        case .quitApp, .stopProject: return true
+        case .stopContainer, .setPreference: return false
+        }
+    }
+
+    /// Answers a request now, with a reason the AI client can read.
+    ///
+    /// The one place a request can end without a person, so every reason that reaches
+    /// it is written here or in `MCPApprovalCopy` — never assembled at a call site.
+    private func denyNow(_ request: MCPApprovalRequest, reason: String) {
+        Task { await broker.decide(id: request.id, outcome: .denied(reason: reason)) }
     }
 
     /// Said when a mutation needs confirmation and there is no window to ask in.

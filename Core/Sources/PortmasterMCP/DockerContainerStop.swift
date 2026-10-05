@@ -47,16 +47,7 @@ public enum DockerContainerStop {
         runner: any ProcessRunning = SystemProcessRunner(),
         executable: @escaping @Sendable () -> String? = { DockerCollector.locate() }
     ) async throws -> StopReport {
-        // Availability first: with the daemon down or docker absent there is no
-        // container list to match against, and no stop to attempt.
-        if let refusal = OnDemandProvider.dockerUnavailableMessage(
-            docker.availability, container: id
-        ) {
-            throw refusal
-        }
-        guard docker.containers.contains(where: { $0.id == id || $0.name == id }) else {
-            throw OnDemandProvider.containerNotFound(id)
-        }
+        if let refusal = refusal(container: id, in: docker) { throw refusal }
         guard let path = executable() else {
             // The sample said docker was there; it is not now.
             throw OnDemandProvider.dockerCommandUnavailableMessage(container: id)
@@ -79,6 +70,30 @@ public enum DockerContainerStop {
             ? .stopped
             : .failed(message: failureMessage(outcome))
         return StopReport(results: [id: StopReport.value(for: status)])
+    }
+
+    /// Why `id` cannot be stopped against `docker`, or `nil` when it can.
+    ///
+    /// Split out of `stop` so the same question can be asked *before* anything runs:
+    /// the app's confirmation window asks it to decide whether a person should be troubled
+    /// with the request at all. One implementation, because a pre-check that disagreed
+    /// with the stop would either ask about a container that is not there, or refuse one
+    /// that is.
+    ///
+    /// Availability first: with the daemon down or docker absent there is no container
+    /// list to match against, and no stop to attempt. The missing-CLI case is *not*
+    /// answered here — that one needs a lookup this function does not make, so it stays
+    /// in `stop`.
+    public static func refusal(container id: String, in docker: DockerSample) -> MCPToolError? {
+        if let refusal = OnDemandProvider.dockerUnavailableMessage(
+            docker.availability, container: id
+        ) {
+            return refusal
+        }
+        guard docker.containers.contains(where: { $0.id == id || $0.name == id }) else {
+            return OnDemandProvider.containerNotFound(id)
+        }
+        return nil
     }
 
     /// Docker's own explanation, first line, or the exit status when docker said

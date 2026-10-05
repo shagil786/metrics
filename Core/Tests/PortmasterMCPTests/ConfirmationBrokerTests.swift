@@ -402,6 +402,73 @@ final class ConfirmationBrokerTests: XCTestCase {
         XCTAssertEqual(firstOutcome, .approved)
     }
 
+    // MARK: - What a presenter can count down to
+
+    /// A presenter shows the remaining budget, and the only honest source for that is
+    /// the deadline the budget task was armed with. A presenter that counted from its
+    /// own arrival would be measuring a different clock: the budget starts when the
+    /// request is *made*, so a request queued behind others — or one whose window took
+    /// a moment to appear — has less time left than the presenter thinks.
+    func testThePendingDeadlineIsTheBudgetsOwn() async throws {
+        let clock = FakeClock()
+        let broker = ConfirmationBroker(
+            timeout: ConfirmationBroker.defaultTimeout, clock: { clock.now }
+        )
+        let empty = await broker.pendingDeadline
+        XCTAssertNil(empty, "nothing is waiting, so there is no deadline to show")
+
+        let (box, _) = start(broker, makeRequest())
+        await waitForPending(broker, 1)
+        let armed = await broker.pendingDeadline
+        let deadline = try XCTUnwrap(armed)
+        XCTAssertEqual(
+            deadline.timeIntervalSince(clock.now),
+            ConfirmationBroker.defaultTimeout,
+            accuracy: 0.001,
+            "the deadline must be the armed budget, not the presenter's own clock"
+        )
+
+        let presented = await waitForPending(broker, 1)
+        let id = try XCTUnwrap(presented.first?.id)
+        await broker.decide(id: id, outcome: .approved)
+        _ = try await waitForOutcome(box)
+        let afterDecision = await broker.pendingDeadline
+        XCTAssertNil(afterDecision, "a decided request has no budget left to count down")
+    }
+
+    /// The deadline belongs to the request being presented, so it moves when the next
+    /// request takes its place rather than describing whoever arrived first.
+    func testTheDeadlineFollowsTheRequestBeingPresented() async throws {
+        let broker = ConfirmationBroker(timeout: 30)
+        let first = makeRequest(summary: "Quit Mail?")
+        let (firstBox, _) = start(broker, first)
+        await waitForPending(broker, 1)
+        let firstDeadlineBox = await broker.pendingDeadline
+        let firstDeadline = try XCTUnwrap(firstDeadlineBox)
+
+        let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
+        let (secondBox, _) = start(broker, second)
+        await waitForQueued(broker, 2)
+        let queued = await broker.pendingDeadline
+        let whileQueued = try XCTUnwrap(queued)
+        XCTAssertEqual(
+            whileQueued.timeIntervalSince(firstDeadline), 0, accuracy: 0.001,
+            "the request being presented is still the first one"
+        )
+
+        await broker.decide(id: first.id, outcome: .approved)
+        _ = try await waitForOutcome(firstBox)
+        await waitForPending(broker, 1)
+        let next = await broker.pendingDeadline
+        let secondDeadline = try XCTUnwrap(next)
+        XCTAssertGreaterThan(
+            secondDeadline, firstDeadline,
+            "the next request was made later, so its own budget ends later"
+        )
+        await broker.decide(id: second.id, outcome: .approved)
+        _ = try await waitForOutcome(secondBox)
+    }
+
     // MARK: - The clock is real, not decorative
 
     /// The budget is measured against the injected clock, not against wall time.

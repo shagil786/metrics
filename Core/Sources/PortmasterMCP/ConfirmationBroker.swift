@@ -19,12 +19,27 @@ public struct MCPApprovalRequest: Identifiable, Sendable {
     public let summary: String
     /// The exact affected targets or key/value, in plain language.
     public let detail: String
+    /// The normalized tool arguments this request is about.
+    ///
+    /// Carried rather than re-derived, because a presenter holding a request cannot
+    /// work out what to resolve from a sentence: the app id, the project path and
+    /// `force` are all inside these, and each decides *which* processes an approval
+    /// covers. Defaults to empty so a caller that only wants to show a sentence still
+    /// can; `HostMCPCallContext` fills it with what the executor validated.
+    public let arguments: [String: String]
 
-    public init(id: UUID = UUID(), kind: Kind, summary: String, detail: String) {
+    public init(
+        id: UUID = UUID(),
+        kind: Kind,
+        summary: String,
+        detail: String,
+        arguments: [String: String] = [:]
+    ) {
         self.id = id
         self.kind = kind
         self.summary = summary
         self.detail = detail
+        self.arguments = arguments
     }
 }
 
@@ -143,6 +158,16 @@ public actor ConfirmationBroker {
     /// nor a caller that it is in the queue at all. This is the count to watch for
     /// "one shown, N-1 waiting"; the depth can be read without disturbing anything.
     public var queuedCount: Int { queue.count }
+
+    /// When the request being presented runs out of budget. `nil` when nothing is
+    /// waiting.
+    ///
+    /// The deadline the budget task was armed with, not a fresh one — a presenter
+    /// counts this down so a person can see the limit they are working against, and the
+    /// only honest number for that is the one the broker will actually enforce. Counting
+    /// from the presenter's own arrival would overstate it, because the budget starts
+    /// when the request is *made* and the window's own opening time is inside it.
+    public var pendingDeadline: Date? { queue.first?.deadline }
 
     /// Suspends until this request is decided, denied in bulk, or times out. Every
     /// accepted request returns an outcome, so nothing about this call can fail —

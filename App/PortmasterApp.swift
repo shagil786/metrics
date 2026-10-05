@@ -48,6 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var mainWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var welcomeWindow: NSWindow?
+    /// Where an AI client's `confirmEach` request is put to a person. Owned here for the
+    /// same reason as the other windows: it has to be reachable from a menu-bar-only app
+    /// with no other window open. `MCPHostController` holds the same object as its
+    /// `confirmationWindow`, which is how `stop()` can take it down on the way out.
+    @MainActor private var mcpConfirmationWindow: MCPConfirmationWindow?
     @MainActor let updates = UpdateController()
     /// The app as an MCP host. Owned here because this delegate owns the app's other
     /// long-lived machinery (status item, shortcuts, extra windows) and the host has
@@ -65,6 +70,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PortmasterShortcuts.updateAppShortcutParameters()
         // Once per launch, not per surface: the host is a socket, not a window.
         mcpHost.start()
+        // …and once per launch, the window its confirmations are asked in. Created here
+        // rather than on the first request so the first request does not pay for it, and
+        // installed unconditionally: with no presenter the host denies a confirmation
+        // immediately with a reason, and there is no reason a request should find the
+        // app without one.
+        let confirmation = MCPConfirmationWindow()
+        mcpConfirmationWindow = confirmation
+        mcpHost.confirmationWindow = confirmation
+        //
+        // Weak, and the only thing a nil delegate can cost is a request that waits out
+        // its budget: `Self.shared` is set at launch and never cleared, so a nil here
+        // means the app is already on its way out — and `MCPHostController.stop` has
+        // denied every pending request by then. Capturing the host instead would be a
+        // cycle the controller owns and only `stop()` breaks.
+        mcpHost.approvalPresenter = { [weak self] request in
+            Task { @MainActor in
+                await self?.mcpHost.presentConfirmation(request)
+            }
+        }
         // User activity unpauses sampling after the idle pause.
         let center = NSWorkspace.shared.notificationCenter
         activityCancellable = center.addObserver(
