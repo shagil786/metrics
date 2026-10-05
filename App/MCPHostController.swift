@@ -18,10 +18,13 @@
 //
 // Three properties this file has to keep:
 //
-//  1. **Nothing here runs per sample.** The host starts once, mirroring is one
-//     Combine subscription, and no read the tool surface does touches the main
-//     actor. A feature that is off costs one bound socket and one thread parked in
-//     `poll`.
+//  1. **Nothing here runs per sample.** The host starts once; mirroring is one
+//     Combine subscription that *coalesces* — at most one pass in flight, and none at
+//     all while no client is connected, so a burst of `@Published` writes (every
+//     sample tick writes five) costs one copy rather than five, and an idle app costs
+//     none. The one read that can still touch the main actor is a snapshot the mirror
+//     could not answer (`LiveAppView.snapshot`), and it hops once and re-reads. A
+//     feature with nobody on it costs one bound socket and one thread in `poll`.
 //  2. **The app is the writer.** Preference writes go through `AppModel.prefs`, so
 //     the running app cannot clobber itself, and no `MCPSettings` file is written
 //     behind the app's back — `mcpMode` is intercepted by the executor before the
@@ -92,13 +95,19 @@ final class MCPHostController: ObservableObject {
     private let live: LiveAppView
     private var host: MCPHostServer?
     private var mirror: AnyCancellable?
+    /// Whether a mirror pass is already queued. See `scheduleMirrorPass`.
+    private var mirrorPassPending = false
 
     init(directory: URL? = nil) {
         self.directory = directory
         live = LiveAppView(loadMode: { MCPSettings.load(directory: directory).mode })
-        // Read once here so Settings has something honest to show before the host
-        // starts; `refreshFromSettings()` is what keeps it honest afterwards.
-        mode = MCPSettings.load(directory: directory).mode
+        // The documented default rather than a read of the file: this runs before
+        // `applicationDidFinishLaunching`, so a read here would be a file open on a
+        // path that may be replaced moments later, and a mode read too early is
+        // wrong for longer than it is right. `start()` reads the file before any
+        // surface can show anything, and `refreshFromSettings()` reads it every time
+        // Settings opens.
+        mode = MCPSettings.defaultMode
     }
 
     // MARK: - Lifecycle
@@ -126,6 +135,13 @@ final class MCPHostController: ObservableObject {
         status = .listening(socket: started.socketURL)
         refreshClients()
     }
+
+    /// Whether a host is bound and serving.
+    ///
+    /// Read by `applicationShouldTerminate` to answer `.terminateNow` without an await
+    /// when there is nothing to stop — which is the case for every launch whose bind
+    /// failed, and for any quit after `stop()`.
+    var isRunning: Bool { host != nil }
 
     /// Denies every pending approval, stops serving, and removes the socket and the
     /// endpoint file.
@@ -167,13 +183,23 @@ final class MCPHostController: ObservableObject {
         mode = MCPSettings.load(directory: directory).mode
     }
 
-    /// Republishes who is connected.
+    /// Republishes who is connected, and makes sure the mirror is current.
     ///
     /// Called rather than polled: the host holds the live list, and Settings is the
     /// only reader, so a timer would wake a menu-bar app once a second to update a
-    /// row nobody is looking at.
+    /// row nobody is looking at. `openSettingsWindow()` calls this for the same reason
+    /// it calls `refreshFromSettings()` — a client can connect, ask and disconnect
+    /// entirely between two openings, so the list has to be read at the moment it is
+    /// shown.
+    ///
+    /// The mirror pass matters as much as the list here: mirroring is skipped while no
+    /// client is connected (see `scheduleMirrorPass`), so the moment a client
+    /// connects is the moment the mirror has to be brought up to date — otherwise the
+    /// first tool call of the first session could read a snapshot from before it
+    /// connected.
     func refreshClients() {
         clients = host?.connectedClients() ?? []
+        if !clients.isEmpty { scheduleMirrorPass() }
     }
 
     /// Changes the mutation policy and persists it.
@@ -245,12 +271,12 @@ final class MCPHostController: ObservableObject {
     private func makeProvider() -> LiveDataProvider {
         let live = self.live
         return LiveDataProvider(
-            snapshot: { try live.snapshot() },
+            snapshot: { try await live.snapshot() },
             alerts: { live.alerts() },
             history: { live.history() },
             settings: { live.settingsSnapshot() },
             // The app owns the write, so the app is what writes.
-            applyPreference: { key, value in try live.applyPreference(key: key, value: value) },
+            applyPreference: { key, value in try await live.applyPreference(key: key, value: value) },
             stopApp: { id, force in try await live.stopApp(id: id, force: force) },
             stopContainerNamed: { id in try await live.stopContainer(id: id) },
             stopProject: { id in try await live.stopProject(id: id) }
@@ -295,9 +321,14 @@ final class MCPHostController: ObservableObject {
 
     /// Keeps the mirror current for as long as the controller is alive.
     ///
-    /// One subscription, installed once at `start`, plus a first copy. This is the
-    /// whole cost of the feature while it is up: nothing here runs per sample, and
-    /// nothing wakes the app to look for changes.
+    /// One subscription, installed once at `start`, plus a first copy.
+    ///
+    /// It is subscribed to `objectWillChange`, which fires on *every* `@Published`
+    /// mutation — and the per-sample sink alone writes five of them, so an
+    /// uncoalesced subscription would copy a whole `ObservationSnapshot` once per
+    /// sample tick, for the life of the process, whether or not anything on the
+    /// machine was reading it. Hence `scheduleMirrorPass`, which is where the two
+    /// rules live: one pass at a time, and none while nobody is connected.
     func startMirroring() {
         guard mirror == nil else { return }
         refreshFromSettings()
@@ -308,252 +339,35 @@ final class MCPHostController: ObservableObject {
         // honest without touching this file.
         mirror = AppModel.shared.objectWillChange
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                // `@Published` fires *before* the value changes, so copying here would
-                // mirror the value the app is about to replace. One main-actor turn
-                // later — after the setter has returned — is what the new value is
-                // visible on.
-                Task { @MainActor [weak self] in self?.live.publishFromModel() }
-            }
-    }
-}
-
-/// The app's published state, mirrored for the MCP tool path, plus the mutations that
-/// only the app may perform.
-///
-/// `LiveDataProvider` reads three things from the app — the latest snapshot, the
-/// current alerts, the current preferences — and **two of its three closures are
-/// synchronous**. A synchronous read of main-actor state has exactly two options:
-/// block the main thread, or read a copy. Blocking is the wrong one: an MCP call
-/// would sit behind whatever the UI is doing, and a socket thread that can make the
-/// main thread wait is a deadlock waiting for a busy frame. So the three values are
-/// mirrored into a lock-protected box, updated on the main actor, and every closure
-/// reads the box.
-///
-/// That is not a weaker answer. The app publishes these on the main actor and nothing
-/// else writes them, so the mirror holds the value the hop would have returned; the
-/// only difference is that a read does not wait for an update that is in flight.
-final class LiveAppView: @unchecked Sendable {
-
-    private let lock = NSLock()
-    private var currentSnapshot: ObservationSnapshot = .empty
-    private var currentAlerts: AlertsSnapshot = AlertsSnapshot(source: .live, alerts: [])
-    private var currentPreferences = LiveAppView.placeholderPreferences
-    private var currentHistory: @Sendable () -> any HistoryReading = {
-        UnavailableHistoryReading(message: "Portmaster has not published its history yet.")
-    }
-    /// Where the mutation policy is read from. A closure because it is the app's
-    /// configuration, not this type's business — and because a test seam is the only
-    /// reason `directory` exists anywhere above either.
-    private let loadMode: @Sendable () -> MCPMutationMode
-
-    init(loadMode: @escaping @Sendable () -> MCPMutationMode) {
-        self.loadMode = loadMode
+            .sink { [weak self] _ in self?.scheduleMirrorPass() }
     }
 
-    // MARK: Mirroring (main actor)
-
-    /// Copies whatever the app is holding right now.
-    @MainActor
-    func publishFromModel() {
-        let model = AppModel.shared
-        let snapshot = model.snapshot
-        let alerts = model.alerts
-        let preferences = model.prefs
-        lock.withLock {
-            currentSnapshot = snapshot
-            currentAlerts = AlertsSnapshot(source: .live, alerts: alerts)
-            currentPreferences = preferences
+    /// Queues at most one mirror pass, and only when someone could read it.
+    ///
+    /// Coalescing because the notifications arrive in bursts and a pass reads a value
+    /// that is the same for all of them: five writes inside one sample tick need one
+    /// copy, and the pass runs *after* the turn that wrote them, so it sees the last
+    /// one. The flag is cleared inside the task rather than before it, so a change
+    /// that lands while a pass is in flight queues the next one instead of being
+    /// dropped — losing the *last* notification before the next tick is how a mirror
+    /// ends up one tick stale forever.
+    ///
+    /// Gating on a connected client because the mirror exists only to be read: with
+    /// nobody connected there is no caller to answer, and this is the difference
+    /// between a menu-bar app that samples all day and one that also copies a
+    /// snapshot on every tick for nobody. `refreshClients()` re-arms it the moment a
+    /// client is there, so nothing is ever read from a mirror that was switched off.
+    private func scheduleMirrorPass() {
+        guard !mirrorPassPending else { return }
+        guard host?.connectedClients().isEmpty == false else { return }
+        mirrorPassPending = true
+        // `@Published` fires *before* the value changes, so the copy cannot happen
+        // inside the notification: one main-actor turn later — after the setters have
+        // returned — is when the new values are visible.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.live.publishFromModel()
+            self.mirrorPassPending = false
         }
     }
-
-    /// Republishes the history reader, once the app's store is known.
-    @MainActor
-    func publishHistory(_ history: @escaping @Sendable () -> any HistoryReading) {
-        lock.withLock { currentHistory = history }
-    }
-
-    // MARK: Reading (any thread)
-
-    /// The app's latest published reading, or the one refusal both providers use.
-    ///
-    /// `.empty` is what the app holds before its first sweep, and an empty reading is
-    /// not a reading: it would be a claim about the machine that nobody took. So
-    /// absence arrives as a throw, in `OnDemandProvider`'s own words — the constant
-    /// rather than the string, so this cannot drift from the on-demand path.
-    func snapshot() throws -> ObservationSnapshot {
-        let snapshot = lock.withLock { currentSnapshot }
-        guard snapshot.at != .distantPast else {
-            throw MCPToolError.samplerNotReady
-        }
-        return snapshot
-    }
-
-    func alerts() -> AlertsSnapshot { lock.withLock { currentAlerts } }
-
-    /// The app's preferences as `get_settings` reports them.
-    ///
-    /// **The mutation mode is read from the policy file on every call, not from the
-    /// mirror.** A client that just changed it through `set_preference` must see its
-    /// own change in the very next `get_settings`, and the mirror is only refreshed
-    /// when the app publishes something or Settings opens — so mirroring the mode
-    /// would let the server report a policy the file no longer holds. The read is one
-    /// small JSON file, on a tool call a client has already asked for.
-    func settingsSnapshot() -> SettingsSnapshot {
-        Self.settings(from: lock.withLock { currentPreferences }, mode: loadMode())
-    }
-
-    /// The app's history, opened on the first history question and kept.
-    ///
-    /// The factory runs under the lock, which is safe because this one only hands back
-    /// a reader the controller already built — not a store to open. `LazyHistory` on
-    /// the provider's side is what actually makes "opened once" true.
-    func history() -> any HistoryReading { lock.withLock { currentHistory() } }
-
-    // MARK: Mutations (hop to the app)
-
-    /// Applies one allowlisted preference, through the app.
-    ///
-    /// `PreferencesStore.apply` is the on-demand path's own mapping — the same
-    /// enums, the same refusals, the same case-insensitive reading of a value — so a
-    /// client that can reach either provider cannot have a value applied by one and
-    /// refused by the other. `LiveDataProvider` has already validated the key and
-    /// value through `validate`, so this cannot fail on either; it is called anyway
-    /// rather than assumed, because "the check happened elsewhere" is not a reason to
-    /// drop the check that protects the user's preferences.
-    ///
-    /// Assigned back to `prefs` rather than mutated in place, so `didSet` saves the
-    /// blob exactly as the Settings screen does.
-    ///
-    /// The one place this type blocks, and the reason is the provider's signature
-    /// rather than a choice: `applyPreference` is synchronous, so a main-actor write
-    /// has to be waited on rather than awaited. It cannot deadlock — the main thread
-    /// never waits for an MCP call, and this only runs once the gate has approved the
-    /// mutation — and `assumeIsolated` states the invariant the hop depends on rather
-    /// than hiding it.
-    func applyPreference(key: String, value: String) throws {
-        @MainActor
-        func write() throws {
-            let model = AppModel.shared
-            var preferences = model.prefs
-            try PreferencesStore.apply(key: key, value: value, to: &preferences)
-            model.prefs = preferences
-        }
-        if Thread.isMainThread {
-            return try MainActor.assumeIsolated { try write() }
-        }
-        return try DispatchQueue.main.sync { try MainActor.assumeIsolated { try write() } }
-    }
-
-    /// Quits an app's processes, as the app would.
-    ///
-    /// Membership comes from the app's own published reading through the app's own
-    /// `stopTarget`, so the list the coordinator signals is the one a person would
-    /// see in the same stop from the UI — and the coordinator re-verifies each pid's
-    /// identity immediately before signalling it.
-    func stopApp(id: String, force: Bool) async throws -> StopReport {
-        try await Self.refusePreviewData()
-        let snapshot = try snapshot()
-        guard let rollup = snapshot.rollups.first(where: { $0.id == id }) else {
-            throw OnDemandProvider.appNotFound(id)
-        }
-        // `project: nil` for the same reason the menu's own app stop passes nil: an
-        // app's processes are not a project, and naming one here would put the wrong
-        // label in `StopTarget`.
-        let target = await AppModel.shared.stopTarget(
-            name: rollup.displayName,
-            project: nil,
-            members: ConfirmedStopPlan.ordered(rollup.processes)
-        )
-        guard !target.members.isEmpty else {
-            throw OnDemandProvider.noRunningProcessesMessage(for: rollup.displayName)
-        }
-        return await Self.stop(target.members, force: force)
-    }
-
-    /// Stops a project's processes, through the app's own project target.
-    func stopProject(id: String) async throws -> StopReport {
-        try await Self.refusePreviewData()
-        let target = await AppModel.shared.projectStopTarget(id)
-        guard !target.members.isEmpty else {
-            throw OnDemandProvider.noRunningProcessesMessage(forProject: id)
-        }
-        return await Self.stop(target.members, force: false)
-    }
-
-    /// Stops a container through the docker CLI.
-    ///
-    /// The same `DockerContainerStop` the on-demand path runs, so the argv, the
-    /// refusals and the wording are one implementation. Only the "not known yet"
-    /// refusal is this path's own, because only this path knows whether the app's
-    /// docker pass has landed.
-    func stopContainer(id: String) async throws -> StopReport {
-        try await Self.refusePreviewData()
-        let snapshot = try snapshot()
-        guard let docker = snapshot.docker else {
-            throw MCPToolError(message: OnDemandProvider.dockerNotKnownMessage)
-        }
-        return try await DockerContainerStop.stop(container: id, in: docker)
-    }
-
-    /// Signals confirmed targets and reports what happened to each pid.
-    ///
-    /// Keyed by pid as a string, the way `StopReport` carries them on the wire — the
-    /// same mapping the on-demand path makes, so a stop reads identically whichever
-    /// provider performed it.
-    private static func stop(_ members: [ConfirmedProcess], force: Bool) async -> StopReport {
-        let coordinator = await AppModel.shared.stopCoordinator
-        let outcomes = await coordinator.stopConfirmed(members, force: force)
-        return StopReport(results: Dictionary(uniqueKeysWithValues: outcomes.map { outcome in
-            (String(outcome.key), StopReport.value(for: outcome.value.status))
-        }))
-    }
-
-    /// Refuses a mutation while Portmaster is showing preview data.
-    ///
-    /// The app's own stop controls are disabled in preview mode for the same reason:
-    /// an id in a sample reading is not a process, and the one thing
-    /// `StopCoordinator` re-checks is whether a pid is the process it was — not
-    /// whether it was ever the app an AI client asked about. The MCP path does not go
-    /// through those controls, so it has to carry the rule itself.
-    ///
-    /// Preferences are not covered: `PreferencesStore.apply` writes the user's real
-    /// preferences whatever the sampler is showing.
-    private static func refusePreviewData() async throws {
-        guard await AppModel.shared.prefs.fixtureMode else { return }
-        throw MCPToolError(message: previewDataStopRefusal)
-    }
-
-    /// Said when a stop is asked for while Portmaster is showing preview data.
-    static let previewDataStopRefusal =
-        "Portmaster is showing preview data, so nothing was stopped. "
-        + "Turn preview data off in Settings to let AI clients stop processes."
-
-
-    // MARK: Settings
-
-    /// The app's preferences as `get_settings` reports them.
-    ///
-    /// Six fields from `AppPreferences`, one from `MCPSettings` — and the split is
-    /// the point: `mutationMode` is the MCP server's own policy, not something the
-    /// app's preferences blob can hold, so it is read from the file the executor
-    /// enforces it from rather than from memory that could disagree with it.
-    private static func settings(
-        from preferences: AppPreferences, mode: MCPMutationMode
-    ) -> SettingsSnapshot {
-        SettingsSnapshot(
-            temperatureUnit: preferences.presentation.temperatureUnit.rawValue,
-            networkUnit: preferences.presentation.networkUnit.rawValue,
-            cpuScale: preferences.presentation.cpuScale.rawValue,
-            temperatureSource: preferences.presentation.temperatureSource.rawValue,
-            compactMenuBar: preferences.presentation.compact,
-            mutationMode: mode.rawValue,
-            alertsEnabled: preferences.alertsEnabled,
-            retention: preferences.retention.rawValue
-        )
-    }
-
-    /// A value to hold before the app has published anything. Never reported: the
-    /// controller mirrors before it starts serving, and the mode is read per call.
-    private static let placeholderPreferences = AppPreferences()
 }
