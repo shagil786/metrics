@@ -250,16 +250,15 @@ final class ConfirmationWindowPlacementTests: XCTestCase {
         )
     }
 
-    /// The fallback lands away from the window's buttons.
+    /// The fallback keeps the cursor off the buttons, and is asserted rather than inferred.
     ///
     /// Pinning it to the top unconditionally — round 3's behaviour — is what this
-    /// replaces. With the window at the top, a mid-band cursor comes to rest against the
-    /// window's *bottom* edge, and the bottom is where Approve and Deny are. The rule now
-    /// splits the screen at the midpoint of the bottom placement, so a cursor in the band
-    /// ends up near the title bar instead.
+    /// replaces: with the window at the top a mid-band cursor comes to rest against the
+    /// window's bottom edge, and the bottom is where Approve and Deny are.
     ///
-    /// Both halves of the band are covered on both short screens, because the behaviour
-    /// this replaces only shows on one of them.
+    /// Each case carries its own expectation in the tuple rather than branching on a
+    /// label, so renaming a case fails loudly instead of silently skipping the assertion —
+    /// which is what round 4 did: it skipped a containment check by comparing a string.
     func testTheFallbackKeepsTheCursorAwayFromTheButtons() {
         let clearance = ConfirmationWindowPlacement.clearance
         for (name, screen) in [
@@ -272,43 +271,64 @@ final class ConfirmationWindowPlacementTests: XCTestCase {
             let clearedLow = screen.maxY - Self.frameHeight - clearance
             let clearedHigh = screen.minY + Self.frameHeight + clearance
             let split = screen.minY + Self.frameHeight / 2
+            let cases: [(label: String, pointer: NSPoint, covers: Bool)] = [
+                ("lower half of the band", NSPoint(x: screen.midX, y: clearedLow + 20), true),
+                ("upper half of the band", NSPoint(x: screen.midX, y: clearedHigh - 20), false),
+                ("middle of the band",
+                 NSPoint(x: screen.midX, y: (clearedLow + clearedHigh) / 2), true),
+            ]
 
-            for (label, pointer) in [
-                ("lower half of the band", NSPoint(x: screen.midX, y: clearedLow + 20)),
-                ("upper half of the band", NSPoint(x: screen.midX, y: clearedHigh - 20)),
-                ("middle of the band", NSPoint(x: screen.midX, y: (clearedLow + clearedHigh) / 2)),
-            ] {
+            for (label, pointer, covers) in cases {
                 let origin = ConfirmationWindowPlacement.frameOrigin(
                     contentWidth: Self.contentWidth, frameHeight: Self.frameHeight,
                     pointer: pointer, visibleFrame: screen
                 )
                 let frame = Self.frame(origin: origin)
+                let why = "\(name), \(label): frame \(frame), pointer \(pointer)"
 
-                if label != "upper half of the band" {
-                    XCTAssertTrue(
-                        frame.contains(pointer),
-                        "\(name), \(label): this half of the band is covered by the "
-                            + "fallback, which is the documented exception"
-                    )
-                }
+                // Stated per case, not derived. The upper half of the band ends up
+                // *uncovered* — the window sits below the cursor — which is strictly
+                // better than covering it, and round 3's unconditional top placement would
+                // have covered it and put the cursor on the buttons.
+                XCTAssertEqual(
+                    frame.contains(pointer), covers,
+                    "\(why): covered = \(covers)"
+                )
                 XCTAssertEqual(
                     frame.minY,
                     pointer.y < split ? screen.maxY - Self.frameHeight : screen.minY,
                     accuracy: 0.001,
-                    "\(name), \(label): the split is at the midpoint of the bottom placement"
+                    "\(why): the split is at the midpoint of the bottom placement"
                 )
-                // The property the change is for. In y-up space `maxY` is the title bar
-                // and `minY` is the footer, where the two buttons are. (The upper half of
-                // the band ends up *uncovered* — the window sits below the cursor — which
-                // is strictly better than covering it; round 3's unconditional top
-                // placement would have covered it and put the cursor on the buttons.)
+                // And the property the change is for. In y-up space `maxY` is the title
+                // bar and `minY` is the footer, where the two buttons are.
                 XCTAssertLessThan(
                     abs(frame.maxY - pointer.y), abs(frame.minY - pointer.y),
-                    "\(name), \(label): the cursor must rest nearer the title bar than "
-                        + "the buttons — frame \(frame), pointer \(pointer)"
+                    "\(why): the cursor must rest nearer the title bar than the buttons"
                 )
             }
         }
+    }
+
+    /// The clamp round 4 dropped, restored in round 5.
+    ///
+    /// Unreachable on a real display — a 488 pt window does not fit a sub-488 pt screen —
+    /// but the two ends of a window are not equal, and the clamp deliberately sacrifices
+    /// the footer: a prompt with its buttons cut off is worse than one with its heading
+    /// pushed off. Asserted on a frame deliberately taller than the screen so the
+    /// degenerate case is not left to a change in window size.
+    func testTheFallbackIsClampedWhenTheWindowIsTallerThanTheScreen() {
+        let tiny = NSRect(x: 0, y: 0, width: 800, height: 300)
+        let pointer = NSPoint(x: 400, y: 150)
+        let origin = ConfirmationWindowPlacement.frameOrigin(
+            contentWidth: Self.contentWidth, frameHeight: Self.frameHeight,
+            pointer: pointer, visibleFrame: tiny
+        )
+        XCTAssertEqual(
+            origin.y, tiny.minY, accuracy: 0.001,
+            "clamped to the bottom, so the title bar survives and the footer is cut"
+        )
+        XCTAssertGreaterThanOrEqual(origin.y, tiny.minY, "never below the visible area")
     }
 
     /// The numbers `fallback`'s doc quotes, evaluated rather than restated.

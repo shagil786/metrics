@@ -134,7 +134,7 @@ The Settings page also shows whether the server is listening (and on which socke
 
 ### Talking to a wedged app
 
-If Portmaster is running but not answering (the window is up, the tools hang), set `PORTMASTER_MCP=on-demand` in the environment your MCP client spawns the CLI in. The session then ignores the socket and does slice 1's own sweep, and says so on stderr. `PORTMASTER_MCP_ENDPOINT_DIR` points the CLI at a different `~/.portmaster` — a test seam, not something to set by hand.
+If Portmaster is running but not answering (the window is up, the tools hang), set `PORTMASTER_MCP=on-demand` in the environment your MCP client spawns the CLI in. The session then ignores the socket and does its own sweep, and says so on stderr: *"portmaster-mcp: no Portmaster answering on the socket; this session is doing its own sweep."* `PORTMASTER_MCP_ENDPOINT_DIR` points the CLI at a different `~/.portmaster` — a test seam, not something to set by hand.
 
 `set_preference` accepts only allowlisted keys: `compact`, `cpuScale`, `mcpMode`, `networkUnit`, `temperatureSource`, `temperatureUnit`. Anything else is rejected rather than ignored. Note the naming asymmetry: the key you *write* is `compact`, while `get_settings` *reports* that same preference as `compactMenuBar`.
 

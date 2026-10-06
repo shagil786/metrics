@@ -1,12 +1,14 @@
 // ConfirmationWindowPlacement: where the "Confirm AI Request" window may go.
 //
-// The one rule: **never under the pointer, wherever the screen is tall enough to put the
-// window entirely on one side of it.** Not "the button is disabled until the pointer
+// The one rule: **never under the pointer, wherever the screen is tall enough to put
+// the window entirely on one side of it.** Not "the button is disabled until the pointer
 // arrives" — never *under*. The window is a destructive consent prompt, and a prompt that
-// appears beneath a stationary cursor is one stray click from approving itself. That is not hypothetical: three end-to-end runs recorded `outcome: "allowed"`
-// for a mutation nobody approved, and the measurement that explained it logged the
-// pointer at (457, 53) with the window at (0, 30, 520, 462) — the Approve button's
-// centre. Nothing had moved the pointer.
+// appears beneath a stationary cursor is one stray click from approving itself.
+//
+// That is not hypothetical: three end-to-end runs recorded `outcome: "allowed"` for a
+// mutation nobody approved, and the measurement that explained it logged the pointer at
+// (457, 53) with the window at (0, 30, 520, 462) — the Approve button's centre. Nothing
+// had moved the pointer.
 //
 // **Everything here is in *frame* space, not content space, and that distinction is the
 // whole reason this file exists.** `NSWindow(contentRect:)` positions the content; the
@@ -92,10 +94,11 @@ public enum ConfirmationWindowPlacement {
     ///
     /// (Round 2 of this comment claimed the fallback was only for displays under about
     /// 970 pt; round 3 quoted 1072 and a 364 pt band, which were wrong *and mutually
-    /// inconsistent* with the formula above them. The figures below are the formula
-    /// evaluated for this window, and `ConfirmationWindowPlacementTests` asserts each one
-    /// so they cannot go stale again — which is the only reason to trust a number written
-    /// in a comment.)
+    /// inconsistent* with the formula above them. `ConfirmationWindowPlacementTests` now
+    /// asserts the figures — but it asserts them for **a 460 pt content view with a 28 pt
+    /// title bar**, which is the frame height the test assumes. Production measures
+    /// whatever AppKit reports for the window it actually has, so treat those numbers as
+    /// worked examples of the formula, not as this app's constants.)
     ///
     /// The honest consequence: when the pointer is mid-screen, it *can* end up inside the
     /// frame, and the window's `onHover` gate is then the thing standing between a parked
@@ -110,13 +113,22 @@ public enum ConfirmationWindowPlacement {
     /// An improvement, not a fix: the pointer is inside the frame either way, which is
     /// what `fallback`'s own doc says, and the `onHover` gate is what prevents the click.
     /// What changes is which end of the window the cursor ends up near.
+    ///
+    /// **The result is clamped back into `visibleFrame`** — round 4 returned the two
+    /// placements raw and round 3 clamped. Restored, because the degenerate case it covers
+    /// is a window taller than the screen, and then something has to be cut: the clamp
+    /// sacrifices the *footer*, and the footer holds Deny. A prompt with its buttons cut
+    /// off is worse than one with its heading pushed off. Unreachable on any real display
+    /// — a 488 pt window on a sub-488 pt visible frame does not exist — but the cheap way
+    /// to lose the wrong end of a window is to not clamp at all.
     static func fallback(
         x: CGFloat, pointer: NSPoint, visibleFrame: NSRect, frameHeight: CGFloat
     ) -> NSPoint {
         let low = visibleFrame.minY + frameHeight / 2
+        let chosen = pointer.y < low ? visibleFrame.maxY - frameHeight : visibleFrame.minY
         return NSPoint(
             x: x,
-            y: pointer.y < low ? visibleFrame.maxY - frameHeight : visibleFrame.minY
+            y: max(visibleFrame.minY, min(chosen, visibleFrame.maxY - frameHeight))
         )
     }
 }
