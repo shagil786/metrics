@@ -314,8 +314,9 @@ final class ConfirmationWindowPlacementTests: XCTestCase {
     ///
     /// Unreachable on a real display — a 488 pt window does not fit a sub-488 pt screen —
     /// but the two ends of a window are not equal, and the clamp deliberately sacrifices
-    /// the footer: a prompt with its buttons cut off is worse than one with its heading
-    /// pushed off. Asserted on a frame deliberately taller than the screen so the
+    /// the **title bar**: a prompt whose heading is pushed off the top is worse than one
+    /// whose buttons are cut off at the bottom. Asserted on a frame deliberately taller
+    /// than the screen so the
     /// degenerate case is not left to a change in window size.
     func testTheFallbackIsClampedWhenTheWindowIsTallerThanTheScreen() {
         let tiny = NSRect(x: 0, y: 0, width: 800, height: 300)
@@ -326,7 +327,8 @@ final class ConfirmationWindowPlacementTests: XCTestCase {
         )
         XCTAssertEqual(
             origin.y, tiny.minY, accuracy: 0.001,
-            "clamped to the bottom, so the title bar survives and the footer is cut"
+            "clamped to the bottom of the screen: the origin is pinned to minY, so the "
+                + "TITLE BAR is what gets cut — the footer, with Deny and Approve, stays"
         )
         XCTAssertGreaterThanOrEqual(origin.y, tiny.minY, "never below the visible area")
     }

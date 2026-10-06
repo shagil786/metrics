@@ -116,9 +116,12 @@ public enum ConfirmationWindowPlacement {
     ///
     /// **The result is clamped back into `visibleFrame`** — round 4 returned the two
     /// placements raw and round 3 clamped. Restored, because the degenerate case it covers
-    /// is a window taller than the screen, and then something has to be cut: the clamp
-    /// sacrifices the *footer*, and the footer holds Deny. A prompt with its buttons cut
-    /// off is worse than one with its heading pushed off. Unreachable on any real display
+    /// is a window taller than the screen, and then something has to be cut. Clamping to
+    /// `minY` pins the window's **origin** to the bottom of the screen, so the part that
+    /// leaves is the **title bar** at the top — and the footer, which holds Deny, Approve
+    /// and the countdown, stays on screen. (Round 5 had this backwards and said the
+    /// opposite; the failing assertion in `ConfirmationWindowPlacementTests` now names the
+    /// title bar, because that is the string a red test prints.) Unreachable on any real display
     /// — a 488 pt window on a sub-488 pt visible frame does not exist — but the cheap way
     /// to lose the wrong end of a window is to not clamp at all.
     static func fallback(

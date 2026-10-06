@@ -10,9 +10,14 @@
 // So this reads `README.md` and checks the quoted fragments against the module. It is
 // deliberately narrow, and the split is the design:
 //
-//   - **prose that quotes code** is asserted here — a fragment the README prints must
-//     exist in the source it names, or a constant's value must appear in the line that
-//     quotes it;
+//   - **prose that quotes code** is asserted here — and against the **specific symbol
+//     that produces it for the case being described**, not against the file that happens
+//     to contain it. That sharpening is not pedantry: this file's first version checked
+//     the on-demand notice against `MCPRoute.swift` as a *file*, and passed on a sentence
+//     that quoted the wrong notice — `unavailableNotice` instead of `forcedNotice` —
+//     while telling exactly the reader that `MCPRoute` goes to some lengths to protect.
+//     A quotation that matches somewhere in the right file is not the same claim as one
+//     that matches the right thing;
 //   - **prose that states arithmetic** is *derived* in the corresponding test rather than
 //     restated in prose. (The placement figures in `ConfirmationWindowPlacement`'s doc are
 //     the worked example: asserted, and qualified to the window the test assumes, after two
@@ -40,7 +45,10 @@ final class READMEClaimsTests: XCTestCase {
             .deletingLastPathComponent()  // repository root
             .appendingPathComponent("README.md")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            preconditionFailure("README.md not found at \(url.path)")
+            // `XCTFail` rather than `preconditionFailure`: a moved file must cost one
+            // result, not abort the process and take every other test's with it.
+            XCTFail("README.md not found at \(url.path)")
+            return ""
         }
         return text
     }()
@@ -92,7 +100,8 @@ final class READMEClaimsTests: XCTestCase {
             .deletingLastPathComponent()  // Core
             .appendingPathComponent(path)
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            preconditionFailure("source file not found at \(url.path)")
+            XCTFail("source file not found at \(url.path)")
+            return ""
         }
         return text
     }
@@ -111,19 +120,46 @@ final class READMEClaimsTests: XCTestCase {
         }
     }
 
-    /// The on-demand notice, quoted, is the notice the CLI writes.
-    func testTheReadmeQuotesTheOnDemandNoticeTheRouteActuallyWrites() {
-        let route = Self.source("Sources/PortmasterMCP/MCPRoute.swift")
-        let notice = MCPRouteSelector.unavailableNotice
-        // The README quotes it in shortened form, so assert the fragment that appears in
-        // both rather than the whole sentence: a shortened quote is still a claim about
-        // wording.
-        let fragment = "no Portmaster answering on the socket"
+    /// Each notice is checked against **the symbol that produces it**, for the trigger the
+    /// sentence describes.
+    ///
+    /// `forcedNotice` is what setting `PORTMASTER_MCP=on-demand` prints, and
+    /// `unavailableNotice` is what a failed probe prints — and `MCPRoute` goes to some
+    /// lengths to keep them apart, because telling someone with a healthy app that no
+    /// Portmaster is answering is the one untrue thing the process could say to them.
+    ///
+    /// Round 6's README quoted the second for the first, and this file's earlier version
+    /// did not catch it: it asked whether the fragment existed *in `MCPRoute.swift`*, which
+    /// it did. Asserting against the symbol is what closes that.
+    func testEachStderrNoticeIsQuotedForTheTriggerThatProducesIt() {
+        // The escape hatch: `PORTMASTER_MCP=on-demand`.
+        let forcedFragment = "even though Portmaster may be up"
         XCTAssertTrue(
-            notice.contains(fragment),
-            "the fragment the README relies on is not in the notice any more"
+            MCPRouteSelector.forcedNotice.contains(forcedFragment),
+            "the fragment the README relies on is not in `forcedNotice` any more"
         )
-        assertQuotes(fragment, from: route, sourceName: "MCPRoute.swift")
+        assertQuotes(
+            forcedFragment,
+            from: MCPRouteSelector.forcedNotice,
+            sourceName: "MCPRouteSelector.forcedNotice"
+        )
+        // And the one sentence that legitimately quotes the other notice — the CLI
+        // reporting that it probed and found nothing.
+        let unavailableFragment = "no Portmaster answering on the socket"
+        XCTAssertTrue(
+            MCPRouteSelector.unavailableNotice.contains(unavailableFragment),
+            "the fragment is not in `unavailableNotice` any more"
+        )
+        assertQuotes(
+            unavailableFragment,
+            from: MCPRouteSelector.unavailableNotice,
+            sourceName: "MCPRouteSelector.unavailableNotice"
+        )
+        // The two must stay distinct, or the distinction the source documents is gone.
+        XCTAssertNotEqual(
+            MCPRouteSelector.forcedNotice, MCPRouteSelector.unavailableNotice,
+            "the two notices are deliberately different; collapsing them re-creates the bug"
+        )
     }
 
     // MARK: - Refusal reasons
@@ -191,12 +227,99 @@ final class READMEClaimsTests: XCTestCase {
         else {
             return XCTFail("could not find AuditLog's CodingKeys case list to compare against")
         }
+        // Normalised too: `case ts, tool, arguments, outcome, reason, pid` is one line
+        // today because a formatter wrote it that way, and nothing in this file's promise
+        // should depend on that.
+        let caseList = caseLine
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined(separator: " ")
         for key in keys {
             XCTAssertTrue(
-                caseLine.contains("case \(key)") || caseLine.contains(", \(key)"),
-                "the README names `\\(key)` and CodingKeys does not: \\(caseLine.trimmingCharacters(in: .whitespaces))"
+                caseList.contains(key),
+                "the README names `\(key)` and CodingKeys does not: "
+                    + caseList.trimmingCharacters(in: .whitespaces)
             )
         }
+    }
+
+    // MARK: - Keys and paths the README prints
+
+    /// The allowlisted preference keys, quoted verbatim, against the executor's own list.
+    ///
+    /// `allowedPreferenceKeysDescription()` is what `set_preference`'s catalog entry and
+    /// every refusal message are built from, so the README printing it is the one place a
+    /// reader would notice the allowlist changing — which makes it the line most likely to
+    /// be right when the code moved and wrong when the code moved the other way.
+    func testTheAllowlistedPreferenceKeysTheReadmePrintsAreTheExecutorsList() {
+        let listed = ToolExecutor.allowedPreferenceKeysDescription()
+        // The README prints the keys one by one in backticks rather than as one
+        // comma-separated string, so the claim is checked key by key on the sentence that
+        // makes it — which is also the form that names *which* key moved when it does.
+        guard let readmeLine = line(containing: "accepts only allowlisted keys") else {
+            return XCTFail(
+                "the sentence listing the allowlist is gone, so the list is unclaimed "
+                    + "rather than stale — restore it or delete the claim deliberately"
+            )
+        }
+        for key in ToolExecutor.allowedPreferenceKeys.sorted() {
+            XCTAssertTrue(
+                readmeLine.contains("`\(key)`"),
+                "`\(key)` is allowlisted (\(listed)) but the README no longer names it.\n"
+                    + "  README line: \(readmeLine)"
+            )
+        }
+        // And nothing the README names that the executor does not: a key printed here
+        // that the executor would refuse is the worse half of the drift.
+        for token in readmeLine.components(separatedBy: "`")
+            where token.contains(", ") || token.contains(",")
+        {
+            let candidate = token
+                .components(separatedBy: ", ")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty }
+            guard let candidate, ToolExecutor.allowedPreferenceKeys.sorted()
+                .contains(where: { $0.hasPrefix(candidate) })
+            else { continue }
+            XCTAssertTrue(
+                ToolExecutor.allowedPreferenceKeys.contains(candidate),
+                "the README names `\(candidate)`, which is not allowlisted"
+            )
+        }
+    }
+
+    /// The two file paths the README tells a reader to look at, against the code that
+    /// builds them.
+    ///
+    /// Asserted by *filename* rather than by whole path, because the README prints them
+    /// under `~/.portmaster` while the code builds them under whatever home directory the
+    /// test runs in — and the part that can drift is the name.
+    func testTheStateFilenamesTheReadmePrintsAreTheOnesTheCodeWrites() {
+        let settings = MCPSettings.fileURL(directory: URL(fileURLWithPath: "/tmp/pm-claims"))
+        assertQuotes(
+            settings.lastPathComponent,
+            from: "appendingPathComponent(\"\(settings.lastPathComponent)\")",
+            sourceName: "MCPSettings.fileURL"
+        )
+        // `AuditLog`'s filename is private, so it is read from the source it is declared
+        // in — and asserted against the file's own value rather than a copy.
+        let auditSource = Self.source("Sources/PortmasterMCP/AuditLog.swift")
+        guard let declared = auditSource
+            .components(separatedBy: .newlines)
+            .first(where: { $0.contains("private static let fileName") })
+        else {
+            return XCTFail("could not find AuditLog's fileName declaration")
+        }
+        let name = declared
+            .components(separatedBy: "\"")
+            .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard let filename = name else {
+            return XCTFail("could not read AuditLog's fileName out of: \(declared)")
+        }
+        assertQuotes(
+            filename,
+            from: declared,
+            sourceName: "AuditLog.fileName"
+        )
     }
 
     // MARK: - What this file does not do
