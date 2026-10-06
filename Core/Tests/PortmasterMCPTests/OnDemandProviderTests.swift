@@ -695,7 +695,7 @@ final class OnDemandProviderTests: XCTestCase {
         )
         XCTAssertTrue(
             alert.detail.contains(
-                OnDemandProvider.spanDescription(AlertEngine.cpuWindow)
+                AlertCopy.spanDescription(AlertEngine.cpuWindow)
             ),
             "the window in the sentence must come from the constant that produced "
                 + "the threshold: \(alert.detail)"
@@ -733,7 +733,7 @@ final class OnDemandProviderTests: XCTestCase {
         let alert = try XCTUnwrap(growth.first)
         XCTAssertTrue(alert.id.hasPrefix("history:"))
         XCTAssertTrue(
-            alert.detail.contains(OnDemandProvider.spanDescription(AlertEngine.memGrowthWindow)),
+            alert.detail.contains(AlertCopy.spanDescription(AlertEngine.memGrowthWindow)),
             alert.detail
         )
     }

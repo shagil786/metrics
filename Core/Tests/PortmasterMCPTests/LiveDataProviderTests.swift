@@ -260,7 +260,8 @@ final class LiveDataProviderTests: XCTestCase {
 
         let raised = ActingUpAlert(
             id: "diskHammering:build:4242", kind: .diskHammering, appName: "build",
-            headline: "build is hammering the disk", detail: "80 MB/s over 10 minutes.",
+            headline: AlertCopy.headline(.diskHammering, appName: "build"),
+            detail: AlertCopy.diskHammering("80 MB/s", source: .live),
             at: OnDemandProviderTests.sampleTime
         )
         let some = try await makeProvider(

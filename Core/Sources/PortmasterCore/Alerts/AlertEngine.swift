@@ -98,8 +98,8 @@ public final class AlertEngine: @unchecked Sendable {
                         id: app.id + ":cpu:" + ISO8601DateFormatter().string(from: at),
                         kind: .sustainedCPU,
                         appName: app.displayName,
-                        headline: "\(app.displayName) is keeping the CPU busy",
-                        detail: "\(Int(avg))% average over the last 10 minutes.",
+                        headline: AlertCopy.headline(.sustainedCPU, appName: app.displayName),
+                        detail: AlertCopy.sustainedCPU(avg, source: .live),
                         at: at
                     ))
                 }
@@ -116,8 +116,12 @@ public final class AlertEngine: @unchecked Sendable {
                         id: app.id + ":mem:" + ISO8601DateFormatter().string(from: at),
                         kind: .memoryGrowth,
                         appName: app.displayName,
-                        headline: "\(app.displayName) keeps using more memory",
-                        detail: "Up \(Fmt.bytes(growth)) in the last hour, now \(Fmt.bytes(app.totalMemory)).",
+                        headline: AlertCopy.headline(.memoryGrowth, appName: app.displayName),
+                        detail: AlertCopy.memoryGrowth(
+                            growth: Fmt.bytes(growth),
+                            now: Fmt.bytes(app.totalMemory),
+                            source: .live
+                        ),
                         at: at
                     ))
                 }
@@ -149,8 +153,8 @@ public final class AlertEngine: @unchecked Sendable {
                             id: app.id + ":disk:" + ISO8601DateFormatter().string(from: at),
                             kind: .diskHammering,
                             appName: app.displayName,
-                            headline: "\(app.displayName) is hammering the disk",
-                            detail: "\(Fmt.rate(avg)) written on average over the last 10 minutes.",
+                            headline: AlertCopy.headline(.diskHammering, appName: app.displayName),
+                            detail: AlertCopy.diskHammering(Fmt.rate(avg), source: .live),
                             at: at
                         ))
                     }
@@ -173,8 +177,8 @@ public final class AlertEngine: @unchecked Sendable {
                             id: app.id + ":net:" + ISO8601DateFormatter().string(from: at),
                             kind: .networkHammering,
                             appName: app.displayName,
-                            headline: "\(app.displayName) is using a lot of network",
-                            detail: "\(Fmt.rate(avg)) downloaded on average over the last 10 minutes.",
+                            headline: AlertCopy.headline(.networkHammering, appName: app.displayName),
+                            detail: AlertCopy.networkHammering(Fmt.rate(avg), source: .live),
                             at: at
                         ))
                     }

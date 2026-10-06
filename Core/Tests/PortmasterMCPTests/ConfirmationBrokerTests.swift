@@ -79,11 +79,11 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
-        let (firstBox, _) = start(broker, first)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
         let presented = await waitForPending(broker, 1)
         XCTAssertEqual(presented.map(\.id), [first.id])
 
-        let (secondBox, _) = start(broker, second)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         await waitWhileSuspended(secondBox)
         XCTAssertNil(secondBox.outcome, "a queued request must stay suspended")
         let whileQueued = await pendingIDs(broker)
@@ -173,9 +173,9 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
-        let (firstBox, _) = start(broker, first)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
         await waitForPending(broker, 1)
-        let (secondBox, _) = start(broker, second)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         await waitForQueued(broker, 2)
 
         // Nobody decides either. The queued one must not be stranded behind the
@@ -206,8 +206,8 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
-        let (firstBox, _) = start(broker, first)
-        let (secondBox, _) = start(broker, second)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         // Both are live before anything is decided, so neither deadline has passed
         // and the queue is the thing being asserted, not one request's timing.
         await waitForQueued(broker, 2)
@@ -240,10 +240,10 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
-        let (firstBox, _) = start(broker, first)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
         let presented = await waitForPending(broker, 1)
         XCTAssertEqual(presented.map(\.id), [first.id])
-        let (secondBox, _) = start(broker, second)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         await waitForQueued(broker, 2)
 
         await broker.decide(id: second.id, outcome: .approved)
@@ -270,10 +270,10 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopProject, summary: "Stop project web")
 
-        let (firstBox, _) = start(broker, first)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
         let presented = await waitForPending(broker, 1)
         XCTAssertEqual(presented.map(\.id), [first.id])
-        let (secondBox, _) = start(broker, second)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         // Wait for the enqueue itself rather than a slice of real time: `pending`
         // cannot show a request that is still waiting its turn.
         await waitForQueued(broker, 2)
@@ -307,9 +307,9 @@ final class ConfirmationBrokerTests: XCTestCase {
         let first = makeRequest(kind: .quitApp, summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
 
-        let (firstBox, _) = start(broker, first)
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
         await waitForPending(broker, 1)
-        let (secondBox, _) = start(broker, second)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
         await waitForQueued(broker, 2)
 
         // The interesting half of "no leak": a caller that says no must not
@@ -416,9 +416,10 @@ final class ConfirmationBrokerTests: XCTestCase {
 
         let first = makeRequest(summary: "Quit Mail?")
         let second = makeRequest(kind: .stopContainer, summary: "Stop container web")
-        let (firstBox, _) = start(broker, first)
-        let (secondBox, _) = start(broker, second)
-        await waitForQueued(broker, 2)
+        // Enqueued one at a time: the assertion below is about queue *order*, so
+        // the order has to be established rather than raced for.
+        let (firstBox, _) = await startAndAwaitQueued(broker, first, expectedQueued: 1)
+        let (secondBox, _) = await startAndAwaitQueued(broker, second, expectedQueued: 2)
 
         let queued = await broker.queuedIDs
         XCTAssertEqual(queued, [first.id, second.id], "oldest first, and every one of them")
@@ -576,6 +577,26 @@ final class ConfirmationBrokerTests: XCTestCase {
         let box = OutcomeBox()
         let task = Task { box.store(await broker.request(request)) }
         return (box, task)
+    }
+
+    /// Starts a request and waits until it is actually queued, so a caller can
+    /// start a second one knowing the first got there first.
+    ///
+    /// Two bare `start` calls race: each spawns an unordered `Task`, so which
+    /// request reaches `broker.request` first is up to the scheduler. A test
+    /// that then asserts on queue *order* is asserting on a race it did not
+    /// establish — which is how `testQueuedIDsNamesEveryWaitingRequestInOrder`
+    /// came to fail intermittently, with the two ids swapped.
+    private func startAndAwaitQueued(
+        _ broker: ConfirmationBroker,
+        _ request: MCPApprovalRequest,
+        expectedQueued: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> (OutcomeBox, Task<Void, Never>) {
+        let started = start(broker, request)
+        await waitForQueued(broker, expectedQueued, file: file, line: line)
+        return started
     }
 
     /// The ids currently presented, hoisted out of the actor because `XCTAssert*`

@@ -359,16 +359,16 @@ final class ToolExecutorReadMoreTests: XCTestCase {
                 id: "history:app:Chrome:sustainedCPU",
                 kind: .sustainedCPU,
                 appName: "Chrome",
-                headline: "Chrome is keeping the CPU busy",
-                detail: "70% average over 10 minutes.",
+                headline: AlertCopy.headline(.sustainedCPU, appName: "Chrome"),
+                detail: AlertCopy.sustainedCPU(70, source: .history),
                 at: Date(timeIntervalSince1970: 1_700_000_000)
             ),
             ActingUpAlert(
                 id: "history:app:Slack:diskHammering",
                 kind: .diskHammering,
                 appName: "Slack",
-                headline: "Slack is hammering the disk",
-                detail: "60 MB/s average over 10 minutes.",
+                headline: AlertCopy.headline(.diskHammering, appName: "Slack"),
+                detail: AlertCopy.diskHammering("60 MB/s", source: .history),
                 at: Date(timeIntervalSince1970: 1_700_000_100)
             )
         ]
@@ -388,8 +388,16 @@ final class ToolExecutorReadMoreTests: XCTestCase {
         XCTAssertEqual(alert["id"] as? String, "history:app:Chrome:sustainedCPU")
         XCTAssertEqual(alert["kind"] as? String, "sustainedCPU")
         XCTAssertEqual(alert["appName"] as? String, "Chrome")
-        XCTAssertEqual(alert["headline"] as? String, "Chrome is keeping the CPU busy")
-        XCTAssertEqual(alert["detail"] as? String, "70% average over 10 minutes.")
+        XCTAssertEqual(
+            alert["headline"] as? String,
+            AlertCopy.headline(.sustainedCPU, appName: "Chrome"),
+            "The wire headline must be the one the copy produces, not a fixture's private wording."
+        )
+        XCTAssertEqual(
+            alert["detail"] as? String,
+            AlertCopy.sustainedCPU(70, source: .history),
+            "The provenance qualifier has to survive serialisation — that is the point of this fixture using .history."
+        )
         XCTAssertNotNil(alert["at"], "an alert carries when it was observed")
     }
 

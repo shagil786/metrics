@@ -437,11 +437,10 @@ public struct OnDemandProvider: DataProvider {
                 id: "history:\(trend.id):sustainedCPU",
                 kind: .sustainedCPU,
                 appName: trend.displayName,
-                headline: "\(trend.displayName) is keeping the CPU busy",
+                headline: AlertCopy.headline(.sustainedCPU, appName: trend.displayName),
                 // The window comes from the same constant the threshold did, so
                 // changing one can never leave the sentence describing the other.
-                detail: "\(Int(average))% average over the last "
-                    + "\(Self.spanDescription(AlertEngine.cpuWindow)), from recorded history.",
+                detail: AlertCopy.sustainedCPU(average, source: .history),
                 at: trend.lastSeen
             ))
         }
@@ -451,10 +450,12 @@ public struct OnDemandProvider: DataProvider {
                 id: "history:\(span.appID):memoryGrowth",
                 kind: .memoryGrowth,
                 appName: span.displayName,
-                headline: "\(span.displayName) keeps using more memory",
-                detail: "Up \(Fmt.bytes(span.growthBytes)) in the last "
-                    + "\(Self.spanDescription(AlertEngine.memGrowthWindow)), now "
-                    + "\(Fmt.bytes(span.lastBytes)), from recorded history.",
+                headline: AlertCopy.headline(.memoryGrowth, appName: span.displayName),
+                detail: AlertCopy.memoryGrowth(
+                    growth: Fmt.bytes(span.growthBytes),
+                    now: Fmt.bytes(span.lastBytes),
+                    source: .history
+                ),
                 at: span.lastAt
             ))
         }
@@ -462,19 +463,6 @@ public struct OnDemandProvider: DataProvider {
             source: .historyApproximate,
             alerts: alerts.sorted { $0.at == $1.at ? $0.id < $1.id : $0.at > $1.at }
         )
-    }
-
-    /// How long a window reads as in a sentence: "10 minutes", "1 hour".
-    /// Derived from the interval rather than written next to it, so a threshold
-    /// change cannot leave a message describing a window that is no longer used.
-    static func spanDescription(_ interval: TimeInterval) -> String {
-        let seconds = Int(interval.rounded())
-        func plural(_ count: Int, _ unit: String) -> String {
-            "\(count) \(unit)\(count == 1 ? "" : "s")"
-        }
-        if seconds % 3600 == 0 { return plural(seconds / 3600, "hour") }
-        if seconds % 60 == 0 { return plural(seconds / 60, "minute") }
-        return plural(seconds, "second")
     }
 
     // MARK: Settings
