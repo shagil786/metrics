@@ -1,6 +1,8 @@
 // Settings: menu bar metric, sampling, history retention, login item,
 // privacy summary, the MCP host, and the clearly-labeled preview (fixture) mode.
-import AppKit
+//
+// The MCP page itself lives in MCPSettingsTab.swift; this file is the sidebar and the
+// other tabs.
 import SwiftUI
 import ServiceManagement
 import PortmasterCore
@@ -243,9 +245,7 @@ struct SettingsView: View {
 
     // MARK: MCP
 
-    /// The MCP host page: what an AI client may do here, whether Portmaster is
-    /// listening, where the audit log is, how to install the client-side binary, and who
-    /// is connected right now.
+    /// The MCP host page, in its own file (`MCPSettingsTab.swift`).
     ///
     /// A separate view so it can hold `@ObservedObject` on the controller — the sidebar's
     /// host is the app delegate, not an environment object, so an observed reference has
@@ -255,7 +255,7 @@ struct SettingsView: View {
         if let host = AppDelegate.shared?.mcpHost {
             MCPSettingsTab(host: host)
         } else {
-            Text("Portmaster's MCP host is not available in this build.")
+            Text(MCPSettingsCopy.Chrome.noHostAvailable)
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -265,210 +265,6 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 6) {
             Text("•")
             Text(text)
-        }
-    }
-}
-
-// MARK: - The MCP page
-
-/// Settings for the MCP host: the mutation policy, whether the host is listening, where
-/// the audit log is, how to install the client-side binary, and who is connected.
-///
-/// Its own view because it observes `MCPHostController` directly. The sidebar's other
-/// pages read `AppModel` from the environment; this one reads the app delegate's host,
-/// which is `@MainActor` and owned for the life of the process rather than injected.
-///
-/// The words are `MCPSettingsCopy`'s and the install path is `MCPInstallCommand`'s,
-/// because the app target has no test target and a sentence nothing can check is a
-/// sentence that drifts. What is left here is drawing, and the three actions that are
-/// genuinely the app's: copying to the pasteboard, asking Finder to reveal the log, and
-/// writing the chosen mode through `setMode`.
-struct MCPSettingsTab: View {
-    @ObservedObject var host: MCPHostController
-    /// Set by the copy button, and cleared by the timer, so the confirmation is a fact
-    /// about this click rather than a permanent claim that something was copied.
-    @State private var copied = false
-    @State private var copyTimer: Timer?
-
-    /// The `claude mcp add` line for the binary on this machine, or `nil` when it has not
-    /// been built.
-    ///
-    /// Resolved once for the life of the process, not per appearance: it is a filesystem
-    /// question, and asking it on every redraw would stat four paths per frame for a value
-    /// that cannot change while Settings is open. The cost of that choice is that an app
-    /// launched before `swift build` ran keeps saying the binary is missing until it is
-    /// relaunched — which is a stale label rather than a wrong command, since the notice
-    /// it shows is the build command, not a path.
-    private static let installCommand: String? = {
-        let candidates = MCPInstallCommand.binDirectories(
-            packagePath: MCPInstallCommand.compiledPackagePath
-        ).map { MCPInstallCommand.binaryPath(in: $0, relativeTo: "") }
-        return MCPInstallCommand.locateBinary(
-            in: candidates, isExecutableFile: { FileManager.default.isExecutableFile(atPath: $0) }
-        ).map(MCPInstallCommand.command(binaryPath:))
-    }()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            policy
-            Divider()
-            status
-            Divider()
-            auditLog
-            Divider()
-            install
-            Divider()
-            clients
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
-    }
-
-    // MARK: The policy
-
-    private var policy: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("What an AI assistant may do here").font(.headline)
-            Picker("Mutation mode", selection: Binding(
-                get: { host.mode },
-                set: { host.setMode($0) }
-            )) {
-                ForEach(MCPMutationMode.allCases, id: \.self) { mode in
-                    Text(MCPSettingsCopy.modeTitle(for: mode)).tag(mode)
-                }
-            }
-            .pickerStyle(.radioGroup)
-            .accessibilityHint("How much an AI client connected to Portmaster may change")
-            Text(MCPSettingsCopy.modeConsequence(for: host.mode))
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("Reads — CPU, memory, apps, containers, projects, history — are always available in every mode.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    // MARK: The status
-
-    private var status: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Is Portmaster listening").font(.headline)
-            Text(statusText)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var statusText: String {
-        switch host.status {
-        case .listening(let socket): return MCPSettingsCopy.listening(socket: socket)
-        case .notRunning: return MCPSettingsCopy.notRunning
-        case .failed(let reason): return MCPSettingsCopy.failed(reason: reason)
-        }
-    }
-
-    // MARK: The audit log
-
-    private var auditLog: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Audit log").font(.headline)
-            Text(MCPSettingsCopy.auditLogCaption)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(MCPSettingsCopy.auditLogPath(host.auditLogURL))
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Reveal in Finder") { revealAuditLog() }
-        }
-    }
-
-    // MARK: Installing the CLI
-
-    private var install: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Use Portmaster from an AI assistant").font(.headline)
-            if let command = Self.installCommand {
-                Text(command)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 8) {
-                    Button("Copy install command") { copy(command) }
-                    if copied {
-                        Label("Copied", systemImage: "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(.teal)
-                    }
-                }
-            } else {
-                // No path to offer rather than a path that does not exist: a clipboard
-                // holding `claude mcp add` pointed at an unbuilt binary is a command that
-                // fails for the person who trusted it.
-                Text(MCPSettingsCopy.binaryNotBuiltNotice)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Text(MCPSettingsCopy.installCaption)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    /// Asks Finder to show the audit log, or the directory holding it when the log has
-    /// never been written.
-    ///
-    /// The alternative — always revealing the file — is a button that appears to do
-    /// nothing on a machine where no mutation has been attempted, which is most machines
-    /// when somebody first opens this page.
-    private func revealAuditLog() {
-        let url = host.auditLogURL
-        NSWorkspace.shared.activateFileViewerSelecting([
-            MCPSettingsCopy.revealTarget(
-                logURL: url, fileExists: FileManager.default.fileExists(atPath: url.path)
-            )
-        ])
-    }
-
-    /// Puts the command on the pasteboard, and says so for a moment.
-    ///
-    /// The confirmation is cleared on a timer rather than left up: "Copied" that never goes
-    /// away stops being a fact about the last click and becomes part of the page.
-    private func copy(_ command: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(command, forType: .string)
-        copied = true
-        copyTimer?.invalidate()
-        copyTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { _ in
-            copied = false
-        }
-    }
-
-    // MARK: Who is connected
-
-    private var clients: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Connected AI clients").font(.headline)
-            if host.clients.isEmpty {
-                Text(MCPSettingsCopy.noClients)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                ForEach(host.clients) { client in
-                    Text(MCPSettingsCopy.clientRow(
-                        pid: client.pid,
-                        connectedAt: client.connectedAt,
-                        lastCallAt: client.lastCallAt
-                    ))
-                    .font(.callout)
-                }
-            }
         }
     }
 }

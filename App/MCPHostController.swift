@@ -92,6 +92,20 @@ final class MCPHostController: ObservableObject {
     /// Who is connected, mirrored for display. Refreshed on demand — see
     /// `refreshClients()` — rather than on a timer.
     @Published private(set) var clients: [MCPConnectedClient] = []
+    /// The mode a person last chose and Portmaster could not write, or `nil`.
+    ///
+    /// **Published separately from `mode`, and never folded into it.** The mode stays
+    /// unchanged when the save fails — reporting a policy the file does not have would be a
+    /// lie the next tool call would contradict — which means the radio snaps back. Without
+    /// this, a person who chose correctly on a machine with an unwritable settings file
+    /// watches the control revert and has no way to tell a refusal from a failed write, and
+    /// will reasonably conclude Portmaster decided their choice was not allowed. So the
+    /// failure is carried here for Settings to say out loud, and it names the mode that did
+    /// not stick.
+    ///
+    /// Cleared by the next successful `setMode`, so a failure that is later resolved does
+    /// not keep explaining itself.
+    @Published private(set) var modeSaveFailure: MCPMutationMode?
 
     /// Where the mutation-mode policy lives. `nil` is the per-user `~/.portmaster`,
     /// which is where a CLI looks for it too.
@@ -221,9 +235,14 @@ final class MCPHostController: ObservableObject {
             try settings.save(directory: directory)
         } catch {
             Self.log.info("could not save the MCP mutation mode: \(error.localizedDescription, privacy: .public)")
+            // Published so the page can say the write failed rather than leaving the radio
+            // to snap back in silence. Deliberately *not* assigning `mode`: the file does
+            // not have it, so displaying it would be a claim the next call contradicts.
+            modeSaveFailure = mode
             return
         }
         self.mode = mode
+        modeSaveFailure = nil
     }
 
     /// Where mutation attempts are recorded, for Settings to offer as a reveal.

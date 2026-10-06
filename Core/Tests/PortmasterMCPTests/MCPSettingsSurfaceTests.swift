@@ -139,14 +139,44 @@ final class MCPSettingsSurfaceTests: XCTestCase {
         XCTAssertTrue(row.contains("PID 4321"), row)
         XCTAssertTrue(row.contains("Connected"), row)
         XCTAssertTrue(row.contains("Last call"), row)
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
         XCTAssertTrue(
-            row.contains(MCPSettingsCopy.timestampFormatter.string(from: connected)),
+            row.contains(formatter.string(from: connected)),
             "the connected-at time itself must be in the row: \(row)"
         )
         XCTAssertTrue(
-            row.contains(MCPSettingsCopy.timestampFormatter.string(from: called)),
+            row.contains(formatter.string(from: called)),
             "the last-call time itself must be in the row: \(row)"
         )
+    }
+
+    /// Shown when nothing is connected.
+    ///
+    /// **The empty state must point at a control the page actually renders.** A line that
+    /// says "copy the install command" while the only copy affordance is inside the
+    /// branch that exists exactly when the binary *is* there points at nothing — and the
+    /// only people who read that line are the people on a build where the button is
+    /// missing. So each branch says what is actually true of that build.
+    func testTheEmptyStatePointsAtAControlThePageActuallyRenders() {
+        let withCommand = MCPSettingsCopy.noClients(installCommandAvailable: true)
+        XCTAssertTrue(withCommand.contains("No AI client"), withCommand)
+        XCTAssertTrue(
+            withCommand.lowercased().contains("copy"), "the button is there, so say so: \(withCommand)"
+        )
+
+        let withoutCommand = MCPSettingsCopy.noClients(installCommandAvailable: false)
+        XCTAssertTrue(withoutCommand.contains("No AI client"), withoutCommand)
+        XCTAssertFalse(
+            withoutCommand.lowercased().contains("copy"),
+            "there is no working copy button on this build, so do not point at one: \(withoutCommand)"
+        )
+        XCTAssertTrue(
+            withoutCommand.lowercased().contains("build"),
+            "so say what would make one appear: \(withoutCommand)"
+        )
+        XCTAssertNotEqual(withCommand, withoutCommand)
     }
 
     /// A client that has not called a tool is a real and different state from one that
@@ -168,18 +198,6 @@ final class MCPSettingsSurfaceTests: XCTestCase {
         )
         XCTAssertFalse(row.contains("PID 0"), row)
         XCTAssertTrue(row.contains("process not known"), row)
-    }
-
-    /// The empty state says what it means and what to do about it. An empty list with no
-    /// line under it is indistinguishable from a page that failed to load.
-    func testTheEmptyStateSaysNothingIsConnected() {
-        XCTAssertFalse(MCPSettingsCopy.noClients.isEmpty)
-        let text = MCPSettingsCopy.noClients
-        XCTAssertTrue(text.contains("No AI client"), text)
-        XCTAssertTrue(
-            text.lowercased().contains("installed") || text.lowercased().contains("copy"),
-            "the empty state must say what would put one there: \(text)"
-        )
     }
 
     /// The walk up to the package root, tested with an injected probe rather than a real
@@ -205,6 +223,131 @@ final class MCPSettingsSurfaceTests: XCTestCase {
             "",
             "no path at all is not a package root, however willing the probe is"
         )
+    }
+
+    /// The bundle is searched **first**, and the checkout last.
+    ///
+    /// This is the correction that makes the button usable for the person the app is
+    /// shipped to: `compiledPackagePath` is the path the *compiler* saw, which exists only
+    /// on the machine that built the app, so a checkout-only search finds nothing for
+    /// every real user and the page shows "not built" forever. The bundle copy is the one
+    /// that is always there; the checkout candidates stay so a developer build still finds
+    /// the binary they just compiled.
+    func testTheBundledBinaryIsSearchedBeforeTheCheckout() {
+        let bundle = "/Applications/Portmaster.app/Contents/Resources"
+        let candidates = MCPInstallCommand.binaryCandidates(
+            bundleResourcesPath: bundle,
+            checkoutPackagePath: "/src/portmaster/Core"
+        )
+        XCTAssertEqual(
+            candidates.first,
+            bundle + "/" + MCPStdioRunner.serverName,
+            "the copy inside the app is the one a shipped build must name"
+        )
+        XCTAssertTrue(candidates.contains { $0.hasPrefix("/src/portmaster/Core/.build") })
+        XCTAssertFalse(candidates.contains { $0.contains("$PWD") })
+        for candidate in candidates {
+            XCTAssertTrue(candidate.hasPrefix("/"), candidate)
+            XCTAssertFalse(candidate.contains("//"), candidate)
+        }
+    }
+
+    /// With no bundle to look in, the checkout candidates are all there is — and no
+    /// invented path fills the gap.
+    func testCandidatesWithoutABundleAreTheCheckoutOnes() {
+        let candidates = MCPInstallCommand.binaryCandidates(
+            bundleResourcesPath: nil,
+            checkoutPackagePath: "/src/portmaster/Core"
+        )
+        XCTAssertFalse(candidates.isEmpty)
+        XCTAssertTrue(candidates.allSatisfy { $0.hasPrefix("/src/portmaster/Core/.build") })
+
+        XCTAssertEqual(
+            MCPInstallCommand.binaryCandidates(bundleResourcesPath: nil, checkoutPackagePath: ""),
+            [],
+            "nothing known means no candidates, not a guess"
+        )
+        XCTAssertEqual(
+            MCPInstallCommand.binaryCandidates(bundleResourcesPath: nil, checkoutPackagePath: "  "),
+            []
+        )
+    }
+
+    /// A bundle path is a directory, and the binary goes inside it. Ending the path with a
+    /// separator must not produce `//`.
+    func testTheBundlePathIsJoinedWithoutDoublingASeparator() {
+        for path in [
+            MCPInstallCommand.binaryCandidates(
+                bundleResourcesPath: "/Applications/Portmaster.app/Contents/Resources/",
+                checkoutPackagePath: ""
+            ).first,
+            MCPInstallCommand.binaryCandidates(
+                bundleResourcesPath: "/Applications/Portmaster.app/Contents/Resources",
+                checkoutPackagePath: ""
+            ).first,
+        ] {
+            XCTAssertEqual(
+                path, "/Applications/Portmaster.app/Contents/Resources/" + MCPStdioRunner.serverName
+            )
+        }
+    }
+
+    /// Both arguments empty is not a path at all, and this function exists to stop a
+    /// stored relative path being handed to a client that will resolve it against its own
+    /// working directory. A bare `portmaster-mcp` is exactly that failure, so the answer is
+    /// nothing.
+    func testAnEmptyDirectoryWithNoBaseIsNoPathAtAll() {
+        XCTAssertEqual(MCPInstallCommand.binaryPath(in: "", relativeTo: ""), "")
+        XCTAssertEqual(MCPInstallCommand.binaryPath(in: "   ", relativeTo: "  "), "")
+    }
+
+    /// The filesystem root is a real directory, not an empty one. Trimming its only
+    /// character away would resolve the binary into the base instead of into `/`.
+    func testTheRootDirectoryIsNotTrimmedAway() {
+        let name = MCPStdioRunner.serverName
+        XCTAssertEqual(
+            MCPInstallCommand.binaryPath(in: "/", relativeTo: "/somewhere/else"),
+            "/" + name
+        )
+        XCTAssertEqual(MCPInstallCommand.binaryPath(in: "//", relativeTo: "/base"), "/" + name)
+    }
+
+    /// A path containing a single quote cannot be wrapped in single quotes — the quoting
+    /// would end where the path does not, and a Mac named after a person is a real path.
+    ///
+    /// Asserted two ways. The exact spelling is the shell's own sequence for a literal
+    /// quote inside a single-quoted word (close, emit `\'`, reopen); and then `/bin/sh` is
+    /// actually asked to expand the result, because a quoting scheme that *looks* balanced
+    /// and does not survive a shell is exactly the failure a string comparison would let
+    /// through. A `claude mcp add` argument is parsed by a shell, so a shell is the test.
+    func testASingleQuoteInAPathIsEscapedRatherThanBreakingTheQuoting() throws {
+        let path = "/Users/o'brien/" + MCPStdioRunner.serverName
+        let command = MCPInstallCommand.command(binaryPath: path)
+        XCTAssertEqual(
+            command,
+            "claude mcp add portmaster -- '/Users/o'\\''brien/" + MCPStdioRunner.serverName + "'"
+        )
+
+        let prefix = "claude mcp add portmaster -- "
+        let argument = String(command.dropFirst(prefix.count))
+        XCTAssertEqual(try shellExpansion(ofArgument: argument), path)
+    }
+
+    /// What `/bin/sh` makes of one word of a command line, read back through a pipe.
+    ///
+    /// A pipe rather than a file so nothing here has to clean up after itself, and the
+    /// trailing newline removed explicitly rather than by trimming — a path with a space in
+    /// it must come back byte-for-byte.
+    private func shellExpansion(ofArgument argument: String) throws -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "printf '%s' \(argument)"]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// A package found several levels up, and a nearer non-package directory that must be
@@ -248,6 +391,59 @@ final class MCPSettingsSurfaceTests: XCTestCase {
         for directory in MCPInstallCommand.binDirectories(packagePath: root) {
             XCTAssertTrue(directory.hasPrefix(root + "/.build"), directory)
         }
+    }
+
+    // MARK: - The mode save that did not happen
+
+    /// `MCPHostController.setMode` leaves the published mode alone when the write fails,
+    /// which is right for the value and useless for the person: a radio that snaps back
+    /// with no explanation reads as Portmaster having refused the choice, when in fact
+    /// the choice was fine and the disk was not. So the failure has to be said, next to
+    /// the radio, and it has to name the mode that was *not* saved.
+    func testAFailedModeWriteIsSaidAndNamesTheModeThatDidNotStick() {
+        let line = MCPSettingsCopy.modeSaveFailed(mode: .allowSession)
+        XCTAssertTrue(line.contains(MCPSettingsCopy.modeTitle(for: .allowSession)), line)
+        XCTAssertTrue(line.lowercased().contains("not saved"), line)
+        XCTAssertTrue(line.lowercased().contains("try again"), line)
+        XCTAssertFalse(
+            line.lowercased().contains("allowed") || line.lowercased().contains("applied"),
+            "it must not read as a confirmation: \(line)"
+        )
+    }
+
+    func testEveryModeHasItsOwnFailedWriteLine() {
+        let lines = MCPMutationMode.allCases.map(MCPSettingsCopy.modeSaveFailed(mode:))
+        XCTAssertEqual(Set(lines).count, lines.count, "\(lines)")
+    }
+
+    // MARK: - What the reads sentence claims
+
+    /// The page's line about reads is the one a person is most likely to hold against
+    /// `tools/list` while debugging, so it must not enumerate tools: the list changes and
+    /// an enumerated sentence goes stale without anybody noticing. It reports the count
+    /// the catalog actually has, so a new read tool moves the number rather than making
+    /// the sentence a lie.
+    func testTheReadsSentenceCountsTheCatalogRatherThanNamingTools() {
+        let reads = ToolExecutor.catalog.filter { $0.effect == .read }
+        let mutations = ToolExecutor.catalog.filter { $0.effect == .mutation }
+        XCTAssertFalse(reads.isEmpty, "there are read tools to talk about")
+
+        let sentence = MCPSettingsCopy.readsAvailableInEveryMode
+        XCTAssertTrue(sentence.contains("\(reads.count)"), sentence)
+        XCTAssertTrue(
+            sentence.lowercased().contains("read"), "it must say what the tools are: \(sentence)"
+        )
+        XCTAssertTrue(
+            sentence.lowercased().contains("every mode"),
+            "the whole claim is that reads are not gated: \(sentence)"
+        )
+        for definition in reads {
+            XCTAssertFalse(
+                sentence.contains(definition.name),
+                "\(definition.name) is named in a sentence that has to survive a new tool: \(sentence)"
+            )
+        }
+        XCTAssertTrue(mutations.count > 0)
     }
 
     // MARK: - The audit log
@@ -362,8 +558,8 @@ final class MCPSettingsSurfaceTests: XCTestCase {
         )
     }
 
-    /// A path with a space has to survive a paste into a shell. Unquoted, the client
-    /// would be handed two arguments and store a path that is not there.
+    /// The same case as above, with a space in the path — quoted rather than split, so
+    /// the client is handed one argument that names a real file.
     func testAPathWithSpacesIsQuotedForTheShell() {
         let binary = "/Users/a b/Products/Release/" + MCPStdioRunner.serverName
         let command = MCPInstallCommand.command(binaryPath: binary)
@@ -449,30 +645,48 @@ final class MCPSettingsSurfaceTests: XCTestCase {
 
     /// The token is what makes a connection legitimate and it is never shown, logged or
     /// copied here. Settings is the screen a person screenshots when something is wrong.
+    ///
+    /// Walked over `everyString` rather than a hand-written list, so a heading or a button
+    /// label added to `MCPSettingsCopy` is covered the moment it is added — the earlier
+    /// version of this test enumerated 16 strings and silently covered none of the page's
+    /// own eleven.
     func testNoSettingsCopyMentionsTheToken() {
-        let strings = [
-            MCPSettingsCopy.modeConsequence(for: .off),
-            MCPSettingsCopy.modeConsequence(for: .allowSession),
-            MCPSettingsCopy.modeConsequence(for: .confirmEach),
-            MCPSettingsCopy.modeTitle(for: .off),
-            MCPSettingsCopy.modeTitle(for: .confirmEach),
-            MCPSettingsCopy.modeTitle(for: .allowSession),
-            MCPSettingsCopy.notRunning,
-            MCPSettingsCopy.failed(reason: "Address already in use"),
-            MCPSettingsCopy.noClients,
-            MCPSettingsCopy.auditLogCaption,
-            MCPSettingsCopy.binaryNotBuiltNotice,
-            MCPSettingsCopy.installCaption,
-            MCPSettingsCopy.clientRow(
-                pid: 7, connectedAt: Date(timeIntervalSince1970: 1_700_000_000), lastCallAt: nil
-            ),
-            MCPInstallCommand.buildCommand,
-            MCPInstallCommand.command(binaryPath: "/opt/" + MCPStdioRunner.serverName),
-        ]
+        let strings = MCPSettingsCopy.everyString
+        XCTAssertGreaterThan(strings.count, 25, "the inventory must be the whole page: \(strings.count)")
         for string in strings {
             XCTAssertFalse(
                 string.lowercased().contains("token"), "the token must not be on this page: \(string)"
             )
         }
+    }
+
+    /// The inventory is the page's strings, so it must not be empty in the ways that would
+    /// make the test above pass for the wrong reason: every mode both ways, both empty
+    /// states, and the chrome the view actually renders.
+    func testTheInventoryCoversTheWholePage() {
+        let strings = MCPSettingsCopy.everyString
+        for required in [
+            MCPSettingsCopy.Chrome.policyHeading,
+            MCPSettingsCopy.Chrome.statusHeading,
+            MCPSettingsCopy.Chrome.auditLogHeading,
+            MCPSettingsCopy.Chrome.installHeading,
+            MCPSettingsCopy.Chrome.clientsHeading,
+            MCPSettingsCopy.Chrome.revealButton,
+            MCPSettingsCopy.Chrome.copyButton,
+            MCPSettingsCopy.Chrome.copiedLabel,
+            MCPSettingsCopy.Chrome.noHostAvailable,
+            MCPSettingsCopy.Chrome.modePickerLabel,
+            MCPSettingsCopy.Chrome.modeHint,
+        ] {
+            XCTAssertTrue(strings.contains(required), "not in the inventory: \(required)")
+        }
+        for mode in MCPMutationMode.allCases {
+            XCTAssertTrue(strings.contains(MCPSettingsCopy.modeTitle(for: mode)), "\(mode)")
+            XCTAssertTrue(strings.contains(MCPSettingsCopy.modeConsequence(for: mode)), "\(mode)")
+            XCTAssertTrue(strings.contains(MCPSettingsCopy.modeSaveFailed(mode: mode)), "\(mode)")
+        }
+        XCTAssertTrue(strings.contains(MCPSettingsCopy.noClients(installCommandAvailable: true)))
+        XCTAssertTrue(strings.contains(MCPSettingsCopy.noClients(installCommandAvailable: false)))
+        XCTAssertTrue(strings.contains(MCPSettingsCopy.readsAvailableInEveryMode))
     }
 }

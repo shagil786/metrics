@@ -18,7 +18,21 @@
 //  3. **A client row is actionable.** Pid and both times, or a plain statement that one
 //     of them is not known. `LOCAL_PEERPID` can fail, so "PID 0" must never be printed.
 //  4. **Nothing here says the token.** Settings is the screen someone screenshots when
-//     something is wrong.
+//     something is wrong — and that is a claim about *every* string the page shows, so the
+//     headings and button labels live here too (`Chrome`), and `MCPSettingsChromeTests`
+//     reads the view file to fail on any literal that is not one of these.
+//
+// Two more, added on review of the first version:
+//
+//  5. **The page must not claim anything that can go stale.** The read-tools sentence
+//     enumerated six tool names and was already wrong about a ten-tool catalog — three
+//     tools unnamed, and memory/network/disk being *arguments* to `get_top_apps` rather
+//     than reads of their own. It now counts `ToolExecutor.catalog`, so a new read tool
+//     moves the number instead of making the sentence a lie.
+//  6. **A control that did not do what it looks like must say so.** `setMode` leaves the
+//     published mode alone when the write fails — right for the value, useless for the
+//     person, whose radio has just snapped back with no explanation. `modeSaveFailed` says
+//     which mode did not stick and why.
 //
 // What is deliberately absent: any claim that `claude mcp add` has been run. It writes the
 // user's client configuration and has never been executed from here, so the page says
@@ -61,6 +75,38 @@ public enum MCPSettingsCopy {
         }
     }
 
+    /// Reads are not gated by any of the three modes, and the page says so.
+    ///
+    /// **Counts the catalog rather than naming tools in the sentence.** The earlier
+    /// version listed "CPU, memory, apps, containers, projects, history" and was already
+    /// wrong: the catalog has ten read tools, three of them unnamed in that list, and
+    /// memory/network/disk are *arguments* to `get_top_apps` rather than reads of their
+    /// own. A sentence that enumerates tools goes stale the moment one is added and nobody
+    /// notices, and this one is the string a person is most likely to hold against
+    /// `tools/list` while debugging. A count derived from `ToolExecutor.catalog` cannot go
+    /// stale — a new read tool moves the number rather than making the sentence a lie.
+    public static var readsAvailableInEveryMode: String {
+        let reads = ToolExecutor.catalog.filter { $0.effect == .read }.count
+        return "\(reads) read tools answer immediately in every mode, whatever this setting says."
+    }
+
+    /// Said when a chosen mode could not be written.
+    ///
+    /// `MCPHostController.setMode` leaves the published mode alone when the save fails,
+    /// which is the right thing for the *value* — reporting a mode the file does not have
+    /// would be a lie the next tool call would contradict — and useless on its own for the
+    /// *person*: a radio that snaps back with no explanation reads as Portmaster having
+    /// refused the choice, when the choice was fine and the disk was not. So the failure is
+    /// named here, next to the radio, with the mode it failed to save.
+    ///
+    /// Names the mode by its own title so the line and the radio cannot disagree, and never
+    /// says the change was allowed or applied: it was not.
+    public static func modeSaveFailed(mode: MCPMutationMode) -> String {
+        "“\(modeTitle(for: mode))” was not saved, so it is not in effect. "
+        + "Portmaster could not write its MCP settings file; try again, or check that "
+        + "\(MCPSettings.fileURL(directory: nil).deletingLastPathComponent().path) is writable."
+    }
+
     // MARK: - Whether the host is listening
 
     /// A host that is bound, and where a client reaches it.
@@ -89,15 +135,20 @@ public enum MCPSettingsCopy {
 
     // MARK: - Connected clients
 
-    /// How a client's two timestamps are written. Shared so a test can hold the format
-    /// still and so a row cannot be built from two different ideas of what "connected at"
-    /// looks like.
-    public static let timestampFormatter: DateFormatter = {
+    /// How a client's two timestamps are written.
+    ///
+    /// A function building a formatter per call rather than one shared `static let`,
+    /// because `DateFormatter` is not thread-safe and a shared instance published from
+    /// this module would be reachable from every thread that can see it — safe today only
+    /// because the page happens to be main-actor, which is not a property of the type. A
+    /// per-call formatter costs a row's worth of allocation and cannot be reached from off
+    /// the main actor at all.
+    static func timestamp(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateStyle = .short
         formatter.timeStyle = .medium
-        return formatter
-    }()
+        return formatter.string(from: date)
+    }
 
     /// One connected client, as a single line.
     ///
@@ -109,20 +160,33 @@ public enum MCPSettingsCopy {
     /// process numbered zero; the row says the process is not known.
     public static func clientRow(pid: pid_t, connectedAt: Date, lastCallAt: Date?) -> String {
         let who = pid > 0 ? "PID \(pid)" : "process not known"
-        let connected = timestampFormatter.string(from: connectedAt)
+        let connected = timestamp(connectedAt)
         guard let lastCallAt else {
             return "\(who) · Connected \(connected) · has not called a tool yet"
         }
-        let called = timestampFormatter.string(from: lastCallAt)
+        let called = timestamp(lastCallAt)
         return "\(who) · Connected \(connected) · Last call \(called)"
     }
 
     /// Shown when nothing is connected.
     ///
-    /// Says what an empty list means and what would put a client in it, because an empty
-    /// table with no line under it is indistinguishable from a page that failed to load.
-    public static let noClients =
-        "No AI client is connected. Copy the install command below and the one you add will show up here."
+    /// **Branch-aware, because the page's controls are.** A line that says "copy the
+    /// install command" is only true where the copy button works; on a build where the
+    /// binary could not be found, the only person who reads this line is the person with
+    /// no working button, and telling them to press it is the one instruction on the page
+    /// that cannot be followed. So each branch says what is actually true of that build,
+    /// and both say the empty table is empty rather than merely blank.
+    ///
+    /// Said as a function rather than two constants because the two are the same sentence
+    /// with one clause changed — two independent literals would drift.
+    public static func noClients(installCommandAvailable: Bool) -> String {
+        guard installCommandAvailable else {
+            return "No AI client is connected. Portmaster cannot find its CLI binary on "
+                + "this build, so there is no install command here to use yet."
+        }
+        return "No AI client is connected. Copy the install command below and the one you "
+            + "add will show up here."
+    }
 
     // MARK: - The audit log
 
@@ -150,13 +214,16 @@ public enum MCPSettingsCopy {
 
     // MARK: - Installing the CLI
 
-    /// Shown when no built `portmaster-mcp` was found anywhere Portmaster knows to look.
+    /// Shown when no built `portmaster-mcp` was found anywhere Portmaster knows to look —
+    /// inside the app bundle or in a checkout.
     ///
     /// Says how to build it rather than offering a command that points at a file which is
-    /// not there.
+    /// not there. On a shipped build this should never appear, because the binary travels
+    /// inside the bundle; it is the honest answer for a developer build made before
+    /// `swift build` has run.
     public static let binaryNotBuiltNotice =
-        "The portmaster-mcp binary was not found. Build it with:\n"
-        + MCPInstallCommand.buildCommand
+        "Portmaster could not find its CLI binary, so there is no install command to copy. "
+        + "Build it with:\n" + MCPInstallCommand.buildCommand
 
     /// What the install button claims.
     ///
@@ -166,4 +233,78 @@ public enum MCPSettingsCopy {
     public static let installCaption =
         "Paste this into your AI client's terminal to register the built binary. "
         + "Portmaster does not run it for you, and the command has not been run from here."
+
+    // MARK: - The words the page's own layout needs
+
+    /// The headings, buttons and labels the page renders.
+    ///
+    /// They live here for the same reason as the sentences: the app target has no test
+    /// target, so a literal written in `App/` is a string nothing can inspect — and "the
+    /// token is never on this page" is a claim about *every* string the page shows, which
+    /// a test that only walks the copy module cannot make. `MCPSettingsChromeTests` reads
+    /// `App/MCPSettingsTab.swift` and fails on any string literal that is not one of these,
+    /// so the two halves cannot drift apart.
+    public enum Chrome {
+        public static let policyHeading = "What an AI assistant may do here"
+        public static let modePickerLabel = "Mutation mode"
+        public static let modeHint = "How much an AI client connected to Portmaster may change"
+        public static let statusHeading = "Is Portmaster listening"
+        public static let auditLogHeading = "Audit log"
+        public static let installHeading = "Use Portmaster from an AI assistant"
+        public static let clientsHeading = "Connected AI clients"
+        public static let revealButton = "Reveal in Finder"
+        public static let copyButton = "Copy install command"
+        public static let copiedLabel = "Copied"
+        /// Shown when there is no app delegate to read the host from — a state that means
+        /// "this build has no MCP host", not one the person caused.
+        public static let noHostAvailable = "Portmaster's MCP host is not available in this build."
+    }
+
+    /// Every string the MCP settings page renders, in one list.
+    ///
+    /// The inventory the token test walks, and the list `MCPSettingsChromeTests` checks the
+    /// view against. A string added to either side and not the other is a red test, which is
+    /// the only way this property survives a person adding a heading.
+    public static var everyString: [String] {
+        var strings: [String] = []
+        strings += MCPMutationMode.allCases.map(modeTitle(for:))
+        strings += MCPMutationMode.allCases.map(modeConsequence(for:))
+        strings += [Chrome.policyHeading, Chrome.modePickerLabel, Chrome.modeHint]
+        strings += [listening(socket: URL(fileURLWithPath: "/tmp/mcp.sock")), notRunning]
+        strings += [failed(reason: "example reason"), failed(reason: "")]
+        strings += [
+            Chrome.statusHeading,
+            Chrome.auditLogHeading,
+            auditLogCaption,
+            auditLogPath(URL(fileURLWithPath: "/tmp/mcp-audit.log")),
+            Chrome.revealButton,
+            Chrome.installHeading,
+            Chrome.copyButton,
+            Chrome.copiedLabel,
+            binaryNotBuiltNotice,
+            installCaption,
+            noClients(installCommandAvailable: true),
+            noClients(installCommandAvailable: false),
+            Chrome.clientsHeading,
+            readsAvailableInEveryMode,
+        ]
+        strings += MCPMutationMode.allCases.map(modeSaveFailed(mode:))
+        strings += [
+            clientRow(pid: 7, connectedAt: Date(timeIntervalSince1970: 0), lastCallAt: nil),
+            clientRow(
+                pid: 7,
+                connectedAt: Date(timeIntervalSince1970: 0),
+                lastCallAt: Date(timeIntervalSince1970: 600)
+            ),
+        ]
+        strings += [
+            MCPInstallCommand.buildCommand,
+            MCPInstallCommand.command(
+                binaryPath: "/Applications/Portmaster.app/Contents/Resources/"
+                    + MCPStdioRunner.serverName
+            ),
+            Chrome.noHostAvailable,
+        ]
+        return strings
+    }
 }
