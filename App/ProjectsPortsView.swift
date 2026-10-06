@@ -7,6 +7,10 @@ struct ProjectsPortsView: View {
     @State private var query = ""
     @State private var filter: ServiceFilter = .all
     @State private var stopTarget: AppModel.StopTarget?
+    /// A force request is a different question from a graceful one, so it
+    /// cannot ride on `stopTarget` — that would make the sheet ask about a
+    /// force quit while looking like a plain stop.
+    @State private var forceTarget: AppModel.StopTarget?
 
     enum ServiceFilter: String, CaseIterable, Identifiable {
         case all, active, quiet
@@ -28,6 +32,10 @@ struct ProjectsPortsView: View {
         }
         .sheet(item: $stopTarget) { target in
             StopSheet(target: target)
+                .environmentObject(model)
+        }
+        .sheet(item: $forceTarget) { target in
+            StopSheet(target: target, forceFirst: true)
                 .environmentObject(model)
         }
     }
@@ -115,9 +123,15 @@ struct ProjectsPortsView: View {
                             }
                         }
                         ForEach(groups[key] ?? []) { svc in
-                            ServiceRow(service: svc) {
-                                stopTarget = model.processStopTarget(svc.process)
-                            }
+                            ServiceRow(
+                                service: svc,
+                                onStop: { stopTarget = model.processStopTarget(svc.process) },
+                                // Force quit is offered only where a graceful
+                                // attempt is likely to be pointless. See `ServiceRow`.
+                                onForceStop: svc.activity.isQuiet
+                                    ? { forceTarget = model.processStopTarget(svc.process) }
+                                    : nil
+                            )
                         }
                     }
                     .padding(12)
@@ -138,6 +152,7 @@ struct ProjectsPortsView: View {
 struct ServiceRow: View {
     let service: DevService
     let onStop: () -> Void
+    var onForceStop: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -166,9 +181,24 @@ struct ServiceRow: View {
 
             activityLabel
 
-            Button("Stop…", action: onStop)
-                .controlSize(.small)
-                .accessibilityLabel("Stop \(service.displayName), port \(service.primaryPort ?? 0)")
+            HStack(spacing: 6) {
+                Button("Stop…", action: onStop)
+                    .controlSize(.small)
+                    .accessibilityLabel("Stop \(service.displayName), port \(service.primaryPort ?? 0)")
+                // Offered only where a graceful attempt is likely to be
+                // pointless: a quiet dev server is detached, has no terminal
+                // attached, and is often a process that ignores SIGTERM. This
+                // says nothing about whether the service *should* be stopped —
+                // the row's own tooltip already calls quiet an observation,
+                // not a recommendation.
+                if let onForceStop {
+                    Button("Force Quit…") { onForceStop() }
+                        .controlSize(.small)
+                        .foregroundStyle(Color.coral)
+                        .accessibilityLabel("Force quit \(service.displayName), port \(service.primaryPort ?? 0)")
+                        .help("Force quit without asking the process to close first. Unsaved work may be lost.")
+                }
+            }
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .contain)

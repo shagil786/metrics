@@ -6,15 +6,28 @@ struct StopSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let target: AppModel.StopTarget
-    @State private var phase: Phase = .confirm
+    /// Whether the sheet was opened asking for a force quit rather than a
+    /// graceful stop — the quiet-dev-server case, where a graceful attempt is
+    /// usually going to time out. It changes which question `.confirm` asks;
+    /// it does not skip the confirmation. Defaults to a graceful stop so every
+    /// existing caller is unchanged.
+    var forceFirst: Bool = false
+    @State private var phase: StopConfirmationPhase = .confirm
     @State private var outcomes: [pid_t: StopCoordinator.Outcome] = [:]
     @State private var confirmingForce = false
-    enum Phase { case confirm, running, done }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label(target.isProject ? "Quit project" : "Stop processes", systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.orange)
-            StopTargetMemberList(target: target)
+            Label(headline, systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.orange)
+            // A force request is stated as what it is rather than left to the
+            // shared member list's generic save-work notice, which describes a
+            // graceful attempt. Same processes, same identity promise; the
+            // difference is whether they are asked first.
+            StopTargetMemberList(
+                target: target,
+                asksBeforeQuitting: !asksForceFirst,
+                forceOfferPossible: !asksForceFirst
+            )
             Divider()
             if phase == .running {
                 HStack { ProgressView().controlSize(.small); Text("Stopping \(target.name)…") }
@@ -36,8 +49,13 @@ struct StopSheet: View {
                 Spacer()
                 if phase == .confirm {
                     Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                    Button(target.isProject ? "Quit Project" : "Stop Processes", role: .destructive) { run(force: false) }.keyboardShortcut(.defaultAction)
-                        .disabled(target.members.isEmpty || model.prefs.fixtureMode)
+                    if asksForceFirst {
+                        Button("Force Quit", role: .destructive) { run(force: true) }.keyboardShortcut(.defaultAction)
+                            .disabled(target.members.isEmpty || model.prefs.fixtureMode)
+                    } else {
+                        Button(target.isProject ? "Quit Project" : "Stop Processes", role: .destructive) { run(force: false) }.keyboardShortcut(.defaultAction)
+                            .disabled(target.members.isEmpty || model.prefs.fixtureMode)
+                    }
                 } else if phase == .done {
                     if shouldOfferForce { Button("Force Quit…") { confirmingForce = true }.foregroundStyle(Color.coral) }
                     Button("Close") { dismiss() }.keyboardShortcut(.defaultAction)
@@ -50,16 +68,20 @@ struct StopSheet: View {
         } message: { Text("Unsaved work may be lost. Only originally listed processes will be targeted, after another identity check.") }
         .interactiveDismissDisabled(phase == .running)
     }
-    private var shouldOfferForce: Bool {
-        outcomes.values.contains { if case .stopped = $0.status { return false }; return true }
+    private var headline: String {
+        if asksForceFirst { return "Force quit processes" }
+        return target.isProject ? "Quit project" : "Stop processes"
     }
+
+    private var asksForceFirst: Bool { StopConfirmationPhase.asksForceFirst(forceFirst: forceFirst) }
+    private var shouldOfferForce: Bool { StopConfirmationPhase.offersForceQuit(after: outcomes) }
     private func run(force: Bool) {
         guard !model.prefs.fixtureMode else { return }
         phase = .running
         Task { @MainActor in
-            let members = force ? target.members.filter {
-                if case .stopped? = outcomes[$0.pid]?.status { return false }; return true
-            } : target.members
+            let members = force
+                ? StopConfirmationPhase.forceQuitCandidates(target.members, after: outcomes)
+                : target.members
             let results = await model.stopCoordinator.stopConfirmed(members, force: force)
             outcomes.merge(results) { _, new in new }
             phase = .done; model.engine.refreshNow()

@@ -34,11 +34,24 @@ struct OverviewView: View {
                         chartStyleButton("chart.bar.fill", bars: true)
                         chartStyleButton("chart.xyaxis.line", bars: false)
                     }.padding(3).background(Theme.card, in: Capsule())
-                    Button(action: exportOverview) { Label("Export", systemImage: "square.and.arrow.up")
-                        .font(.system(size: 11, weight: .semibold)).padding(.horizontal, 12).padding(.vertical, 8)
+                    // Two exports, two shapes of answer: a CSV is the raw
+                    // readings for something that will read it, and a card is a
+                    // picture for something that will only look at it. Both
+                    // are refused before anything has been sampled — a card of
+                    // no data would still look like data.
+                    Menu {
+                        Button(action: exportOverview) {
+                            Label("Readings as CSV", systemImage: "tablecells")
+                        }
+                        Button(action: exportShareCard) {
+                            Label("Share Card as PNG", systemImage: "photo")
+                        }
+                    } label: {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                            .font(.system(size: 11, weight: .semibold)).padding(.horizontal, 12).padding(.vertical, 8)
+                    }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                         .background(Theme.card, in: Capsule())
-                    }.buttonStyle(.plain).help("Export the current system readings as CSV")
-                        .disabled(model.snapshot.at == .distantPast)
+                        .disabled(!hasReading)
                 }.padding(.bottom, 4)
                 if let exportError { ErrorBanner(message: exportError) { self.exportError = nil } }
                 cardGrid(ids: ["cpu", "memory", "gpu", "disk", "network", "power"], width: geo.size.width)
@@ -63,6 +76,63 @@ struct OverviewView: View {
             if let disk = snap.system.disk {
                 diskBuffer.push(disk.writeBytesPerSec ?? 0)
             }
+        }
+    }
+
+    /// Whether there is anything to export. `distantPast` is the engine's
+    /// "nothing sampled yet" sentinel, so this is the same check the paused
+    /// pill reasons about.
+    private var hasReading: Bool { model.snapshot.at != .distantPast }
+
+    /// The card's content, resolved and formatted before anything is drawn.
+    ///
+    /// Forced light rather than the app's adaptive `Theme`: `Theme.canvas` is a
+    /// dynamic `NSColor` that resolves against the current appearance, so an
+    /// adaptive card would silently come out dark on a Mac in dark mode — a
+    /// share card's appearance should not be decided by a system setting the
+    /// person posting it may not have meant.
+    private var shareCardContent: ShareCardContent {
+        ShareCardContent.make(
+            snapshot: model.snapshot,
+            machineName: ProcessInfo.processInfo.hostName,
+            subtitle: [SystemInfo.chipName(), "\(model.snapshot.system.cpu.coreCount) cores"]
+                .compactMap { $0 }.joined(separator: " · ")
+        )
+    }
+
+    /// Render the card off-screen and write it as a PNG.
+    ///
+    /// A save panel rather than dropping the file in Downloads: the CSV export
+    /// already asks, and a share card is going somewhere specific, so guessing
+    /// the folder would guess wrong about as often as right.
+    private func exportShareCard() {
+        exportError = nil
+        let content = shareCardContent
+        guard content.hasReading else {
+            exportError = "Nothing has been sampled yet. Open Portmaster and let it take a reading first."
+            return
+        }
+        let renderer = ImageRenderer(
+            content: ShareCardView(content: content)
+                .frame(width: ShareCardContent.pixelWidth, height: ShareCardContent.pixelHeight)
+                .environment(\.colorScheme, .light)
+        )
+        renderer.scale = ShareCardContent.renderScale
+        guard let image = renderer.nsImage,
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            exportError = "Could not render the share card."
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Save Share Card"
+        panel.nameFieldStringValue = "Portmaster-card.png"
+        panel.allowedContentTypes = [.png]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try png.write(to: url, options: .atomic) }
+            catch { exportError = "Could not save the share card: \(error.localizedDescription)" }
         }
     }
 
