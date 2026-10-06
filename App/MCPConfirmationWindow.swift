@@ -147,11 +147,15 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
     private func makeWindow() -> NSWindow? {
         let size = NSSize(width: 540, height: 460)
         let created = NSWindow(
-            contentRect: NSRect(origin: Self.frameOrigin(for: size), size: size),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: Self.styleMask,
             backing: .buffered,
             defer: false
         )
+        // The **frame** origin, set after construction: passing a frame origin to
+        // `contentRect` would put the title bar above it and land the window somewhere
+        // other than the one the placement arithmetic chose.
+        created.setFrameOrigin(Self.frameOrigin(for: size))
         created.title = "Confirm AI Request"
         created.isReleasedWhenClosed = false
         let host = NSHostingView(
@@ -171,72 +175,41 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
         return created
     }
 
-    /// Where the window goes: **never under the pointer.**
+    /// The frame origin for this window, on the screen the pointer is on.
     ///
-    /// `NSWindow(contentRect:)` was called with an origin of (0, 0) and no frame set, so
-    /// the window landed in the bottom-left corner of the screen — which is where this
-    /// machine's pointer rests. Three end-to-end runs then recorded `outcome: "allowed"`
-    /// for a mutation nobody approved, and the measurement that explained it logged the
-    /// pointer at (457, 53) with the window at (0, 30, 520, 462): the Approve button's
-    /// centre. Nothing moved the pointer; something clicked where it already was.
+    /// All the arithmetic — including the title-bar correction and the middle-band
+    /// fallback — lives in `ConfirmationWindowPlacement`, where it is a table test rather
+    /// than a parked pointer on somebody's machine. The two things that cannot move out of
+    /// AppKit are here: **measuring** the frame height, and **finding** the screen.
     ///
-    /// So the precondition is removed rather than argued against. The window is placed
-    /// **above** the pointer where it fits and **below** it where it does not, with a
-    /// real gap either way, so a stationary cursor is never inside the frame — and
-    /// therefore never inside the destructive button. The `onHover` gate in the view is
-    /// defence in depth on top of this, not the thing holding it up.
-    ///
-    /// Clamped to `NSScreen.visibleFrame` in both axes, so a pointer near an edge cannot
-    /// push the question off the screen, and horizontally **centred on the pointer**
-    /// rather than stuck to a corner: the old behaviour also meant the window appeared
-    /// somewhere the person had to go and find it.
-    ///
-    /// A parameter for both, so the arithmetic is checkable without a screen.
-    static func frameOrigin(
-        for size: NSSize,
-        pointer: NSPoint,
-        visibleFrame: NSRect
-    ) -> NSPoint {
-        /// More than the button's own inset, so the pointer is nowhere near it rather
-        /// than merely off its centre.
-        let clearance: CGFloat = 24
-
-        // Centred on the pointer, then clamped inside the visible area. Clamping can
-        // only ever move it *away* from the pointer's x, which does not affect the
-        // property above — that is about the vertical axis, where the pointer lands.
-        let halfWidth = size.width / 2
-        let x = min(
-            max(visibleFrame.minX, pointer.x - halfWidth),
-            max(visibleFrame.minX, visibleFrame.maxX - size.width)
-        )
-
-        // Above first: a question reads better below the thing the person is looking at,
-        // and the pointer is usually in the lower half of a screen.
-        let above = pointer.y - clearance - size.height
-        if above >= visibleFrame.minY {
-            return NSPoint(x: x, y: above)
-        }
-        let below = pointer.y + clearance
-        if below + size.height <= visibleFrame.maxY {
-            return NSPoint(x: x, y: below)
-        }
-        // Neither fits: a screen too short for the window to clear the pointer at all.
-        // Centred is the only answer left, and it is stated here because it is the one
-        // case where the guarantee above does not hold.
-        return NSPoint(
-            x: x,
-            y: max(visibleFrame.minY, visibleFrame.maxY - size.height)
-        )
-    }
-
-    /// The origin for the real screen, resolved from the pointer's own display.
-    static func frameOrigin(for size: NSSize) -> NSPoint {
+    /// Measuring rather than assuming is the point. `NSWindow(contentRect:)` positions the
+    /// *content*; the frame is the content plus the title bar, sitting above the given
+    /// origin, so a placement computed against a content height lands the frame's top edge
+    /// inside the very gap it claims to leave. Round 2 of this file got that wrong and
+    /// nothing could have caught it, because the arithmetic was here.
+    private static func frameOrigin(for contentSize: NSSize) -> NSPoint {
+        let frameHeight = NSWindow.frameRect(
+            forContentRect: NSRect(origin: .zero, size: contentSize),
+            styleMask: Self.styleMask
+        ).height
         let pointer = NSEvent.mouseLocation
+        // The screen the pointer is on, not `NSScreen.main`: a person with the app on a
+        // second display should not have the question appear on the other one.
         let screen = NSScreen.screens.first { $0.frame.contains(pointer) } ?? NSScreen.main
         let visible = (screen ?? NSScreen.screens.first)?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: size.width, height: size.height)
-        return frameOrigin(for: size, pointer: pointer, visibleFrame: visible)
+            ?? NSRect(x: 0, y: 0, width: contentSize.width, height: frameHeight)
+        return ConfirmationWindowPlacement.frameOrigin(
+            contentWidth: contentSize.width,
+            frameHeight: frameHeight,
+            pointer: pointer,
+            visibleFrame: visible
+        )
     }
+
+    /// One style mask, named, because `makeWindow` and `frameRect` must agree on it: a
+    /// frame measured with different decorations than the window has is the content-vs-frame
+    /// bug wearing a different hat.
+    private static let styleMask: NSWindow.StyleMask = [.titled, .closable]
 
     // MARK: - Keeping the window and the broker in agreement
 

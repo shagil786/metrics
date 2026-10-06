@@ -346,15 +346,17 @@ check 'tools/list over the socket returns 13 tools' "$tool_count" '13'
 # **that the app itself recorded the attempt.** A call the CLI is still waiting on proves
 # only that the CLI has not been told anything — which is also what "nothing arrived" looks
 # like. Only the app's own audit line can tell those apart, so this makes a relayed
-# mutation, has the gate refuse it, and looks for the refusal *in the app's log*.
-#
-# `temperatureUnit` rather than `mcpMode`: `mcpMode` is the MCP server's own policy, and
-# setting it from here would change the very configuration the rest of the script depends
-# on. Every other allowlisted key is refused identically by the gate.
+# mutation, has the app refuse it, and looks for the refusal *in the app's log*.
 
 section 'Phase 2b — a relayed mutation the app itself refuses'
 
 refusal_before=$(audit_lines)
+# Guarded on the app being up, like the read block below: with it down the CLI falls back
+# to its own sweep and refuses the call itself, which is a different fact and would pass
+# every check below while proving nothing about the relay.
+if [[ -z "$launched_pid" ]]; then
+    fail 'the app was not running, so this phase could not have exercised the relay'
+fi
 out="$work_dir/phase2b.out"
 err="$work_dir/phase2b.err"
 mcp_session "$out" "$err" \

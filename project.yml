@@ -54,10 +54,10 @@ targets:
         product: portmaster-mcp
         link: false
     # Copy the built CLI into Contents/Resources, by the post-build script below
-      # (`scripts/embed-mcp-cli.sh`, whose header explains why it is a script and not an
-      # Xcode Copy Files phase — one was tried and abandoned).
-      # The script copies what Xcode built — it never invokes `swift build`, so it takes no
-      # SwiftPM build lock and does not make an app build depend on the toolchain.
+    # (`scripts/embed-mcp-cli.sh`, whose header explains why it is a script and not an
+    # Xcode Copy Files phase — one was tried and abandoned).
+    # The script copies what Xcode built — it never invokes `swift build`, so it takes no
+    # SwiftPM build lock and does not make an app build depend on the toolchain.
     postBuildScripts:
       - path: scripts/embed-mcp-cli.sh
         name: Embed portmaster-mcp

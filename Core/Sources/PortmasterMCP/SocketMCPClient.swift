@@ -67,10 +67,15 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// tell "the app never got it" from "the app is thinking", and the second sentence
     /// names the one thing that makes it think.
     public static func timeoutText(seconds: TimeInterval) -> String {
-        let rounded = seconds.rounded()
-        return "Portmaster did not answer this call within \(Int(rounded)) seconds, "
-            + "so it was not completed. Portmaster may be waiting for you to answer a "
-            + "confirmation."
+        // Floored at a whole second and pluralised, because the budget is configurable and
+        // a test's own budget is fractional: `Int(0.5.rounded())` is 1 and
+        // `Int(0.4.rounded())` is 0, which rendered as "within 1 seconds" and "within
+        // 0 seconds" respectively.
+        let whole = max(1, Int(seconds.rounded()))
+        let unit = whole == 1 ? "second" : "seconds"
+        return "Portmaster did not answer this call within \(whole) \(unit), so no "
+            + "answer was received. Whether it took effect is not knowable from here — "
+            + "check the audit log and your machine before retrying."
     }
 
     /// How long the handshake may take to be *refused*.
@@ -287,8 +292,19 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     ///
     /// Set by `abandon`, read by the catch above, under the same lock as the connection
     /// state: a client has one session and the two facts are about that one session.
-    /// Cleared when the session is dropped, so a later call that genuinely fails is
-    /// reported as what it was.
+    ///
+    /// **Deliberately never cleared.** An earlier version of this comment claimed it was
+    /// cleared by `disconnect`, which clears `connected` and `client` and nothing else —
+    /// so the comment asserted a safety property the code did not provide, in the one
+    /// function whose job is honest failure attribution. Adding the reset would be worse
+    /// than the stale comment: `abandon` sets the flag and *then* calls `disconnect`, so a
+    /// reset there would clear it before the throw it exists to explain was observed, and
+    /// every timeout would be reported as a missing app again.
+    ///
+    /// Leaving it set is safe, because that same `disconnect` closes the socket, a later
+    /// `open()` cannot succeed, and every later call therefore returns `unavailable`
+    /// before reaching the catch — so the flag is never read against a call it does not
+    /// describe.
     private func gaveUpWaiting() -> Bool {
         lock.withLock { abandonedCall }
     }
