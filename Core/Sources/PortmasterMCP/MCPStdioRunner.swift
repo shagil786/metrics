@@ -68,6 +68,32 @@ public enum MCPStdioRunner {
     public static let eofDrainTimeout: TimeInterval =
         OnDemandProvider.defaultSnapshotTimeout + eofQuietPeriod
 
+    /// The same drain, for a session whose calls are answered by a running app.
+    ///
+    /// **The on-demand bound above is wrong for the relayed route, and using it there
+    /// silently dropped a confirmation.** A relayed mutation under `confirmEach` waits
+    /// for a person, up to `SocketMCPClient.callTimeout` — 75 s by construction. The
+    /// on-demand drain is ~10 s, so a client that wrote its request and closed stdin
+    /// (`printf '…' | portmaster-mcp`, and any one-shot client) had its process exit
+    /// while the confirmation was still open: the socket closed, the answer could not
+    /// be delivered, and nothing said so. `eofDrainTimeout`'s own comment claims a cap
+    /// below the slowest legitimate tool "silently loses the slowest legitimate tool";
+    /// slice 2's confirmation *is* that tool, and the cap had not been told.
+    ///
+    /// Derived from the client's own budget rather than restated, so the two cannot
+    /// drift: the drain must outlast the call it is waiting for, plus the same quiet
+    /// period the on-demand path uses to be sure nothing started late.
+    public static let relayedEofDrainTimeout: TimeInterval =
+        SocketMCPClient.callTimeout + eofQuietPeriod
+
+    /// How long shutdown waits for in-flight work, for the route this session chose.
+    ///
+    /// One function so the choice is a value a test can hold rather than a line
+    /// somewhere in `runMain`.
+    public static func drainTimeout(relayed: Bool) -> TimeInterval {
+        relayed ? relayedEofDrainTimeout : eofDrainTimeout
+    }
+
     /// Serves one session over `transport` and returns when the client is done —
     /// that is, when the transport's input reaches EOF.
     ///
@@ -78,12 +104,17 @@ public enum MCPStdioRunner {
     /// `context` is a call surface, not an executor factory, so the same `serve`
     /// serves the on-demand path and the relayed one without knowing which it has.
     ///
-    /// The session itself lives in `MCPServerSurface.serveSession`, which the socket
-    /// host also calls — the two transports must serve the same `initialize` and
-    /// drain the same way, so there is one implementation of both rather than two
-    /// that agree today.
-    public static func serve(context: any MCPToolCalling, transport: any Transport) async throws {
-        try await MCPServerSurface.serveSession(context: context, transport: transport)
+    /// `drainTimeout` is threaded through rather than read from the runner because the
+    /// socket host also calls `serveSession`, and the two callers have different
+    /// budgets — see `relayedEofDrainTimeout`.
+    public static func serve(
+        context: any MCPToolCalling,
+        transport: any Transport,
+        drainTimeout: TimeInterval = eofDrainTimeout
+    ) async throws {
+        try await MCPServerSurface.serveSession(
+            context: context, transport: transport, drainTimeout: drainTimeout
+        )
     }
 
     /// Serves MCP on stdin/stdout until the client closes stdin. Does not return:
@@ -104,6 +135,9 @@ public enum MCPStdioRunner {
     ///
     /// - Parameter context: serves this surface instead of routing. For a test that
     ///   wants one specific authority; the executable passes none.
+    /// - Parameter drainTimeout: how long shutdown waits for in-flight calls. Passed
+    ///   in rather than derived here because only the caller knows the route, and the
+    ///   two routes have genuinely different budgets — see `relayedEofDrainTimeout`.
     public static func runMain(context: (any MCPToolCalling)? = nil) {
         let session = SessionOutcome()
 
@@ -114,14 +148,19 @@ public enum MCPStdioRunner {
             var relayed: SocketMCPClient?
             do {
                 let surface: any MCPToolCalling
+                let drain: TimeInterval
                 if let context {
                     surface = context
+                    drain = drainTimeout(relayed: false)
                 } else {
                     let route = await MCPRouteSelector.select()
                     if case .proxy(let client) = route { relayed = client }
                     surface = route.context
+                    drain = drainTimeout(relayed: relayed != nil)
                 }
-                try await serve(context: surface, transport: StdioTransport())
+                try await serve(
+                    context: surface, transport: StdioTransport(), drainTimeout: drain
+                )
                 await relayed?.disconnect()
                 session.finish(error: nil)
             } catch {

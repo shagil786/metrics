@@ -296,6 +296,266 @@ final class MCPHostWiringTests: XCTestCase {
         XCTAssertEqual(try reportedMutationMode(after.text), "confirmEach")
     }
 
+    /// The regression this whole file's cancellation half exists for.
+    ///
+    /// **A confirmation nobody answered must never become an `allowed` line.** Three
+    /// runs of `scripts/mcp-e2e.sh` recorded `outcome: "allowed"` for a
+    /// `set_preference` whose client had been killed and whose window no person had
+    /// touched. The only route to `.approved` is the window's Approve button (pinned
+    /// by `MCPApprovalPresentationTests`), and that button used to carry
+    /// `.keyboardShortcut(.defaultAction)` on a window that force-raises and
+    /// activates the app — so a Return meant for another application was a consent.
+    /// The binding is gone; this is the invariant behind that, and it is the one that
+    /// holds whatever the presenter does.
+    ///
+    /// Cancellation is the reachable form of "nobody answered" in a test: the client
+    /// goes away, so the awaiting task is cancelled and its continuation will never
+    /// be serviced. Two things must be true — the action is not performed, and the
+    /// attempt is still on the record, because every mutation attempt leaves a line.
+    func testACancelledConfirmationIsNeverPerformedAndIsStillAudited() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        // A budget long enough that only the cancellation can end this, so the test
+        // cannot pass by timing out instead — and the reason is asserted below for
+        // the same reason. The broker's budget task is not the caller's task and does
+        // not inherit its cancellation, so a cancelled caller still waits the budget
+        // out; keeping it short is what stops this suite from spending minutes.
+        let broker = ConfirmationBroker(timeout: 1)
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach, present: { _ in }  // a window nobody will answer
+        )
+
+        let caller = Task { await context.call(name: "quit_app", arguments: ["id": "app:Chrome"]) }
+        try await waitUntilPending(broker)
+        caller.cancel()
+        _ = await caller.value
+
+        XCTAssertEqual(
+            provider.quitAppCallCount, 0,
+            "a confirmation that was never answered must never perform the action, "
+                + "however the waiting ended"
+        )
+        let outcomes = try auditOutcomes(directory)
+        XCTAssertEqual(
+            outcomes, ["denied"],
+            "an attempt nobody answered is still an attempt: one line, and it is a denial"
+        )
+        let entry = try XCTUnwrap(try auditEntries(directory).first)
+        XCTAssertEqual(entry["tool"] as? String, "quit_app")
+        XCTAssertEqual(
+            entry["reason"] as? String, HostMCPCallContext.abandonedReason,
+            "the caller is gone, so the line has to say that — and saying the timeout "
+                + "instead would mean this test could pass without being cancelled"
+        )
+    }
+
+    /// The same invariant with the approval already in hand.
+    ///
+    /// A person approved, and *then* the client vanished. Approval is consent to
+    /// change the machine on behalf of a caller that is no longer there to receive
+    /// the answer — and the audit line would claim a completed action for a client
+    /// that never heard back. So a cancelled caller loses the approval, and the line
+    /// says the attempt was abandoned rather than performed.
+    ///
+    /// This is the narrow case that makes the rule above a rule rather than an
+    /// accident of ordering: without it, "cancel first" would be the only safe order.
+    func testCancellationAfterAnApprovalRefusesRatherThanPerforms() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let broker = ConfirmationBroker(timeout: 5)
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach, present: { request in
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        let caller = Task { await context.call(name: "quit_app", arguments: ["id": "app:Chrome"]) }
+        caller.cancel()
+        _ = await caller.value
+
+        XCTAssertEqual(
+            provider.quitAppCallCount, 0,
+            "the caller went away, so there is nobody to carry out the change for"
+        )
+        XCTAssertEqual(
+            try auditOutcomes(directory), ["denied"],
+            "and the log must not claim an action happened"
+        )
+    }
+
+    /// A mutation the person never got asked about is `rejected`, not `denied` —
+    /// asserted here as well as in `ToolExecutorMutationTests`, because the hosted
+    /// path is the one a real client takes and it goes through this file's own
+    /// refusal plumbing.
+    func testAMalformedMutationIsAuditedRejectedThroughTheHostPath() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let presented = RecordingPresenter()
+        let broker = ConfirmationBroker(timeout: 5)
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach, present: { request in
+                presented.record(request)
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        let outcome = await context.call(name: "stop_container", arguments: [:])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, "Missing argument: id")
+        XCTAssertEqual(provider.stopContainerCallCount, 0)
+        XCTAssertEqual(try auditOutcomes(directory), ["rejected"])
+    }
+
+    /// Polls until the broker is holding `count` requests, or fails the test.
+    /// Bounded on purpose: a broker that never publishes is a failure to report,
+    /// not a suite to hang.
+    private func waitUntilPending(
+        _ broker: ConfirmationBroker,
+        _ count: Int = 1,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        var seen = 0
+        while Date() < deadline {
+            seen = await broker.queuedCount
+            if seen == count { return }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTFail("expected \(count) pending request(s), saw \(seen)")
+    }
+
+    /// `mcpMode` under `confirmEach`, end to end.
+    ///
+    /// This is the change that used to be impossible. The confirmation window asks
+    /// `PreferencesStore.validate` whether a change is doable *before* it puts it to a
+    /// person, and the validator had no case for `mcpMode` — the one allowlisted key
+    /// the app's preferences blob does not own — so it refused the request and named
+    /// `mcpMode` as allowed in the same sentence. `allowSession` worked, because that
+    /// path asks nobody. So the mode a user had chosen was reachable only by the one
+    /// mode that does not check with anybody.
+    ///
+    /// Asserted as the whole round trip: asked about, answered, written to the file the
+    /// gate reads next, and on the record as `allowed`.
+    func testTheMutationModeIsConfirmedAndWrittenRatherThanRefused() async throws {
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        try MCPSettings(mode: .confirmEach).save(directory: directory)
+        let broker = ConfirmationBroker(timeout: 5)
+        let presented = RecordingPresenter()
+        let app = RecordedAppSurface()
+        let context = makeContext(
+            provider: liveProvider(app, mode: { MCPSettings.load(directory: directory).mode }),
+            broker: broker, directory: directory,
+            mode: nil,  // read the file, as the host does
+            present: { request in
+                presented.record(request)
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        let outcome = await context.call(
+            name: "set_preference", arguments: ["key": "mcpMode", "value": "allowSession"]
+        )
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        let request = try XCTUnwrap(presented.requests.first, "a mode change is asked about")
+        XCTAssertEqual(
+            request.kind, .setPreference,
+            "the mode change reaches a person as a preference change"
+        )
+        XCTAssertTrue(
+            request.summary.contains("mcpMode"), request.summary
+        )
+        XCTAssertEqual(
+            MCPSettings.load(directory: directory).mode, .allowSession,
+            "an approved mode change must land in the file the gate reads next"
+        )
+        XCTAssertEqual(
+            app.preferenceWrites, [],
+            "the server's own policy is not the app's preferences blob"
+        )
+        XCTAssertEqual(
+            try auditOutcomes(directory), ["allowed"],
+            "the one attempt is on the record as the granted change it was"
+        )
+    }
+
+    /// The other half of the same round trip: the mode a user has just set decides the
+    /// very next call, without a restart.
+    func testAModeChangedThroughAConfirmationGovernsTheNextCall() async throws {
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        try MCPSettings(mode: .confirmEach).save(directory: directory)
+        let broker = ConfirmationBroker(timeout: 5)
+        let presented = RecordingPresenter()
+        let app = RecordedAppSurface()
+        let context = makeContext(
+            provider: liveProvider(app, mode: { MCPSettings.load(directory: directory).mode }),
+            broker: broker, directory: directory,
+            mode: nil,
+            present: { request in
+                presented.record(request)
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        _ = await context.call(
+            name: "set_preference", arguments: ["key": "mcpMode", "value": "off"]
+        )
+        let refused = await context.call(name: "quit_app", arguments: ["id": "app:Chrome"])
+
+        XCTAssertTrue(refused.isError)
+        XCTAssertEqual(refused.text, "MCP mutations are disabled in Portmaster settings.")
+        XCTAssertEqual(app.stops, [], "and nothing was performed")
+        XCTAssertEqual(
+            presented.requests.count, 1,
+            "the second call was refused by the mode, so nobody was asked about it"
+        )
+    }
+
+    /// The app quitting with a question on screen.
+    ///
+    /// `MCPHostController.stop()` answers every pending request before it closes the
+    /// socket, so this is the ordinary path and it already recorded a line. It is
+    /// pinned separately from the cancellation case because they are different events
+    /// with different reasons: here the *app* is leaving and nothing will ever answer,
+    /// which is what `MCPHostController.quittingReason` is for. The property is the
+    /// same one — the attempt is on the record — and it is the last chance to put it
+    /// there, because after this there is no process left to write it.
+    func testQuittingWithAConfirmationPendingRecordsTheAttempt() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let broker = ConfirmationBroker(timeout: 600)  // only the quit can end this
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach, present: { _ in }
+        )
+
+        let caller = Task {
+            await context.call(name: "stop_project", arguments: ["id": "/src/api"])
+        }
+        try await waitUntilPending(broker)
+
+        // What the app does on the way out, and the reason it gives.
+        await broker.cancelAll(reason: "Portmaster is quitting, so this action was not taken.")
+        let outcome = await caller.value
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(provider.stopProjectCallCount, 0, "a quit performs nothing")
+        XCTAssertEqual(
+            try auditOutcomes(directory), ["denied"],
+            "the last process to write this line is the one quitting, so it has to"
+        )
+        let entry = try XCTUnwrap(try auditEntries(directory).first)
+        XCTAssertTrue(
+            (entry["reason"] as? String)?.contains("quitting") == true,
+            "and it must say the app went away rather than that a person said no: "
+                + "\(entry)"
+        )
+    }
+
     // MARK: - The refusal the app's own snapshot closure owes a cold sampler
 
     /// The app's snapshot closure throws this, and `LiveDataProvider` passes

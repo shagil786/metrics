@@ -477,6 +477,14 @@ private struct MCPConfirmationView: View {
     let approve: () -> Void
     let deny: () -> Void
 
+    /// Whether the pointer has entered the Approve button for **this** request.
+    ///
+    /// `@State`, not a published field on `MCPApprovalState`: it describes this
+    /// rendering of the window, not anything about the decision, and it must not
+    /// survive a decision — hence the `onChange` below, which clears it whenever the
+    /// window adopts a different request.
+    @State private var pointerEntered = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             if let request = state.request {
@@ -497,7 +505,12 @@ private struct MCPConfirmationView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        }.padding(18).frame(width: 520, height: 430)
+        }
+        .padding(18).frame(width: 520, height: 430)
+        // Re-armed from scratch for every request. Without this the hover that armed
+        // the button for the question before it would still be armed for this one, and
+        // the second question would need no pointer movement at all to be approved.
+        .onChange(of: state.request?.id) { _, _ in pointerEntered = false }
     }
 
     private func header(for request: MCPApprovalRequest) -> some View {
@@ -559,11 +572,48 @@ private struct MCPConfirmationView: View {
                 Spacer()
                 // Cancel action, and the window's close button behaves the same way:
                 // neither is consent.
+                //
+                // Escape stays on Deny because refusing is the safe direction: a stray
+                // Escape costs the caller a retry, and the window says why.
                 Button("Deny", role: .cancel, action: deny).keyboardShortcut(.cancelAction)
                 if let request = state.request {
-                    Button(MCPApprovalCopy.approveTitle(for: request.kind), role: .destructive, action: approve)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(state.stopTarget?.members.isEmpty ?? false)
+                    // **Three things stand between this button and a change nobody
+                    // asked for**, and all three are here on purpose.
+                    //
+                    // 1. **No key binding.** It used to be
+                    //    `.keyboardShortcut(.defaultAction)` — Return — on a window that
+                    //    `raise()` activates, so a Return meant for another application
+                    //    was a consent to quit somebody's processes.
+                    // 2. **Disabled until the pointer has entered it.**
+                    //    `.onHover` fires on a *transition*, and this window opens
+                    //    under wherever the pointer already is: AppKit gives an
+                    //    `NSWindow(contentRect:)` no origin, so it lands in the
+                    //    bottom-left, and on this machine the pointer was parked at
+                    //    (457, 53) — inside that window, on this button. Anything that
+                    //    clicks where the pointer happens to be (an automation, a
+                    //    remote-desktop frame, a stuck mouse button, a stray tap on a
+                    //    trackpad) then approved the mutation. Measured: `approve()`
+                    //    fired ~3 s after the request was presented with the pointer
+                    //    never moving, 3 runs out of 3.
+                    // 3. **`pointerEntered` is reset for every request**, so approving
+                    //    one question never leaves the button armed for the next.
+                    //
+                    // The hover gate is the load-bearing one. A click with no hover
+                    // transition behind it — which is exactly what a synthesised click
+                    // at a parked pointer is — cannot enable the button, so it cannot
+                    // approve. The person has to move there.
+                    Button(
+                        MCPApprovalCopy.approveTitle(for: request.kind),
+                        role: .destructive,
+                        action: approve
+                    )
+                    .onHover { inside in
+                        if inside { pointerEntered = true }
+                    }
+                    .disabled(
+                        pointerEntered == false
+                            || (state.stopTarget?.members.isEmpty ?? false)
+                    )
                 }
             }
         }

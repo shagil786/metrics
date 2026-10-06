@@ -387,6 +387,30 @@ final class MCPApprovalPresentationTests: XCTestCase {
         XCTAssertEqual(MCPApprovalCopy.outcome(for: .approve), .approved)
     }
 
+    /// **One action in this enum is an approval, and it is the pointer one.**
+    ///
+    /// Enumerated rather than asserting the approve case alone, because the property
+    /// that matters is the *count*: a fourth `Action` added to this enum — for a
+    /// notification, a timeout, a shortcut — is a fourth way to be `.approved`, and
+    /// the three below are the only three that exist. A mapping where something other
+    /// than `.approve` granted consent would make a stray event destructive.
+    ///
+    /// The other half of the rule is in the view rather than here: `.approve` is now
+    /// reachable only by a deliberate click, because the button no longer carries
+    /// `.keyboardShortcut(.defaultAction)`. Nothing in this module can enforce a key
+    /// binding, so that half is held by the comment at the button and by the fact that
+    /// `HostMCPCallContext` refuses any attempt whose caller stopped waiting
+    /// (`testCancellationAfterAnApprovalRefusesRatherThanPerforms`).
+    func testApproveIsTheOnlyActionThatGrantsConsent() {
+        let approving = MCPApprovalCopy.Action.allCases.filter {
+            MCPApprovalCopy.outcome(for: $0) == .approved
+        }
+        XCTAssertEqual(
+            approving, [.approve],
+            "only a deliberate pointer action on the Approve button may grant consent"
+        )
+    }
+
     func testDenyingIsARefusalCarryingAReason() throws {
         guard case .denied(let reason) = MCPApprovalCopy.outcome(for: .deny) else {
             return XCTFail("a denial must be a denial")

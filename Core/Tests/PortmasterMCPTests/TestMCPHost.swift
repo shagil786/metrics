@@ -34,6 +34,30 @@ final class RecordingHostContext: MCPToolCalling, @unchecked Sendable {
     }
 }
 
+/// A host whose calls take longer than the on-demand drain and then answer.
+///
+/// The shape a confirmation has from the client's side: the request is relayed, the app
+/// is busy with a person, and the answer comes back eventually. `testARelayedCallOutliving
+/// TheOnDemandDrainIsStillAnswered` points this at a delay just past
+/// `MCPStdioRunner.eofDrainTimeout`, which is the bound the old code used for every
+/// route — so a client that closed stdin while this was running used to exit without
+/// ever hearing back.
+final class SlowHostContext: MCPToolCalling, @unchecked Sendable {
+    private let delay: TimeInterval
+    private let lock = NSLock()
+    private var recordedCalls = 0
+
+    init(delay: TimeInterval) { self.delay = delay }
+
+    var calls: Int { lock.withLock { recordedCalls } }
+
+    func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+        lock.withLock { recordedCalls += 1 }
+        try? await Task.sleep(for: .seconds(delay))
+        return ToolOutcome(text: #"{"mutationMode":"confirmEach"}"#, isError: false)
+    }
+}
+
 /// A host whose calls never answer.
 ///
 /// This is the *wedged app* shape from the other side: the handshake works, `initialize`

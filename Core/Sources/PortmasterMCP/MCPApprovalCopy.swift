@@ -30,7 +30,7 @@ public enum MCPApprovalCopy {
     /// Deliberately not a `Bool` and not an `ApprovalOutcome`: "the window was closed"
     /// and "the person said no" are different acts that reach the AI client differently,
     /// and a type that cannot tell them apart will eventually treat them alike.
-    public enum Action: Equatable, Sendable {
+    public enum Action: Equatable, Sendable, CaseIterable {
         /// The person agreed.
         case approve
         /// The person said no.

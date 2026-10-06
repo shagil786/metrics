@@ -88,6 +88,30 @@ public final class PreferencesStore: @unchecked Sendable {
     /// refusals exist to prevent. The refusals below are `apply`'s own, so there is
     /// one answer to "can this be applied" in the module.
     public static func validate(key: String, value: String) throws {
+        // `mcpMode` is this MCP server's own mutation policy. It is not a field of
+        // `AppPreferences` — `MCPSettings` owns it, beside the audit log, precisely so
+        // the server can read and write it whether or not the UI is running — and
+        // `ToolExecutor.setPreference` performs the write after this check.
+        //
+        // So it is validated here rather than through `apply`, and the split is the
+        // whole point: `validate` answers "can this request be carried out?", which
+        // covers every key the executor's allowlist advertises, while `apply` answers
+        // "can this be written into the app's preferences blob?", which `mcpMode`
+        // cannot be. `validate` used to be `apply` against a throwaway blob and nothing
+        // else, so the two questions were one question — and the confirmation window
+        // validates through here before it will put a change to a person, which meant
+        // every `mcpMode` change was refused by the window with a sentence that
+        // refused `mcpMode` while listing `mcpMode` as allowed.
+        if key == "mcpMode" {
+            guard Self.matching(MCPMutationMode.self, value) != nil else {
+                throw MCPToolError(
+                    message: "Invalid mcpMode: \(value). Allowed: "
+                        + MCPMutationMode.allCases.map(\.rawValue).joined(separator: ", ")
+                        + "."
+                )
+            }
+            return
+        }
         var scratch = AppPreferences()
         try apply(key: key, value: value, to: &scratch)
     }
@@ -125,12 +149,15 @@ public final class PreferencesStore: @unchecked Sendable {
             guard let unit = Self.matching(TemperatureUnit.self, value) else { throw invalid() }
             preferences.presentation.temperatureUnit = unit
         default:
-            // Unreachable through the tool surface, which refuses a key outside
-            // the allowlist before the provider is touched — and `mcpMode`, which
-            // the executor handles itself, is the one allowed key this switch has
-            // no case for. Quoting the executor's list rather than a second copy of
-            // it means a rejection can never name a key as allowed that the
-            // executor would have let through, or hide one it would have refused.
+            // Two kinds of key land here and they mean different things. A key nobody
+            // may write at all is the allowlist refusal, quoting the executor's list so
+            // a rejection can never name a key the executor would have let through, or
+            // hide one it would have refused. `mcpMode` is the other: the executor
+            // *does* let it through, because it is the MCP server's own policy rather
+            // than a field of this blob, so refusing it here is what stops the on-demand
+            // provider writing the server's mode into the app's preferences. Its own
+            // validity is checked by `validate`, which is the question the confirmation
+            // window asks; this one is "can this blob hold it?", and the answer is no.
             throw MCPToolError(
                 message: "Preference '\(key)' cannot be changed via MCP. Allowed: "
                     + ToolExecutor.allowedPreferenceKeysDescription() + "."

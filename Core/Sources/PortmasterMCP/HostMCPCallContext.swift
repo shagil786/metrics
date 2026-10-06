@@ -41,6 +41,16 @@ public struct HostMCPCallContext: MCPToolCalling {
     public static let confirmationTimedOutMessage =
         "No answer to Portmaster's confirmation prompt, so this action was not taken."
 
+    /// What a client is told when it stopped waiting before anybody answered.
+    ///
+    /// Its own sentence rather than `confirmationTimedOutMessage`, because they are
+    /// different facts: one is a person who was asked and said nothing, the other is
+    /// a caller that is no longer there to hear an answer. An audit log that
+    /// reported the second as the first would send a reader looking for a person who
+    /// was never asked.
+    public static let abandonedReason =
+        "The AI client stopped waiting for an answer, so this action was not taken."
+
     private let provider: any DataProvider
     private let broker: ConfirmationBroker
     /// Opens the confirmation. The caller decides what "cannot ask" means — today
@@ -104,16 +114,46 @@ public struct HostMCPCallContext: MCPToolCalling {
             return await run(name: name, arguments: normalized, gate: makeGate(for: settings))
         }
 
-        switch await confirm(Self.request(for: tool, arguments: normalized)) {
-        case .approved:
-            return await run(
-                name: name, arguments: normalized, gate: Self.approvedGate
-            )
-        case .denied(let reason):
-            return refusal(name: name, arguments: normalized, reason: reason)
-        case .timedOut:
-            return refusal(
-                name: name, arguments: normalized, reason: Self.confirmationTimedOutMessage
+        // One line per attempt, whichever way it ends — including the way it ends
+        // here, which is the one that used to write nothing at all. A `CheckedContinuation`
+        // resumes whatever the awaiting task has since decided to do, so a cancelled
+        // caller is woken anyway; without this the cancellation path is the one branch
+        // in the whole feature that leaves no record of an attempt somebody made.
+        let audit = OneAttemptAudit(directory: auditDirectory)
+        let request = Self.request(for: tool, arguments: normalized)
+
+        return await withTaskCancellationHandler {
+            switch await confirm(request) {
+            case .approved:
+                // **The approval is not enough on its own.** A person said yes to a
+                // change on behalf of a caller; if that caller has gone, there is
+                // nobody to carry the change out for, and performing it would be a
+                // mutation with no recipient — reported to the log as `allowed`, for
+                // a client that never heard back. Silence is never consent, and a
+                // consent with nobody to give it to is not consent.
+                if Task.isCancelled {
+                    return abandoned(name: name, arguments: normalized, audit: audit)
+                }
+                return await run(
+                    name: name, arguments: normalized, gate: Self.approvedGate
+                )
+            case .denied(let reason):
+                return refusal(
+                    name: name, arguments: normalized, reason: reason, audit: audit
+                )
+            case .timedOut:
+                return refusal(
+                    name: name, arguments: normalized,
+                    reason: Self.confirmationTimedOutMessage, audit: audit
+                )
+            }
+        } onCancel: {
+            // Runs synchronously on whichever thread cancelled, because that is the
+            // only moment guaranteed to arrive: the awaiting task may never run again,
+            // so a line written from inside it would be a line that might not exist.
+            audit.record(
+                tool: name, arguments: normalized,
+                outcome: "denied", reason: Self.abandonedReason
             )
         }
     }
@@ -234,9 +274,60 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// happened", and here it is also what a person refusing, or failing to answer,
     /// means: nothing happened. The reason travels in both places, because the caller
     /// needs it and the log is where anyone looking at this an hour later will look.
-    private func refusal(name: String, arguments: [String: String], reason: String) -> ToolOutcome {
-        AuditLog(directory: auditDirectory)
-            .record(tool: name, arguments: arguments, outcome: "denied", reason: reason)
+    private func refusal(
+        name: String, arguments: [String: String], reason: String, audit: OneAttemptAudit
+    ) -> ToolOutcome {
+        audit.record(tool: name, arguments: arguments, outcome: "denied", reason: reason)
         return ToolOutcome(text: reason, isError: true)
+    }
+
+    /// The caller stopped waiting, so the attempt ends without happening.
+    ///
+    /// `denied` rather than a fourth word: nothing was permitted either, and the log's
+    /// job here is to say that an attempt was made and refused, which `denied` already
+    /// means. The `reason` is what distinguishes this from a person saying no.
+    private func abandoned(
+        name: String, arguments: [String: String], audit: OneAttemptAudit
+    ) -> ToolOutcome {
+        audit.record(
+            tool: name, arguments: arguments,
+            outcome: "denied", reason: Self.abandonedReason
+        )
+        return ToolOutcome(text: Self.abandonedReason, isError: true)
+    }
+}
+
+/// Writes at most one audit line for one mutation attempt.
+///
+/// The cancellation handler and the refusal path can both fire for the same attempt —
+/// a cancelled caller is resumed anyway, so both run — and two lines for one attempt
+/// would make the log a *worse* account of what happened than the single refusal it is
+/// recording. First writer wins; whoever loses is told so, which is why this returns
+/// whether it wrote rather than returning nothing.
+///
+/// `@unchecked Sendable` with a lock, because the whole point is that one of the two
+/// callers is a cancellation handler and the other is a task on an arbitrary executor:
+/// there is no queue to serialise them, so the exclusion has to be explicit.
+private final class OneAttemptAudit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded = false
+    private let audit: AuditLog
+
+    init(directory: URL?) {
+        audit = AuditLog(directory: directory)
+    }
+
+    /// Records the attempt unless something already has. Returns whether this call was
+    /// the one that wrote.
+    @discardableResult
+    func record(
+        tool: String, arguments: [String: String], outcome: String, reason: String?
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !recorded else { return false }
+        recorded = true
+        audit.record(tool: tool, arguments: arguments, outcome: outcome, reason: reason)
+        return true
     }
 }

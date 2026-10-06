@@ -279,9 +279,16 @@ public enum MCPServerSurface {
     ///
     /// Every wait here is bounded. A handler that hangs costs the deadline and
     /// nothing more: no client can keep the server alive by work it will not finish.
+    ///
+    /// `drainTimeout` is a parameter rather than a constant because only the caller
+    /// knows how long this session's calls can legitimately take — a relayed session
+    /// waits for a person, an on-demand one waits for a sampler, and giving either the
+    /// other's budget drops a slow call or hangs a dead one. The socket host passes the
+    /// same budget the stdio runner does.
     public static func serveSession(
         context: any MCPToolCalling,
-        transport: any Transport
+        transport: any Transport,
+        drainTimeout: TimeInterval = MCPStdioRunner.eofDrainTimeout
     ) async throws {
         let server = makeServer()
         // Handlers are registered before `start` so the server is complete the
@@ -292,7 +299,7 @@ public enum MCPServerSurface {
         await server.waitUntilCompleted()
         await tracker.waitUntilIdle(
             quiet: MCPStdioRunner.eofQuietPeriod,
-            timeout: MCPStdioRunner.eofDrainTimeout
+            timeout: drainTimeout
         )
         await server.stop()
     }

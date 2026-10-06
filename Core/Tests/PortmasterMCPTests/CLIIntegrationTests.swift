@@ -160,6 +160,53 @@ final class CLIIntegrationTests: XCTestCase {
         XCTAssertNotNil(try jsonObject(text)["mutationMode"], text)
     }
 
+    /// A relayed call outlives the on-demand drain, and the answer still arrives.
+    ///
+    /// This is the end-to-end proof of `MCPStdioRunner.relayedEofDrainTimeout`. The
+    /// child is launched with **stdin closed immediately** — `writeAndClose`, the shape
+    /// `printf '…' | portmaster-mcp` produces — while a relayed call is still in
+    /// flight, and the call deliberately takes longer than `MCPStdioRunner
+    /// .eofDrainTimeout` (about 10 s). Under the old single bound the process exited
+    /// mid-call: the question was asked of a person and its answer had nowhere to go.
+    ///
+    /// The delay is the on-demand budget plus a margin, **not** a real 60-second
+    /// confirmation: this is about the shape of the shutdown, and a test that spent a
+    /// minute proving it would be a test people delete.
+    func testARelayedCallOutlivingTheOnDemandDrainIsStillAnswered() async throws {
+        let delay = MCPStdioRunner.eofDrainTimeout + 2
+        let fixture = try startHost(context: SlowHostContext(delay: delay))
+
+        let server = try MCPServerProcess.launch(
+            environment: [MCPRouteSelector.endpointDirectoryVariable: fixture.directory.path]
+        )
+        try server.writeAndClose([
+            """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":\
+            {"protocolVersion":"2025-06-18","capabilities":{},\
+            "clientInfo":{"name":"test","version":"0"}}}
+            """,
+            #"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            """
+            {"jsonrpc":"2.0","id":2,"method":"tools/call",\
+            "params":{"name":"get_settings","arguments":{}}}
+            """,
+        ])
+
+        // The bound under test, so a failure says which wait ran out.
+        let replies = try server.linesWrittenBeforeExit(
+            timeout: delay + MCPStdioRunner.relayedEofDrainTimeout
+        )
+        let answered = replies.contains { line in
+            guard let object = try? MCPServerProcess.jsonObject(line) else { return false }
+            return object["id"] as? Int == 2
+        }
+        XCTAssertTrue(
+            answered,
+            "the relayed call outlived the on-demand drain and was dropped without an "
+                + "answer; stdout held: \(replies)"
+        )
+    }
+
     // MARK: The live read, and the run loop it depends on
 
     /// Pins the run loop requirement.
