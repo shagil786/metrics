@@ -11,6 +11,13 @@
 # MCP client spawns, not a library the app links. `MCPInstallCommand.binaryCandidates`
 # searches the bundle's Resources directory first for exactly this path.
 #
+# WHY A SCRIPT AND NOT AN XCODE "COPY FILES" PHASE. XcodeGen only emits a `copyFiles`
+# phase from a **source** path that exists when the project is generated — and the source
+# here is `$(BUILT_PRODUCTS_DIR)/portmaster-mcp`, which exists only once Xcode has built
+# it, after generation. A `copyFiles` entry was tried and abandoned for exactly that
+# reason: it resolves at generation time, not at build time, so it names a file that does
+# not exist yet and copies nothing. Do not reintroduce one.
+#
 # SIGNING. The copy is signed ad-hoc here (`codesign -s -`), which is what makes it runnable
 # from a locally built app. It is NOT what a distributed build needs: a nested executable
 # must carry the same Developer ID signature as the app for Gatekeeper to run it on another

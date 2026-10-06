@@ -53,12 +53,9 @@ targets:
       - package: PortmasterCore
         product: portmaster-mcp
         link: false
-    # Copy the built CLI into Contents/Resources, by a post-build script. There is no
-      # Xcode "Copy Files" phase here and one cannot be added: XcodeGen only emits one
-      # from a *source* path that exists when the project is generated, and this file's
-      # path (BUILT_PRODUCTS_DIR/portmaster-mcp) only exists once Xcode has built it.
-      # A `copyFiles` entry was tried and abandoned for exactly that reason — it
-      # resolves at generation time, not at build time. Do not reintroduce one.
+    # Copy the built CLI into Contents/Resources, by the post-build script below
+      # (`scripts/embed-mcp-cli.sh`, whose header explains why it is a script and not an
+      # Xcode Copy Files phase — one was tried and abandoned).
       # The script copies what Xcode built — it never invokes `swift build`, so it takes no
       # SwiftPM build lock and does not make an app build depend on the toolchain.
     postBuildScripts:

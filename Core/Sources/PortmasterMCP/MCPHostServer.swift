@@ -403,7 +403,18 @@ public final class MCPHostServer: @unchecked Sendable {
         let recording = RecordingContext(base: context) { connection.recordCall() }
 
         do {
-            try await MCPServerSurface.serveSession(context: recording, transport: transport)
+            // The relayed drain, named explicitly. This is one end of a relay whose other
+            // end is the CLI, and the two used to disagree about the same logical event:
+            // the CLI waited `relayedEofDrainTimeout` for this session's calls to finish
+            // while this side took the on-demand default. Nothing observable went wrong —
+            // the *client* gives up first either way — but two sides of one relay
+            // reasoning about the same deadline differently is the kind of thing that
+            // becomes a bug the moment either of them is measured rather than assumed.
+            try await MCPServerSurface.serveSession(
+                context: recording,
+                transport: transport,
+                drainTimeout: MCPStdioRunner.relayedEofDrainTimeout
+            )
         } catch {
             // Keeping the host up is right — one bad connection is not worth taking the
             // socket down for. Silence is not: this feature's whole failure surface is

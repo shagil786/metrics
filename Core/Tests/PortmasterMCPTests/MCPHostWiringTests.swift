@@ -385,31 +385,6 @@ final class MCPHostWiringTests: XCTestCase {
         )
     }
 
-    /// A mutation the person never got asked about is `rejected`, not `denied` —
-    /// asserted here as well as in `ToolExecutorMutationTests`, because the hosted
-    /// path is the one a real client takes and it goes through this file's own
-    /// refusal plumbing.
-    func testAMalformedMutationIsAuditedRejectedThroughTheHostPath() async throws {
-        let provider = StubProvider()
-        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
-        let presented = RecordingPresenter()
-        let broker = ConfirmationBroker(timeout: 5)
-        let context = makeContext(
-            provider: provider, broker: broker, directory: directory,
-            mode: .confirmEach, present: { request in
-                presented.record(request)
-                Task { await broker.decide(id: request.id, outcome: .approved) }
-            }
-        )
-
-        let outcome = await context.call(name: "stop_container", arguments: [:])
-
-        XCTAssertTrue(outcome.isError)
-        XCTAssertEqual(outcome.text, "Missing argument: id")
-        XCTAssertEqual(provider.stopContainerCallCount, 0)
-        XCTAssertEqual(try auditOutcomes(directory), ["rejected"])
-    }
-
     /// Polls until the broker is holding `count` requests, or fails the test.
     /// Bounded on purpose: a broker that never publishes is a failure to report,
     /// not a suite to hang.
@@ -554,6 +529,68 @@ final class MCPHostWiringTests: XCTestCase {
             "and it must say the app went away rather than that a person said no: "
                 + "\(entry)"
         )
+    }
+
+    /// A malformed mutation is `rejected` under **every** mode, including the one that asks
+    /// a person.
+    ///
+    /// This file's earlier version of the malformed-mutation test passed a presenter, so
+    /// the malformed request was put to a person — refused there for a reason that had
+    /// nothing to do with the problem, audited `denied`, which says *the user refused it*.
+    /// Ruling R3 exists so a buggy client is not counted among the user's refusals, and
+    /// `confirmEach` was the one mode where it was counted. So this pins both halves: the
+    /// outcome is `rejected`, and **nobody is asked**.
+    func testAMalformedMutationIsRejectedWithoutAskingAnyone() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let presented = RecordingPresenter()
+        let broker = ConfirmationBroker(timeout: 5)
+        let context = makeContext(
+            provider: provider, broker: broker, directory: directory,
+            mode: .confirmEach,
+            present: { request in
+                presented.record(request)
+                Task { await broker.decide(id: request.id, outcome: .approved) }
+            }
+        )
+
+        let outcome = await context.call(name: "stop_container", arguments: [:])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, "Missing argument: id")
+        XCTAssertEqual(
+            presented.requests.count, 0,
+            "a request that cannot be carried out must never be put to a person: they "
+                + "would be asked to authorise \"Stop container ?\""
+        )
+        XCTAssertEqual(provider.stopContainerCallCount, 0)
+        XCTAssertEqual(
+            try auditOutcomes(directory), ["rejected"],
+            "and it must be the executor's word, not a refusal attributed to the user"
+        )
+    }
+
+    /// The same request under `allowSession`, where no one is asked anyway.
+    ///
+    /// Written as a separate test because the point is that the two modes *agree* — and
+    /// two code paths producing one vocabulary is exactly what R3 is about.
+    func testAMalformedMutationIsRejectedUnderASessionGrantToo() async throws {
+        let provider = StubProvider()
+        let directory = try makeTemporaryDirectory(prefix: "pmwiring")
+        let presented = RecordingPresenter()
+        let context = makeContext(
+            provider: provider, broker: ConfirmationBroker(timeout: 5),
+            directory: directory, mode: .allowSession, appRunning: { true },
+            present: { presented.record($0) }
+        )
+
+        let outcome = await context.call(name: "quit_app", arguments: ["id": "   "])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, "Missing argument: id")
+        XCTAssertEqual(provider.quitAppCallCount, 0)
+        XCTAssertEqual(presented.requests.count, 0)
+        XCTAssertEqual(try auditOutcomes(directory), ["rejected"])
     }
 
     // MARK: - The refusal the app's own snapshot closure owes a cold sampler

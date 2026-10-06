@@ -107,6 +107,41 @@ public struct HostMCPCallContext: MCPToolCalling {
         // and the line the audit log writes describe the same values the tool will
         // act on.
         let normalized = ToolExecutor.normalizing(arguments, for: tool)
+
+        // **At most one line from here, and at least one whenever the caller goes
+        // away.** A `CheckedContinuation` resumes whatever the awaiting task has since
+        // decided to do, so a cancelled caller is woken anyway; without the handler
+        // below, cancellation was the one branch in the whole feature that left no
+        // record of an attempt somebody made.
+        //
+        // "At most", not "exactly": `OneAttemptAudit` covers every line written *through
+        // this context* — the refusals and the cancellation. A cancellation that lands
+        // between the `.approved` branch's `Task.isCancelled` check and the dispatch
+        // below can still produce a second line from `ToolExecutor`'s own `allowed`,
+        // because the executor has no idea this context exists. Closing that would mean
+        // threading the one-shot into `ToolExecutor` and every construction site; flagged
+        // rather than done, because the race is narrow and the fix is not.
+        let audit = OneAttemptAudit(directory: auditDirectory)
+
+        // **Checked here, before a person is asked anything.** The same check the
+        // executor runs, and deliberately so: without it, a mutation missing a required
+        // argument reaches the window, where `Self.request` builds its question from
+        // whatever is there — a `stop_container` with no `id` becomes "Stop container ?",
+        // and `resolve` refuses it for a reason that has nothing to do with the problem.
+        // The person is asked to authorise a malformed request, answers no, and the
+        // attempt is audited `denied` — which says *they refused it*. Ruling R3 exists so
+        // a buggy client is not counted among the user's refusals, and under the one mode
+        // that asks a person it was being counted exactly there.
+        //
+        // `rejected`, the executor's own word for this, and the executor's own reason, so
+        // the two modes cannot report the same request two different ways.
+        if let missing = ToolExecutor.firstMissingRequiredArgument(in: normalized, for: tool) {
+            return refusal(
+                name: name, arguments: normalized,
+                reason: "Missing argument: \(missing)", audit: audit, outcome: "rejected"
+            )
+        }
+
         let settings = loadSettings()
         guard settings.mode == .confirmEach else {
             // `.off` and `.allowSession` are `PermissionGate`'s answers, including
@@ -114,12 +149,6 @@ public struct HostMCPCallContext: MCPToolCalling {
             return await run(name: name, arguments: normalized, gate: makeGate(for: settings))
         }
 
-        // One line per attempt, whichever way it ends — including the way it ends
-        // here, which is the one that used to write nothing at all. A `CheckedContinuation`
-        // resumes whatever the awaiting task has since decided to do, so a cancelled
-        // caller is woken anyway; without this the cancellation path is the one branch
-        // in the whole feature that leaves no record of an attempt somebody made.
-        let audit = OneAttemptAudit(directory: auditDirectory)
         let request = Self.request(for: tool, arguments: normalized)
 
         return await withTaskCancellationHandler {
@@ -275,9 +304,10 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// means: nothing happened. The reason travels in both places, because the caller
     /// needs it and the log is where anyone looking at this an hour later will look.
     private func refusal(
-        name: String, arguments: [String: String], reason: String, audit: OneAttemptAudit
+        name: String, arguments: [String: String], reason: String, audit: OneAttemptAudit,
+        outcome: String = "denied"
     ) -> ToolOutcome {
-        audit.record(tool: name, arguments: arguments, outcome: "denied", reason: reason)
+        audit.record(tool: name, arguments: arguments, outcome: outcome, reason: reason)
         return ToolOutcome(text: reason, isError: true)
     }
 

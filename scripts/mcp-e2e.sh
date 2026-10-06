@@ -340,16 +340,139 @@ for line in open(sys.argv[1]):
 ' "$out")
 check 'tools/list over the socket returns 13 tools' "$tool_count" '13'
 
-# --- a confirmation, and what it records --------------------------------------
+# --- a relayed mutation that needs nobody -------------------------------------
+#
+# The point of this block is that it asserts something the `pending` check below cannot:
+# **that the app itself recorded the attempt.** A call the CLI is still waiting on proves
+# only that the CLI has not been told anything — which is also what "nothing arrived" looks
+# like. Only the app's own audit line can tell those apart, so this makes a relayed
+# mutation, has the gate refuse it, and looks for the refusal *in the app's log*.
+#
+# `temperatureUnit` rather than `mcpMode`: `mcpMode` is the MCP server's own policy, and
+# setting it from here would change the very configuration the rest of the script depends
+# on. Every other allowlisted key is refused identically by the gate.
 
-# The current preference value is read back first, so the confirmed write is a
-# no-op rather than a change to the user's machine.
+section 'Phase 2b — a relayed mutation the app itself refuses'
+
+refusal_before=$(audit_lines)
+out="$work_dir/phase2b.out"
+err="$work_dir/phase2b.err"
+mcp_session "$out" "$err" \
+    "$(initialize_request)" \
+    "$(initialized_notification)" \
+    "$(tools_call 6 quit_app '{"id":"mcp-e2e-no-such-app"}')"
+
+refusal_after=$(audit_lines)
+# Two different facts, two variables: what came back down the socket, and what the app
+# wrote to its own log. Reading one into the other is how a check ends up passing on the
+# wrong evidence — which it did, the first time.
+refusal_is_error=$(python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get("id") == 6:
+        # `isError` lives on the result object; the text is the refusal sentence, which
+        # is prose and must never be parsed as JSON.
+        print("error" if message.get("result", {}).get("isError") is True else "ok")
+        break
+' "$out")
+refusal_outcome=$(outcome_for "$refusal_before" quit_app)
+
+check 'the relayed call came back with isError set' "$refusal_is_error" 'error'
+check 'the app wrote the refusal to its own audit log' "$refusal_outcome" 'denied'
+
+# The app and the CLI are different processes with different pids, and only the app
+# hosts the gate — so a line carrying the CLI's pid would mean the refusal came from the
+# on-demand path and this check proved nothing.
+app_pid=$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["pid"])
+except Exception:
+    print("")
+' "$endpoint_file")
+# Only the lines *this phase* appended: the log is shared and cumulative, so "the first
+# quit_app in the file" is whichever run got there first, not this one.
+relayed_pid=$(python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        continue
+    if entry.get("tool") == "quit_app":
+        print(entry.get("pid", ""))
+        break
+' < <(new_audit_lines "$refusal_before"))
+check 'the refusal was written by the app, not by the CLI' "$relayed_pid" "$app_pid"
+
+# --- a relayed read, answered by the app --------------------------------------
+
+# `tools/list` above proves the catalog arrived, which is static. This proves a *call*
+# round-tripped to the app and came back with the app's own answer — the thing the relay
+# exists for, and the thing `--no-manual` otherwise never exercised.
 settings_out="$work_dir/phase2-settings.out"
 settings_err="$work_dir/phase2-settings.err"
 mcp_session "$settings_out" "$settings_err" \
     "$(initialize_request)" \
     "$(initialized_notification)" \
     "$(tools_call 5 get_settings '{}')"
+
+settings_error=$(python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get("id") == 5:
+        result = message.get("result", {})
+        print("error" if result.get("isError") else "ok")
+        break
+' "$settings_out")
+check 'a relayed read came back without an error' "$settings_error" 'ok'
+# Guarded on the app actually being up: with it down the CLI falls back to its own
+# sweep and answers the same request, so the check would pass without having
+# exercised the relay at all.
+if [[ -z "$launched_pid" ]]; then
+    fail 'the app was not running, so these checks could not have exercised the relay'
+fi
+relayed_mode=$(python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get("id") == 5:
+        text = "".join(
+            part.get("text", "") for part in message.get("result", {}).get("content", [])
+        )
+        print(json.loads(text).get("mutationMode", ""))
+        break
+' "$settings_out")
+if [[ -n "$relayed_mode" ]]; then
+    pass "the app answered get_settings with its own mutation mode ($relayed_mode)"
+else
+    fail 'get_settings returned no mutation mode, so the relay answered nothing'
+fi
+
+# --- a confirmation, and what it records --------------------------------------
 
 if [[ $allow_manual -eq 1 && -n "$launched_pid" ]]; then
     # The value written back is whatever the machine already reports, so an approved

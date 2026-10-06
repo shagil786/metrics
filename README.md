@@ -130,7 +130,7 @@ Mode lives in `~/.portmaster/mcp-settings.json` as one key:
 
 **`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: **Settings → MCP**, or edit `~/.portmaster/mcp-settings.json` yourself. That is deliberate — an assistant cannot widen its own permissions.
 
-The Settings page also shows whether the server is listening (and on which socket), how many clients are connected, the most recent audit lines with a **Reveal in Finder** button for the log itself, and the install command. The mode is re-read on every call, so changing it takes effect immediately — no restart.
+The Settings page also shows whether the server is listening (and on which socket), how many clients are connected, **the audit log's path** with a **Reveal in Finder** button, and the install command. It does not show the log's contents — read it with `tail -f ~/.portmaster/mcp-audit.log` or open it in an editor. The mode is re-read on every call, so changing it takes effect immediately — no restart.
 
 ### Talking to a wedged app
 
@@ -159,7 +159,11 @@ Every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log
 
 The line is written *after* the action for `allowed`/`failed`, so for anything that reached the provider the log answers "did the stop actually work?", not merely "was it permitted?".
 
-**Every mutation attempt leaves exactly one line, including the ones that never happened.** That includes an attempt whose client gave up before anybody answered (`denied`, reason *"The AI client stopped waiting for an answer…"*) and one where the app was quitting underneath it (`denied`, reason *"Portmaster is quitting…"*). So when you are asking "did my assistant try that?", the log can answer even for the attempts that ended in a disconnect — which is exactly the case that used to be invisible.
+**Almost every mutation attempt leaves a line, including the ones that never happened.** An attempt whose client gave up before anybody answered is recorded (`denied`, reason *"The AI client stopped waiting for an answer…"*), and so is one where the app was quitting underneath it (`denied`, reason *"Portmaster is quitting…"*). That is the class of question the log exists for — "did my assistant try that?" — and it used to be invisible for exactly the attempts that mattered most.
+
+**The exception, so you are not sent looking for a line that is not there:** if the app is *killed or crashes* while a confirmation is on screen, the process that would write the line is the one that died, and nothing is recorded. There is also a narrow race in which a client that disconnects at the same moment an approval arrives can leave two lines for one attempt — one `denied` from this path and one `allowed` from the tool layer. Both are known and neither is silent; if you are counting refusals, treat a doubled pair as one attempt.
+
+**When the CLI says Portmaster isn't running, believe it only sometimes.** Two different failures used to produce that one sentence. If a client *probe* fails — no endpoint file, no socket, a refused token — then "Portmaster isn't running" is the honest summary. If a **call times out** — the handshake succeeded, the catalog came back, and then a tool call went silent — it now says *"Portmaster did not answer this call within N seconds, so it was not completed. Portmaster may be waiting for you to answer a confirmation."* That second case almost always means a confirmation window is open somewhere, or the app is wedged; look at the window before you go looking for a process.
 
 **Reading it when something looks wrong.** The `reason` is the fastest discriminator, because each refusal has its own sentence rather than a shared one: *"MCP mutations are disabled…"* is the mode, *"Portmaster must be open to approve…"* is `confirmEach` with no app to ask, *"No answer to Portmaster's confirmation prompt…"* is a person who was asked and did not answer within 60 s, *"The AI client stopped waiting…"* is a client that hung up, and *"Preference 'X' cannot be changed via MCP"* is a key outside the allowlist.
 

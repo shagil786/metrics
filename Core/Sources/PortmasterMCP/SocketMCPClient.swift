@@ -51,6 +51,28 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     public static let unavailableText =
         "Portmaster isn't running; showing on-demand readings instead."
 
+    /// What a client is told when the app **answered** and then went quiet.
+    ///
+    /// Its own sentence, and not `unavailableText`, because the two are different facts.
+    /// `unavailableText` is for a probe that failed: no endpoint file, no socket, a
+    /// refused token, a dead pid — every one of which really does mean there is no app to
+    /// talk to. A **truncated call** is not that: the handshake completed, the catalog
+    /// came back, and then a `tools/call` produced silence. The app is up. The most
+    /// likely reason is a confirmation window waiting on a person, which is exactly what
+    /// `confirmEach` is for.
+    ///
+    /// Saying "isn't running" there invents a cause, and this repo's whole thesis is not
+    /// to: it sends the reader looking for an app that was running the entire time, and
+    /// away from the window asking them a question. The bound is named so the reader can
+    /// tell "the app never got it" from "the app is thinking", and the second sentence
+    /// names the one thing that makes it think.
+    public static func timeoutText(seconds: TimeInterval) -> String {
+        let rounded = seconds.rounded()
+        return "Portmaster did not answer this call within \(Int(rounded)) seconds, "
+            + "so it was not completed. Portmaster may be waiting for you to answer a "
+            + "confirmation."
+    }
+
     /// How long the handshake may take to be *refused*.
     ///
     /// A rejection is silence followed by a close, so "was I admitted?" can only be
@@ -133,6 +155,10 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     private let lock = NSLock()
     private var client: Client?
     private var connected = false
+    /// Whether the last call on this session was abandoned by the watchdog rather than
+    /// refused by the app. See `gaveUpWaiting()`: it is what keeps a truncated call from
+    /// being reported as a missing app.
+    private var abandonedCall = false
 
     /// A connected, authenticated client, or `nil` — never a throw the caller has to
     /// translate.
@@ -245,8 +271,26 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
                 "a relayed MCP call failed on the wire",
                 detail: "pid \(ProcessInfo.processInfo.processIdentifier) asked the app for \(name)"
             )
+            // Unless it was **our** watchdog that ended the wait: `abandon` disconnects,
+            // which is what resumes the SDK's pending request, so the throw above is then
+            // our own doing and not a wire failure. Reporting that as "isn't running"
+            // blames an app that answered the handshake a moment ago — the lie this
+            // branch exists to avoid, and the one the confirmation-window case produced.
+            if gaveUpWaiting() {
+                return ToolOutcome(text: Self.timeoutText(seconds: budget), isError: true)
+            }
             return Self.unavailable
         }
+    }
+
+    /// Whether this client gave up on a call rather than being refused one.
+    ///
+    /// Set by `abandon`, read by the catch above, under the same lock as the connection
+    /// state: a client has one session and the two facts are about that one session.
+    /// Cleared when the session is dropped, so a later call that genuinely fails is
+    /// reported as what it was.
+    private func gaveUpWaiting() -> Bool {
+        lock.withLock { abandonedCall }
     }
 
     /// Completes MCP's `initialize`, or reports that there is no app to talk to.
@@ -377,6 +421,10 @@ public final class SocketMCPClient: MCPToolCalling, @unchecked Sendable {
     /// request — which is why the call's `await` ends at all — and it is what stops the
     /// next one from waiting at all, since a client with no session answers immediately.
     private func abandon(tool name: String) async {
+        // Set before the disconnect, because the disconnect is what resumes the SDK's
+        // pending request and therefore what makes the call above throw — the flag has
+        // to be in place before that throw can be observed, not after it is handled.
+        lock.withLock { abandonedCall = true }
         MCPDiagnostics.hostFailure(
             "a relayed MCP call did not answer in time",
             detail: "pid \(ProcessInfo.processInfo.processIdentifier) asked the app for \(name)"

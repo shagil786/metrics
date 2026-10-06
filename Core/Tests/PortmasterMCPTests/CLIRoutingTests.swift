@@ -304,8 +304,10 @@ final class CLIRoutingTests: XCTestCase {
     private static func someOtherToken(_ other: String) throws -> String {
         let replacement: Character = other.first == "0" ? "1" : "0"
         var flipped = other
-        flipped.replaceSubrange(other.startIndex..<other.index(after: other.startIndex),
-                               with: String(replacement))
+        flipped.replaceSubrange(
+            other.startIndex..<other.index(after: other.startIndex),
+            with: String(replacement)
+        )
         XCTAssertNotEqual(flipped, other, "the replacement token must actually differ")
         return flipped
     }
@@ -460,7 +462,15 @@ final class CLIRoutingTests: XCTestCase {
         let elapsed = Date().timeIntervalSince(began)
 
         XCTAssertTrue(outcome.isError, outcome.text)
-        XCTAssertEqual(outcome.text, SocketMCPClient.unavailableText)
+        // Its own sentence, not `unavailableText`. The host in this test is *alive and
+        // silent* — the shape a confirmation window waiting on a person has — so
+        // "Portmaster isn't running" is the one thing the client cannot know and must not
+        // say. It sends whoever reads it looking for an app that was running the whole
+        // time.
+        XCTAssertEqual(
+            outcome.text,
+            SocketMCPClient.timeoutText(seconds: Self.stallBudget)
+        )
         XCTAssertGreaterThan(
             elapsed, Self.stallBudget * 0.5,
             "the answer must have come from the bound, not from something failing early"
@@ -566,10 +576,22 @@ final class CLIRoutingTests: XCTestCase {
         "the sum of two declared budgets is exactly the slowest designed case; a margin is "
             + "what keeps the next undocumented cost past it from truncating a call"
     )
-    // And the refusal a client gives when it gives up must not name a cause it cannot know.
+    // And neither refusal may name a cause the client cannot know. `unavailableText` is
+    // for a *probe* that failed — no endpoint, no socket, refused token — where "isn't
+    // running" is the honest summary. A call that was **truncated** is a different fact:
+    // the app answered the handshake and then went quiet, so it gets its own text, and
+    // the two must not be the same string.
     XCTAssertTrue(
         SocketMCPClient.unavailableText.contains("isn't running"),
-        "this is the message a truncated call produces, which is why the bound above matters"
+        "this is what a failed probe says, and it is only true there"
+    )
+    XCTAssertFalse(
+        SocketMCPClient.timeoutText(seconds: 75).contains("isn't running"),
+        "a truncated call is not a missing app; the host answered and then went quiet"
+    )
+    XCTAssertTrue(
+        SocketMCPClient.timeoutText(seconds: 75).contains("75"),
+        "and it must name the bound it gave up at, because that is what the reader needs"
     )
 }
 
