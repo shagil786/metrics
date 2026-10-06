@@ -1,9 +1,9 @@
 // ConfirmationWindowPlacement: where the "Confirm AI Request" window may go.
 //
-// The one rule: **never under the pointer.** Not "the button is disabled until the
-// pointer arrives" — never *under*. The window is a destructive consent prompt, and a
-// prompt that appears beneath a stationary cursor is one stray click from approving
-// itself. That is not hypothetical: three end-to-end runs recorded `outcome: "allowed"`
+// The one rule: **never under the pointer, wherever the screen is tall enough to put the
+// window entirely on one side of it.** Not "the button is disabled until the pointer
+// arrives" — never *under*. The window is a destructive consent prompt, and a prompt that
+// appears beneath a stationary cursor is one stray click from approving itself. That is not hypothetical: three end-to-end runs recorded `outcome: "allowed"`
 // for a mutation nobody approved, and the measurement that explained it logged the
 // pointer at (457, 53) with the window at (0, 30, 520, 462) — the Approve button's
 // centre. Nothing had moved the pointer.
@@ -75,31 +75,48 @@ public enum ConfirmationWindowPlacement {
         if above + frameHeight <= visibleFrame.maxY {
             return NSPoint(x: x, y: above)
         }
-        return fallback(x: x, visibleFrame: visibleFrame, frameHeight: frameHeight)
+        return fallback(
+            x: x, pointer: pointer, visibleFrame: visibleFrame, frameHeight: frameHeight
+        )
     }
 
     /// Neither side fits, so the window has to overlap the pointer's row.
     ///
-    /// **Reachable for any pointer in the middle band of the screen**, and the band is
-    /// non-empty on every display shorter than `2 * (clearance + frameHeight)` — about
-    /// 1072 pt of usable height with this window, which includes 1440×900 and 1280×800
-    /// laptops as well as the 970 pt case first claimed. A pointer near the top or
-    /// bottom of the screen is always cleared; a pointer near the middle is not, because
-    /// a 488 pt frame cannot sit entirely on one side of it.
+    /// **Reachable for any pointer in the middle band of the screen.** A frame clears the
+    /// pointer when it fits below it (`pointer.y - clearance - frameHeight >= minY`) or
+    /// above it (`pointer.y + clearance + frameHeight <= maxY`), so the band where neither
+    /// holds spans `2 * (clearance + frameHeight)` of the screen and every display shorter
+    /// than that has one. A pointer near the top or bottom of the screen is always
+    /// cleared; a pointer near the middle is not, because the frame cannot sit entirely on
+    /// one side of it.
     ///
-    /// (A round-2 version of this comment claimed the fallback was only for displays
-    /// under about 970 pt. The table test in
-    /// `ConfirmationWindowPlacementTests` showed that wrong — 1440×900 has a 364 pt
-    /// middle band — so the precondition is stated as it actually is.)
+    /// (Round 2 of this comment claimed the fallback was only for displays under about
+    /// 970 pt; round 3 quoted 1072 and a 364 pt band, which were wrong *and mutually
+    /// inconsistent* with the formula above them. The figures below are the formula
+    /// evaluated for this window, and `ConfirmationWindowPlacementTests` asserts each one
+    /// so they cannot go stale again — which is the only reason to trust a number written
+    /// in a comment.)
     ///
     /// The honest consequence: when the pointer is mid-screen, it *can* end up inside the
     /// frame, and the window's `onHover` gate is then the thing standing between a parked
     /// cursor and a consent. The gate is defence in depth everywhere else and load-bearing
     /// here, which is why it was kept.
     ///
-    /// Pinned to the top of the visible area, where the title bar is furthest from the
-    /// pointer for a cursor in the lower half of the screen.
-    static func fallback(x: CGFloat, visibleFrame: NSRect, frameHeight: CGFloat) -> NSPoint {
-        NSPoint(x: x, y: max(visibleFrame.minY, visibleFrame.maxY - frameHeight))
+    /// Placed in whichever half the pointer is **not** in, so a mid-band cursor lands near
+    /// the window's *header* rather than its footer — the footer is where Approve and Deny
+    /// live, and the one thing worth avoiding is the cursor coming to rest on the
+    /// destructive button when the geometry has already had to give up.
+    ///
+    /// An improvement, not a fix: the pointer is inside the frame either way, which is
+    /// what `fallback`'s own doc says, and the `onHover` gate is what prevents the click.
+    /// What changes is which end of the window the cursor ends up near.
+    static func fallback(
+        x: CGFloat, pointer: NSPoint, visibleFrame: NSRect, frameHeight: CGFloat
+    ) -> NSPoint {
+        let low = visibleFrame.minY + frameHeight / 2
+        return NSPoint(
+            x: x,
+            y: pointer.y < low ? visibleFrame.maxY - frameHeight : visibleFrame.minY
+        )
     }
 }

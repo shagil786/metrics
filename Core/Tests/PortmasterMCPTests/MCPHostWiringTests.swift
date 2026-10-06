@@ -577,19 +577,21 @@ final class MCPHostWiringTests: XCTestCase {
     func testAMalformedMutationIsRejectedUnderASessionGrantToo() async throws {
         let provider = StubProvider()
         let directory = try makeTemporaryDirectory(prefix: "pmwiring")
-        let presented = RecordingPresenter()
         let context = makeContext(
             provider: provider, broker: ConfirmationBroker(timeout: 5),
             directory: directory, mode: .allowSession, appRunning: { true },
-            present: { presented.record($0) }
+            present: { _ in XCTFail("allowSession must not put anything to a person") }
         )
 
         let outcome = await context.call(name: "quit_app", arguments: ["id": "   "])
 
+        // The text and the outcome are the whole point of this test: the two modes must
+        // agree on both, because a client with a bug in it should get the same answer and
+        // leave the same record whichever mode the user happens to be in. Nothing about
+        // *presenting* is asserted here — `allowSession` asks nobody, so it could not fail.
         XCTAssertTrue(outcome.isError)
         XCTAssertEqual(outcome.text, "Missing argument: id")
         XCTAssertEqual(provider.quitAppCallCount, 0)
-        XCTAssertEqual(presented.requests.count, 0)
         XCTAssertEqual(try auditOutcomes(directory), ["rejected"])
     }
 

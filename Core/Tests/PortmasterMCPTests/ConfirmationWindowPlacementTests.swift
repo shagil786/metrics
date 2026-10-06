@@ -240,11 +240,108 @@ final class ConfirmationWindowPlacementTests: XCTestCase {
         XCTAssertTrue(
             Self.onScreen(frame, short), "the fallback must still stay on the screen"
         )
-        XCTAssertEqual(
-            origin.y, short.maxY - Self.frameHeight, accuracy: 0.001,
-            "the fallback is the top of the visible area, where the title bar is furthest "
-                + "from a cursor low on the screen"
+        // The overlap is the *point* of the exception, so it is asserted rather than
+        // described: a change that made the fallback stop overlapping would be an
+        // improvement, but this test would then be lying about why it exists.
+        XCTAssertTrue(
+            frame.contains(pointer),
+            "precondition: the documented exception is that the frame does cover the "
+                + "pointer — if this ever stops being true, the exception can go too"
         )
+    }
+
+    /// The fallback lands away from the window's buttons.
+    ///
+    /// Pinning it to the top unconditionally — round 3's behaviour — is what this
+    /// replaces. With the window at the top, a mid-band cursor comes to rest against the
+    /// window's *bottom* edge, and the bottom is where Approve and Deny are. The rule now
+    /// splits the screen at the midpoint of the bottom placement, so a cursor in the band
+    /// ends up near the title bar instead.
+    ///
+    /// Both halves of the band are covered on both short screens, because the behaviour
+    /// this replaces only shows on one of them.
+    func testTheFallbackKeepsTheCursorAwayFromTheButtons() {
+        let clearance = ConfirmationWindowPlacement.clearance
+        for (name, screen) in [
+            ("1280×800", NSRect(x: 0, y: 0, width: 1280, height: 800)),
+            ("1440×900", NSRect(x: 0, y: 0, width: 1440, height: 900)),
+        ] {
+            // The band is where `canClear` is false: above `clearedLow` a frame fits on
+            // top of the cursor, below `clearedHigh` it fits underneath, between them
+            // neither does.
+            let clearedLow = screen.maxY - Self.frameHeight - clearance
+            let clearedHigh = screen.minY + Self.frameHeight + clearance
+            let split = screen.minY + Self.frameHeight / 2
+
+            for (label, pointer) in [
+                ("lower half of the band", NSPoint(x: screen.midX, y: clearedLow + 20)),
+                ("upper half of the band", NSPoint(x: screen.midX, y: clearedHigh - 20)),
+                ("middle of the band", NSPoint(x: screen.midX, y: (clearedLow + clearedHigh) / 2)),
+            ] {
+                let origin = ConfirmationWindowPlacement.frameOrigin(
+                    contentWidth: Self.contentWidth, frameHeight: Self.frameHeight,
+                    pointer: pointer, visibleFrame: screen
+                )
+                let frame = Self.frame(origin: origin)
+
+                if label != "upper half of the band" {
+                    XCTAssertTrue(
+                        frame.contains(pointer),
+                        "\(name), \(label): this half of the band is covered by the "
+                            + "fallback, which is the documented exception"
+                    )
+                }
+                XCTAssertEqual(
+                    frame.minY,
+                    pointer.y < split ? screen.maxY - Self.frameHeight : screen.minY,
+                    accuracy: 0.001,
+                    "\(name), \(label): the split is at the midpoint of the bottom placement"
+                )
+                // The property the change is for. In y-up space `maxY` is the title bar
+                // and `minY` is the footer, where the two buttons are. (The upper half of
+                // the band ends up *uncovered* — the window sits below the cursor — which
+                // is strictly better than covering it; round 3's unconditional top
+                // placement would have covered it and put the cursor on the buttons.)
+                XCTAssertLessThan(
+                    abs(frame.maxY - pointer.y), abs(frame.minY - pointer.y),
+                    "\(name), \(label): the cursor must rest nearer the title bar than "
+                        + "the buttons — frame \(frame), pointer \(pointer)"
+                )
+            }
+        }
+    }
+
+    /// The numbers `fallback`'s doc quotes, evaluated rather than restated.
+    ///
+    /// Round 3's comment claimed 1072 pt and a 364 pt band; both were wrong, and they
+    /// were inconsistent with each other. Asserting them here is what stops the next
+    /// reader having to take a comment's arithmetic on trust — and it fails the moment
+    /// `clearance`, the window size or the title bar changes.
+    func testTheNumbersTheCommentQuotesAreTheOnesTheConstantsProduce() {
+        let clearance = ConfirmationWindowPlacement.clearance
+        let threshold = 2 * (clearance + Self.frameHeight)
+
+        XCTAssertEqual(threshold, 1024, accuracy: 0.001, "2 * (clearance + frameHeight)")
+        for (name, screen, expectedBand) in [
+            ("1440×900", NSRect(x: 0, y: 0, width: 1440, height: 900), CGFloat(124)),
+            ("1280×800", NSRect(x: 0, y: 0, width: 1280, height: 800), CGFloat(224)),
+        ] {
+            // Below `clearedHigh` a frame fits underneath the cursor; above
+            // `clearedLow` it fits on top. Between them, neither.
+            let clearedLow = screen.maxY - Self.frameHeight - clearance
+            let clearedHigh = screen.minY + Self.frameHeight + clearance
+            XCTAssertEqual(
+                clearedHigh - clearedLow, expectedBand, accuracy: 0.001,
+                "\(name): the middle band quoted in `fallback`'s doc"
+            )
+            XCTAssertGreaterThan(
+                clearedHigh, clearedLow, "\(name): precondition — the band exists"
+            )
+            XCTAssertLessThan(
+                screen.height, threshold,
+                "\(name): precondition — this screen is short enough to have a band"
+            )
+        }
     }
 
     // MARK: Horizontal

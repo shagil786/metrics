@@ -90,7 +90,7 @@ claude mcp add portmaster -- "$(cd Core && swift build -c release --show-bin-pat
 
 Use the path exactly as `--show-bin-path` prints it — it is already absolute, so prefixing it with anything (`$PWD/`, say) yields a path that does not exist. It differs per machine and per toolchain, which is why the command asks rather than hardcodes; a toolchain that printed a relative path would need an absolute prefix before `claude mcp add` stores it, since the client spawns the binary with its own working directory rather than yours. This form registers in the default `--scope local`, meaning it is available in this project only; pass `--scope user` to make it available everywhere you use the client.
 
-`claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same absolute binary path. The executable takes no arguments and needs no environment; stdout carries JSON-RPC and nothing else.
+`claude mcp add` syntax can vary by client version — if your client rejects that line, check its MCP docs for the current form and pass the same absolute binary path. The executable takes no arguments; stdout carries JSON-RPC and nothing else. It reads two environment variables, both documented under *Talking to a wedged app*, and needs neither.
 
 ### Tools
 
@@ -112,7 +112,7 @@ Nine read tools and four mutations. A read never changes anything; a mutation is
 | `stop_project` | **Mutation** — stop every process in a detected project | `id` (required) |
 | `set_preference` | **Mutation** — change one allowlisted preference | `key`, `value` (both required) |
 
-A value that has not been measured is **left out** of the payload rather than filled with a plausible zero. What "left out" looks like depends on the shape: an entire section of `get_system_overview` (say `battery`) is simply absent, and inside a *series* such as a `get_history_rankings` resource reading, each point is present and only its `value` is absent — so treat a missing `value` as a gap in the line, not as a zero. A refusal — mutation disabled, unknown app, bad argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
+A value that has not been measured is **left out** of the payload rather than filled with a plausible zero. What "left out" looks like depends on the shape: an entire section of `get_system_overview` (say `battery`) is simply absent, and inside a *series* such as a `get_history_rankings` resource reading, each point is present and only its `value` is absent — so treat a missing `value` as a gap in the line, not as a zero. A refusal — mutation disabled, unknown app, missing argument — arrives as the tool's own text with `isError` set; it is not a transport failure.
 
 ### Mutation modes
 
@@ -125,10 +125,10 @@ Mode lives in `~/.portmaster/mcp-settings.json` as one key:
 | Mode | Effect |
 | --- | --- |
 | `off` (default) | Every mutation is refused: *"MCP mutations are disabled in Portmaster settings."* |
-| `confirmEach` | Every mutation opens a **confirmation window in the Portmaster app** — "Confirm AI Request", naming the change and what it would affect — and runs only if you press its button. If the app is not running there is nobody to ask, so it is refused: *"Portmaster must be open to approve this action."* If nobody answers within 60 seconds the window says so and refuses. Silence is never consent. |
+| `confirmEach` | Every mutation that could be carried out opens a **confirmation window in the Portmaster app** — "Confirm AI Request", naming the change and what it would affect — and runs only if you press its button. If the app is not running there is nobody to ask, so it is refused: *"Portmaster must be open to approve this action."* If nobody answers within 60 seconds the window says so and refuses. Silence is never consent. A mutation **missing a required argument** never reaches a window at all — it is refused as `rejected` before anyone is asked, because there is nothing to ask about. |
 | `allowSession` | Mutations are permitted while the Portmaster app is running, and refused when it is not. Nothing is asked. |
 
-**`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: **Settings → MCP**, or edit `~/.portmaster/mcp-settings.json` yourself. That is deliberate — an assistant cannot widen its own permissions.
+**`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: **Settings → MCP**, or edit `~/.portmaster/mcp-settings.json` yourself. That is deliberate — an assistant cannot widen its own permissions. The one exception is `mcpMode` **itself**, which is an ordinary mutation: once `allowSession` is on, a client can change the mode through the normal path, and under `confirmEach` it can do so with a click. It still cannot do it from `off`.
 
 The Settings page also shows whether the server is listening (and on which socket), how many clients are connected, **the audit log's path** with a **Reveal in Finder** button, and the install command. It does not show the log's contents — read it with `tail -f ~/.portmaster/mcp-audit.log` or open it in an editor. The mode is re-read on every call, so changing it takes effect immediately — no restart.
 
@@ -140,7 +140,7 @@ If Portmaster is running but not answering (the window is up, the tools hang), s
 
 ### Audit log
 
-Every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log` (owner-readable only, `0600`, inside a `0700` directory):
+Almost every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log` (owner-readable only, `0600`, inside a `0700` directory) — the two cases that leave no line are named at the end of this section, so read it before you rely on it:
 
 ```json
 {"arguments":{"id":"nonexistent-app-id-for-gate-check"},"tool":"quit_app","pid":60663,"ts":"2026-10-03T17:02:13Z","reason":"MCP mutations are disabled in Portmaster settings.","outcome":"denied"}
@@ -191,7 +191,7 @@ The line is written *after* the action for `allowed`/`failed`, so for anything t
 
 - The read-only dashboard needs **no permissions** — it reads your own user's processes and socket tables.
 - Direct distribution build (App Sandbox **off**). That's what makes per-process metrics, project attribution, and stop actions possible; a sandboxed Mac App Store build would show "Unattributed" for other apps' processes and would have stop actions disabled.
-- Hardened runtime is on; the app is ad-hoc signed for local development. For wider distribution, add Developer ID signing and notarization — configuration only, no code changes.
+- Hardened runtime is on; the app is ad-hoc signed for local development. For wider distribution it needs Developer ID signing and notarization — and that is **not** configuration only: the signing step below has to reach inside the bundle.
 - **The bundled `portmaster-mcp` is signed ad-hoc, and that is not release-ready.** The app's post-build script signs the nested executable with `codesign -s -`, which is enough to run it from a locally built app and nothing more: a nested executable has to carry the app's own **Developer ID** signature for Gatekeeper on another Mac, and `scripts/package-dmg.sh` re-signs nothing. **A released build has to sign the bundle once, deepest first, before packaging** — `Contents/Resources/portmaster-mcp`, then the app. Until that exists, a notarized app would ship a CLI that Gatekeeper refuses, and the Settings page would name a path that does not work on a user's machine. Nothing here has been checked against a notarized copy.
 - [Local DMG packaging and signed-update setup](Support/Release.md): the installer includes an Applications shortcut. Sparkle checks are disabled until a real HTTPS feed and Ed25519 public key are configured. Developer ID signing/notarization and actual update delivery remain release work.
 - New installs see a welcome screen; legacy preferences skip it. Welcome can be reopened from Settings → Privacy. Notification permission is requested through an explicit Alerts action rather than at launch.
@@ -232,9 +232,11 @@ Core/                    PortmasterCore package (no UI deps)
     Stop/                SIGTERM/SIGKILL coordinator with verification
     History/             SwiftData store, retention, clear-all
     Fixtures/            preview data (opt-in, labeled)
-  Sources/PortmasterMCP/ MCP tool catalog, permission gate, audit log,
-                         on-demand provider (no UI, no app required)
-  Sources/portmaster-mcp/ stdio executable serving MCP on stdin/stdout
+  Sources/PortmasterMCP/ MCP tool catalog, permission gate, audit log, wire payloads,
+                         Unix-socket host + relay client, confirmation broker and window
+                         placement, on-demand provider (no UI, no app required)
+  Sources/portmaster-mcp/ stdio executable: serves MCP on stdin/stdout, and routes each
+                         session to the running app when there is one
   Tests/                 parser/attribution/breakdown unit tests + live smoke tests
                          (+ PortmasterMCPTests for the tool layer)
 design-reference/        captured frames of the Vitals 1.2 reference video
