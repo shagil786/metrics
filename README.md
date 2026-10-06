@@ -56,13 +56,25 @@ Graceful stop sends SIGTERM; force quit sends SIGKILL and is offered after an un
 
 ## MCP server (for AI assistants)
 
-Portmaster ships a local [MCP](https://modelcontextprotocol.io) server, `portmaster-mcp`, so an AI assistant can read the same machine telemetry the menu bar shows — CPU, memory, apps, containers, projects, history, temperatures, alerts, settings — and, only if you say so, act on it. It speaks MCP over stdio, runs entirely on this Mac, and answers straight from the machine with **no Portmaster app running**: each read spins up a short-lived sampler of its own and tears it down again, so nothing is left sweeping the machine between calls. Nothing is uploaded, and there is no network listener.
+Portmaster ships a local [MCP](https://modelcontextprotocol.io) server, `portmaster-mcp`, so an AI assistant can read the same machine telemetry the menu bar shows — CPU, memory, apps, containers, projects, history, temperatures, alerts, settings — and, only if you say so, act on it. It speaks MCP over stdio, runs entirely on this Mac, and never listens on the network. Nothing is uploaded.
 
-Build it from the same package as the core:
+**With Portmaster running, the CLI talks to the app.** It opens a Unix socket at `~/.portmaster/mcp.sock` and the running app answers every call, so an assistant reads the app's live snapshot rather than starting one of its own, and a mutation is decided by the app's own permission gate and — under `confirmEach` — by a person looking at a window. **With the app closed, the CLI does the work itself**: each read spins up a short-lived sampler and tears it down again, so nothing is left sweeping the machine between calls.
+
+The handoff is three files in `~/.portmaster` (a `0700` directory):
+
+| File | What it is |
+| --- | --- |
+| `mcp.sock` | The socket the running app serves MCP on. `0600`. |
+| `mcp-endpoint.json` | `{socket, token, pid}`, `0600`. The token is a fresh 64-character random value minted at every launch and rotated with it; `pid` is how a stale file left by a crash is recognised as stale. **Read this file if you are debugging a connection, and do not paste its contents anywhere** — the token is a live credential for your machine's process list and stop actions. |
+| `mcp-settings.json` | The mutation mode (below). |
+
+Build the CLI from the same package as the core:
 
 ```sh
 cd Core && swift build -c release --product portmaster-mcp
 ```
+
+**If you built the app, you do not need to do the above.** `Portmaster.app` ships the CLI inside itself at `Contents/Resources/portmaster-mcp`, and Settings → MCP offers **Copy install command**, which fills in the right absolute path for the build you are looking at. Use the button; the README path below is for someone running the CLI straight out of a checkout.
 
 The binary lands in SwiftPM's release bin directory; ask SwiftPM where that is rather than assuming a path, because it varies per machine and per toolchain:
 
@@ -113,10 +125,16 @@ Mode lives in `~/.portmaster/mcp-settings.json` as one key:
 | Mode | Effect |
 | --- | --- |
 | `off` (default) | Every mutation is refused: *"MCP mutations are disabled in Portmaster settings."* |
-| `confirmEach` | **Always refuses in this release** — the intended behavior is to prompt the running app, which does not exist yet. See limitations. |
-| `allowSession` | Mutations are permitted while the Portmaster app is running, and refused when it is not. |
+| `confirmEach` | Every mutation opens a **confirmation window in the Portmaster app** — "Confirm AI Request", naming the change and what it would affect — and runs only if you press its button. If the app is not running there is nobody to ask, so it is refused: *"Portmaster must be open to approve this action."* If nobody answers within 60 seconds the window says so and refuses. Silence is never consent. |
+| `allowSession` | Mutations are permitted while the Portmaster app is running, and refused when it is not. Nothing is asked. |
 
-**`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: edit that file, or use Settings once the in-app MCP panel lands. That is deliberate — an assistant cannot widen its own permissions.
+**`off` is the default, and an MCP client cannot turn it off.** Changing the mode is itself a mutation, so with `mode: off` the server refuses the very call that would grant it. Turning mutations on is a user action: **Settings → MCP**, or edit `~/.portmaster/mcp-settings.json` yourself. That is deliberate — an assistant cannot widen its own permissions.
+
+The Settings page also shows whether the server is listening (and on which socket), how many clients are connected, the most recent audit lines with a **Reveal in Finder** button for the log itself, and the install command. The mode is re-read on every call, so changing it takes effect immediately — no restart.
+
+### Talking to a wedged app
+
+If Portmaster is running but not answering (the window is up, the tools hang), set `PORTMASTER_MCP=on-demand` in the environment your MCP client spawns the CLI in. The session then ignores the socket and does slice 1's own sweep, and says so on stderr. `PORTMASTER_MCP_ENDPOINT_DIR` points the CLI at a different `~/.portmaster` — a test seam, not something to set by hand.
 
 `set_preference` accepts only allowlisted keys: `compact`, `cpuScale`, `mcpMode`, `networkUnit`, `temperatureSource`, `temperatureUnit`. Anything else is rejected rather than ignored. Note the naming asymmetry: the key you *write* is `compact`, while `get_settings` *reports* that same preference as `compactMenuBar`.
 
@@ -128,24 +146,38 @@ Every **mutation attempt** appends one JSON line to `~/.portmaster/mcp-audit.log
 {"arguments":{"id":"nonexistent-app-id-for-gate-check"},"tool":"quit_app","pid":60663,"ts":"2026-10-03T17:02:13Z","reason":"MCP mutations are disabled in Portmaster settings.","outcome":"denied"}
 ```
 
-`outcome` is `denied` (the gate refused; nothing was touched), `allowed` (it succeeded), or `failed` (permitted but did not work). `reason` carries the explanation, or is `null` when there is nothing to add. Reads are never logged — they change nothing, and logging them would bury the entries that matter.
+`outcome` is one of four words:
+
+| Outcome | Meaning |
+| --- | --- |
+| `rejected` | The request was malformed — a required argument missing or blank — and was refused before the gate, so no policy was consulted and nothing was touched. |
+| `denied` | The gate refused, or nobody answered (or refused) a confirmation. Still nothing was touched. |
+| `allowed` | The action succeeded. |
+| `failed` | It was permitted but did not work. |
+
+`rejected` is separated from `denied` because it was not a decision *you* made — a client calling `stop_container` with no `id` is a client with a bug, and counting it among your refusals would misattribute it. `reason` carries the explanation, or is `null` when there is nothing to add. Reads are never logged — they change nothing, and logging them would bury the entries that matter. **The token is never in this log, or in any other.**
+
+The line is written *after* the action for `allowed`/`failed`, so for anything that reached the provider the log answers "did the stop actually work?", not merely "was it permitted?".
 
 ### Limitations in this release
 
-- **`confirmEach` cannot work yet.** It refuses with *"Portmaster must be open to approve this action."* because the in-app confirmation prompt does not exist in this slice — the server has no channel to ask the app anything. This is the expected behavior, not a fault. Until it lands, **`allowSession` with the app open is the working mutation mode.**
-- **Preference writes need the app closed.** With Portmaster running, it holds preferences in memory and rewrites the whole blob on its next change, which would erase what MCP just wrote, so `set_preference` refuses (except `mcpMode`, which the app never holds). Use the app's own Settings while it is open.
+- **`confirmEach` needs your client to keep the connection open.** The confirmation can wait up to 60 s, but the CLI's stdio session gives up about 10 s after your client closes its end of the pipe. A long-lived client (Claude Code and friends do keep the pipe open) is fine; a one-shot client that writes a request and closes stdin loses the answer — and the audit log records nothing for it, so a lost confirmation leaves no trace. Same for an app you quit mid-prompt.
+- **`mcpMode` cannot be confirmed.** Under `confirmEach`, a `set_preference` for `mcpMode` is refused before the window opens, with a message that contradicts itself: *"Preference 'mcpMode' cannot be changed via MCP. Allowed: compact, cpuScale, mcpMode, …"*. The confirmation window checks a preference change against the app's own preferences, and the MCP server's own policy is not one of them. `mcpMode` still works under `allowSession`, where no window is involved.
+- **The confirmation window is a window, not a sheet.** It is raised in front of whatever you were using (`orderFrontRegardless` plus an app activation), so expect Portmaster to come forward when a prompt arrives.
+- **Preference writes from the on-demand path need the app closed.** With no app running there is nothing holding the preferences blob, so `set_preference` refuses rather than write something the next launch would overwrite. With the app running it applies the change live. Either way `mcpMode` is the exception — the app never holds it.
 - **Alerts are history-approximate.** `get_active_alerts` reports `source: "history-approximate"` and reconstructs sustained-CPU and memory-growth alerts from recorded history: the observation is real, its freshness is not. Per-app disk and network hammering is live-only and is therefore *not* fabricated — those alert kinds simply do not appear from history.
 - **`get_settings` can report defaults it did not read.** When the preferences blob cannot be decoded, the read falls back to default values while writes refuse over the same blob. Reading back defaults right after a successful write means this, not a lost write.
 - **`get_temperatures_fans` separates "nothing observed yet" from "nothing readable".** The SMC pass runs on the sampler’s slow lane and lands a tick after it is kicked, so the first read on a cold sampler has no reading at all — and answering `available: false` for that would be a claim about the hardware that nothing observed. While no sensor reading has been observed the tool refuses with *“Temperature and fan readings are not known yet; no sensor reading has been observed.”* Retry a moment later. Once a pass has read the SMC the payload says which answer it carries in `availability`: `"available"` with the readings, or `"noSensors"` when a completed pass over a readable SMC produced no plausible reading (`available: false`, and no reading invented for a sensor that said none). `"noSensors"` is what this collector verified, not a claim about the hardware: it decodes `flt `/`sp78` temperature keys and plausible values only, so a Mac whose sensors answer in another type reads the same way. `available` stays as a convenience flag for callers that read only that one field, and `get_system_overview`’s `thermal` section carries the same two fields.
 - **Reads have a ~10 s budget.** The first read on a cold sampler waits for a full process sweep, port scan and `nettop` pass. If that budget expires the tool says *"No reading available yet; the sampler is still starting."* instead of returning zeros — retry a moment later.
 - **`stop_container` shells out to Docker.** It runs `docker stop -- <id>` with fixed argv (no shell), so Docker must be installed with the daemon up.
-- **No app-driven provider, no in-app confirmation, no live alert engine.** Slice 1 is stdio + on-demand sampling only.
+- **The app's slice of this server is build-verified, not exercised by CI.** `scripts/mcp-e2e.sh` drives the real CLI against a real app build — socket, catalog, refusal, audit line, and the confirmation up to the point where a person must click — but the Settings page, the confirmation window and the status/clients readouts have only been compiled and looked at, never driven by an automated test. `scripts/mcp-e2e.sh` needs a real click for its last check; everything before that click is asserted.
 
 ## Permissions and distribution
 
 - The read-only dashboard needs **no permissions** — it reads your own user's processes and socket tables.
 - Direct distribution build (App Sandbox **off**). That's what makes per-process metrics, project attribution, and stop actions possible; a sandboxed Mac App Store build would show "Unattributed" for other apps' processes and would have stop actions disabled.
 - Hardened runtime is on; the app is ad-hoc signed for local development. For wider distribution, add Developer ID signing and notarization — configuration only, no code changes.
+- **The bundled `portmaster-mcp` is signed ad-hoc, and that is not release-ready.** The app's post-build script signs the nested executable with `codesign -s -`, which is enough to run it from a locally built app and nothing more: a nested executable has to carry the app's own **Developer ID** signature for Gatekeeper on another Mac, and `scripts/package-dmg.sh` re-signs nothing. **A released build has to sign the bundle once, deepest first, before packaging** — `Contents/Resources/portmaster-mcp`, then the app. Until that exists, a notarized app would ship a CLI that Gatekeeper refuses, and the Settings page would name a path that does not work on a user's machine. Nothing here has been checked against a notarized copy.
 - [Local DMG packaging and signed-update setup](Support/Release.md): the installer includes an Applications shortcut. Sparkle checks are disabled until a real HTTPS feed and Ed25519 public key are configured. Developer ID signing/notarization and actual update delivery remain release work.
 - New installs see a welcome screen; legacy preferences skip it. Welcome can be reopened from Settings → Privacy. Notification permission is requested through an explicit Alerts action rather than at launch.
 - Launch-at-login uses `SMAppService` (macOS 13+); if approval is pending, Settings shows the exact status.

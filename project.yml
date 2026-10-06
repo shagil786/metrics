@@ -48,16 +48,19 @@ targets:
       #
       # Declared as a dependency so Xcode *builds* the executable and links its output into
       # this target's products directory, and with `link: false` because an executable
-      # cannot be linked against — only copied. The copy itself is the `copyFiles` phase
-      # below.
+      # cannot be linked against — only copied. The copy itself is the post-build script
+      # below, not an Xcode Copy Files phase: see the comment on it.
       - package: PortmasterCore
         product: portmaster-mcp
         link: false
-    # Copy the built CLI into Contents/Resources. A post-build script rather than an Xcode
-    # Copy Files phase: XcodeGen only emits one from a *source* path that exists when the
-    # project is generated, and this file's path only exists once Xcode has built it.
-    # The script copies what Xcode built — it never invokes `swift build`, so it takes no
-    # SwiftPM build lock and does not make an app build depend on the toolchain.
+    # Copy the built CLI into Contents/Resources, by a post-build script. There is no
+      # Xcode "Copy Files" phase here and one cannot be added: XcodeGen only emits one
+      # from a *source* path that exists when the project is generated, and this file's
+      # path (BUILT_PRODUCTS_DIR/portmaster-mcp) only exists once Xcode has built it.
+      # A `copyFiles` entry was tried and abandoned for exactly that reason — it
+      # resolves at generation time, not at build time. Do not reintroduce one.
+      # The script copies what Xcode built — it never invokes `swift build`, so it takes no
+      # SwiftPM build lock and does not make an app build depend on the toolchain.
     postBuildScripts:
       - path: scripts/embed-mcp-cli.sh
         name: Embed portmaster-mcp

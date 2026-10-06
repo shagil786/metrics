@@ -11,10 +11,17 @@
 // no-delegate fallback — were literals in the view that nothing inspected. A property
 // asserted over part of a page is not a property of the page.
 //
-// So this reads the view's source and fails on any string literal that is not one the copy
+// So this reads the page's source and fails on any string literal that is not one the copy
 // module owns. Two ways that can pass for the wrong reason are also checked: the file
 // actually being where it is looked for, and `everyString` actually containing every
 // literal the view does use.
+//
+// **Two files, not one.** `MCPSettingsTab.swift` is the page, but not the whole of it:
+// `SettingsView.mcpTab` renders the no-host fallback itself, so a literal written there
+// would have been exactly as invisible to the token test as one in the page — and it is
+// *reachable* without the host, which makes it the more likely of the two to be edited.
+// So `SettingsView.swift` is scanned too, but only its MCP region: the rest of that file
+// is other settings pages, none of whose words this property is about.
 //
 // **What this does not do.** It is a source scan, not a render. It proves the page cannot
 // *introduce* a string that the token test has not seen; it does not prove the page looks
@@ -27,21 +34,53 @@ import XCTest
 
 final class MCPSettingsChromeTests: XCTestCase {
 
-    /// The page's source, read once. Absent the file the scan is skipped rather than
-    /// failed — a library test that cannot find an app file must not be a red test on a
-    /// machine where the app is checked out elsewhere.
-    private static let source: String? = {
-        // Four levels up from the test file: PortmasterMCPTests → Tests → Core → the
-        // repository root, which is where `App/` lives. The package root alone would be
-        // three, and `App/` is not inside the package.
-        let view = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()  // PortmasterMCPTests
-            .deletingLastPathComponent()  // Tests
-            .deletingLastPathComponent()  // Core
-            .deletingLastPathComponent()  // repository root
-            .appendingPathComponent("App/MCPSettingsTab.swift")
-        return try? String(contentsOf: view, encoding: .utf8)
+    /// The repository root, four levels up from the test file: PortmasterMCPTests →
+    /// Tests → Core → the repository root, which is where `App/` lives. The package root
+    /// alone would be three, and `App/` is not inside the package.
+    private static let repositoryRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // PortmasterMCPTests
+        .deletingLastPathComponent()  // Tests
+        .deletingLastPathComponent()  // Core
+        .deletingLastPathComponent()  // repository root
+
+    /// The page's own source, read once.
+    private static let viewSource: String? = try? String(
+        contentsOf: repositoryRoot.appendingPathComponent("App/MCPSettingsTab.swift"),
+        encoding: .utf8
+    )
+
+    /// The MCP region of `SettingsView.swift`: from the marker comment to the next
+    /// declaration, which is where the page and its fallback live.
+    ///
+    /// **Bounded on both ends rather than scanned whole, and deliberately.** The whole
+    /// file is four other settings pages whose every string belongs to some other copy
+    /// module; including them would make this test a red test over code it has nothing
+    /// to say about, and the fix for that red test would be to delete the assertion.
+    /// The bounds are markers rather than line numbers so that adding a line inside the
+    /// region is invisible to this file and moving the region is not.
+    static let settingsRegionStart = "// MARK: MCP"
+    static let settingsRegionEnd = "private func bullet("
+
+    private static let settingsRegion: String? = {
+        guard let whole = try? String(
+            contentsOf: repositoryRoot.appendingPathComponent("App/SettingsView.swift"),
+            encoding: .utf8
+        ) else { return nil }
+        return region(in: whole, from: settingsRegionStart, to: settingsRegionEnd)
     }()
+
+    /// The slice of `source` between the first line containing `start` and the first
+    /// line after it containing `end`, or `nil` when either is absent.
+    ///
+    /// `nil` rather than a silent empty slice: a missing marker must fail the test that
+    /// depends on it, because "the scan found no literals" is the pass-for-the-wrong-
+    /// reason outcome the scanner test exists to rule out.
+    static func region(in source: String, from start: String, to end: String) -> String? {
+        guard let startRange = source.range(of: start) else { return nil }
+        let remainder = source[startRange.upperBound...]
+        guard let endRange = remainder.range(of: end) else { return nil }
+        return String(remainder[..<endRange.lowerBound])
+    }
 
     /// Literals the view may hold without the token test having seen them: SF Symbol
     /// names, which name a drawing rather than say anything to a person.
@@ -140,15 +179,51 @@ final class MCPSettingsChromeTests: XCTestCase {
     /// uncovered string — and, since the token test walks `everyString`, the only way to
     /// get through is to route the string past a test that checks it.
     func testThePageHasNoStringLiteralsOfItsOwn() throws {
-        let source = try XCTUnwrap(
-            Self.source, "App/MCPSettingsTab.swift was not found next to the package"
-        )
         let known = Set(MCPSettingsCopy.everyString)
-        let foreign = Self.literals(in: source).filter { !known.contains($0) }
+        var foreign: [String] = []
+
+        let view = try XCTUnwrap(
+            Self.viewSource, "App/MCPSettingsTab.swift was not found next to the package"
+        )
+        foreign += Self.literals(in: view).filter { !known.contains($0) }
+
+        // The fallback the page cannot render without, rendered by `SettingsView` itself.
+        let region = try XCTUnwrap(
+            Self.settingsRegion,
+            "the MCP region of App/SettingsView.swift was not found between "
+                + "'\(Self.settingsRegionStart)' and '\(Self.settingsRegionEnd)'"
+        )
+        foreign += Self.literals(in: region).filter { !known.contains($0) }
+
         XCTAssertEqual(
             foreign, [],
             "these strings are rendered by the page but asserted by no test — "
                 + "move them into MCPSettingsCopy"
+        )
+    }
+
+    /// The region this file scans is a region, not the file: a slice taken by two
+    /// markers has to actually contain the fallback, or the scan above covers nothing
+    /// and reports success.
+    func testTheSettingsRegionIsFoundAndIsNotTheWholeFile() throws {
+        let region = try XCTUnwrap(Self.settingsRegion)
+        XCTAssertTrue(
+            region.contains("mcpTab"),
+            "the slice must include the MCP page's fallback: \(region.prefix(200))"
+        )
+        XCTAssertFalse(
+            region.contains("private func bullet"),
+            "the slice must stop before the next declaration, or it is a whole file"
+        )
+        let whole = try XCTUnwrap(
+            try? String(
+                contentsOf: Self.repositoryRoot.appendingPathComponent("App/SettingsView.swift"),
+                encoding: .utf8
+            )
+        )
+        XCTAssertLessThan(
+            region.count, whole.count,
+            "the scanned region is a small part of the file, not all of it"
         )
     }
 
@@ -183,7 +258,7 @@ final class MCPSettingsChromeTests: XCTestCase {
     /// module rather than that nothing is being drawn.
     func testTheViewDrawsItsWordsFromTheInventory() throws {
         let source = try XCTUnwrap(
-            Self.source, "App/MCPSettingsTab.swift was not found next to the package"
+            Self.viewSource, "App/MCPSettingsTab.swift was not found next to the package"
         )
         XCTAssertEqual(
             Self.literals(in: source), [],

@@ -6,9 +6,24 @@ import Foundation
 /// nothing, and logging them would bury the entries that matter.
 ///
 /// Lines have the shape `{ts, tool, arguments, outcome, reason, pid}` with every
-/// key always present (a nil `reason` is written as JSON `null`). `outcome` is
-/// one of `denied` (the gate refused; nothing happened), `allowed` (the action
-/// succeeded), or `failed` (it was permitted but did not work). `arguments` is an
+/// key always present (a nil `reason` is written as JSON `null`).
+///
+/// `outcome` is one of four words, and the distinction between the first two is the
+/// point of the whole file:
+///
+/// - `rejected` — the request was malformed (a required argument missing or blank) and
+///   was refused before the permission gate, so no policy was ever consulted and
+///   nothing was touched.
+/// - `denied` — the gate refused: a mode said no, or nobody answered a confirmation.
+///   Also nothing was touched.
+/// - `allowed` — the action succeeded.
+/// - `failed` — it was permitted but did not work.
+///
+/// The difference between `rejected` and `denied` is *whose* answer it was: a
+/// malformed call is not a decision a user made, so it must not be counted among the
+/// refusals a user can see in the Settings page.
+///
+/// `arguments` is an
 /// echo of what the client sent, bounded by `maxRecordedArgumentKeys` /
 /// `maxRecordedArgumentValueCharacters` / `maxRecordedArgumentsCharacters` and
 /// marked with `argumentsTruncationMarker` when anything was dropped — a client

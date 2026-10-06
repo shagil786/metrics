@@ -9,234 +9,6 @@
 import Foundation
 import PortmasterCore
 
-// MARK: - Wire payloads
-//
-// PortmasterCore's models are display models, not wire models, and are not
-// `Codable`. These payloads are the MCP contract: flat, stable, and honest —
-// an unmeasured value stays `null` rather than becoming a zero. The reads with
-// their own shape live in `WirePayloads.swift`.
-
-private struct CPUPayload: Encodable {
-    let totalPercent: Double
-    let userPercent: Double
-    let systemPercent: Double
-    let idlePercent: Double
-    let coreCount: Int
-    let corePercents: [Double]
-
-    init(_ cpu: SystemCPU) {
-        totalPercent = cpu.totalPercent
-        userPercent = cpu.userPercent
-        systemPercent = cpu.systemPercent
-        idlePercent = cpu.idlePercent
-        coreCount = cpu.coreCount
-        corePercents = cpu.corePercents
-    }
-}
-
-private struct MemoryPayload: Encodable {
-    let totalBytes: UInt64
-    let usedBytes: UInt64
-    let pressureLevel: String
-    let pressureRatio: Double
-    let swapBytes: UInt64?
-    let freeBytes: UInt64?
-    let appBytes: UInt64?
-    let wiredBytes: UInt64?
-    let compressedBytes: UInt64?
-
-    init(_ memory: SystemMemory) {
-        totalBytes = memory.totalBytes
-        usedBytes = memory.usedBytes
-        pressureLevel = memory.pressureLevel.rawValue
-        pressureRatio = memory.pressureRatio
-        swapBytes = memory.swapBytes
-        freeBytes = memory.freeBytes
-        appBytes = memory.appBytes
-        wiredBytes = memory.wiredBytes
-        compressedBytes = memory.compressedBytes
-    }
-}
-
-private struct NetworkPayload: Encodable {
-    let downBytesPerSec: Double
-    let upBytesPerSec: Double
-
-    init(_ network: NetworkSample) {
-        downBytesPerSec = network.downBytesPerSec
-        upBytesPerSec = network.upBytesPerSec
-    }
-}
-
-private struct DiskPayload: Encodable {
-    let freeBytes: UInt64
-    let totalBytes: UInt64
-    let readBytesPerSec: Double?
-    let writeBytesPerSec: Double?
-
-    init(_ disk: DiskSample) {
-        freeBytes = disk.freeBytes
-        totalBytes = disk.totalBytes
-        readBytesPerSec = disk.readBytesPerSec
-        writeBytesPerSec = disk.writeBytesPerSec
-    }
-}
-
-private struct BatteryPayload: Encodable {
-    let percentage: Double?
-    let timeToEmptyMinutes: Int?
-    let isCharging: Bool
-    let source: String
-    let wattage: Double?
-    let healthPercent: Double?
-    let cycleCount: Int?
-
-    init(_ battery: BatterySample) {
-        percentage = battery.percentage
-        timeToEmptyMinutes = battery.timeToEmptyMinutes
-        isCharging = battery.isCharging
-        source = battery.source.rawValue
-        wattage = battery.wattage
-        healthPercent = battery.healthPercent
-        cycleCount = battery.cycleCount
-    }
-}
-
-private struct GPUPayload: Encodable {
-    let utilizationPercent: Double?
-    let rendererPercent: Double?
-    let tilerPercent: Double?
-    let inUseMemoryBytes: UInt64?
-    let coreCount: Int?
-
-    init(_ gpu: GPUSample) {
-        utilizationPercent = gpu.utilizationPercent
-        rendererPercent = gpu.rendererPercent
-        tilerPercent = gpu.tilerPercent
-        inUseMemoryBytes = gpu.inUseMemoryBytes
-        coreCount = gpu.coreCount
-    }
-}
-
-struct FanPayload: Encodable {
-    let name: String?
-    let currentRPM: Double?
-
-    init(_ fan: FanSample) {
-        name = fan.name
-        currentRPM = fan.currentRPM
-    }
-}
-
-// `TemperaturesPayload` in `WirePayloads.swift` answers the same sensors with
-// the same three states; this one is the overview's slice of the same sample,
-// where the surrounding sections are independently optional. It therefore
-// carries `availability` too: the section's own presence says only that a pass
-// has answered, not that the sensors produced readings, so the state has to be
-// named or a caller would read presence as availability.
-private struct ThermalPayload: Encodable {
-    let availability: String
-    let available: Bool
-    let cpuTempC: Double?
-    let gpuTempC: Double?
-    let hottestTempC: Double?
-    let fans: [FanPayload]
-
-    init(_ thermal: ThermalSample) {
-        switch thermal.availability {
-        case .available: availability = "available"
-        case .noSensors: availability = "noSensors"
-        case .notSampledYet: availability = "notSampledYet"
-        }
-        available = thermal.availability == .available
-        cpuTempC = thermal.cpuTempC
-        gpuTempC = thermal.gpuTempC
-        hottestTempC = thermal.hottestTempC
-        fans = thermal.fans.map(FanPayload.init)
-    }
-}
-
-private struct SystemOverviewPayload: Encodable {
-    let at: Date
-    let cpu: CPUPayload
-    let memory: MemoryPayload
-    let network: NetworkPayload?
-    let disk: DiskPayload?
-    let battery: BatteryPayload?
-    let gpu: GPUPayload?
-    let thermal: ThermalPayload?
-
-    init(_ sample: SystemSample) {
-        at = sample.at
-        cpu = CPUPayload(sample.cpu)
-        memory = MemoryPayload(sample.memory)
-        network = sample.network.map(NetworkPayload.init)
-        disk = sample.disk.map(DiskPayload.init)
-        battery = sample.battery.map(BatteryPayload.init)
-        gpu = sample.gpu.map(GPUPayload.init)
-        thermal = sample.thermal.map(ThermalPayload.init)
-    }
-}
-
-private struct ProcessPayload: Encodable {
-    let pid: Int32
-    let name: String
-    let isAppBundle: Bool
-    let cpuPercent: Double?
-    let memoryBytes: UInt64?
-    let projectID: String?
-    let lifecycle: String
-    let netInBytesPerSec: Double?
-    let netOutBytesPerSec: Double?
-    let diskReadBytesPerSec: Double?
-    let diskWriteBytesPerSec: Double?
-
-    init(_ process: ProcessRow) {
-        pid = process.pid
-        name = process.displayName
-        isAppBundle = process.isAppBundle
-        cpuPercent = process.cpuPercent
-        memoryBytes = process.memoryBytes
-        projectID = process.projectID
-        switch process.lifecycle {
-        case .continuing: lifecycle = "continuing"
-        case .exited: lifecycle = "exited"
-        case .reused: lifecycle = "reused"
-        }
-        netInBytesPerSec = process.netInBytesPerSec
-        netOutBytesPerSec = process.netOutBytesPerSec
-        diskReadBytesPerSec = process.diskReadBytesPerSec
-        diskWriteBytesPerSec = process.diskWriteBytesPerSec
-    }
-}
-
-private struct AppRollupPayload: Encodable {
-    let id: String
-    let displayName: String
-    let isAppBundle: Bool
-    let pidCount: Int
-    /// Sorted so the payload is byte-stable for a given snapshot.
-    let projectIDs: [String]
-    let totalCPU: Double
-    let totalMemory: UInt64
-    let netInBytesPerSec: Double?
-    let diskWriteBytesPerSec: Double?
-    let processes: [ProcessPayload]
-
-    init(_ rollup: AppRollup) {
-        id = rollup.id
-        displayName = rollup.displayName
-        isAppBundle = rollup.isAppBundle
-        pidCount = rollup.pidCount
-        projectIDs = rollup.projectIDs.sorted()
-        totalCPU = rollup.totalCPU
-        totalMemory = rollup.totalMemory
-        netInBytesPerSec = rollup.totalNetInBytesPerSec
-        diskWriteBytesPerSec = rollup.totalDiskWriteBytesPerSec
-        processes = rollup.processes.map(ProcessPayload.init)
-    }
-}
-
 // MARK: - Outcome
 
 /// What a tool call returns to the MCP host: text plus whether it failed.
@@ -430,12 +202,14 @@ public struct ToolExecutor: Sendable {
     /// Failure is data, not a thrown error: every problem comes back as a
     /// `ToolOutcome` with `isError` set, so the MCP host never has to guess.
     ///
-    /// Audit vocabulary, one line per mutation attempt: `denied` (the gate
-    /// refused, so no provider call happened and the line is written before any
-    /// provider call), `allowed` / `failed` (written after the provider call
-    /// returns). For an attempt that reached the provider the log therefore
-    /// answers "did the stop actually work?" — not merely "was it permitted?".
-    /// It cannot answer that for a denial, which never reached the action.
+    /// Audit vocabulary, one line per mutation attempt: `rejected` (the request was
+    /// malformed — a required argument missing or blank — and was refused before the
+    /// gate, so no policy was ever consulted), `denied` (the gate refused, so no
+    /// provider call happened and the line is written before any provider call),
+    /// `allowed` / `failed` (written after the provider call returns). For an attempt
+    /// that reached the provider the log therefore answers "did the stop actually
+    /// work?" — not merely "was it permitted?". It cannot answer that for a denial or a
+    /// rejection, neither of which reached the action.
     public func execute(name: String, arguments: [String: String]) async -> ToolOutcome {
         guard let tool = Self.catalog.first(where: { $0.name == name }) else {
             return ToolOutcome(text: "Unknown tool: \(name)", isError: true)
@@ -453,7 +227,21 @@ public struct ToolExecutor: Sendable {
         // request.
         let normalized = Self.normalizing(arguments, for: tool)
         if let missing = Self.firstMissingRequiredArgument(in: normalized, for: tool) {
-            return ToolOutcome(text: "Missing argument: \(missing)", isError: true)
+            // Recorded rather than returned silently, because this returns *before* the
+            // gate and a mutation that returns before the gate used to leave no trace at
+            // all — so "an assistant tried to stop a container and nothing happened" had
+            // no answer in the log the log exists to give. `rejected` rather than
+            // `denied`: nothing was refused by a policy, the request never got far
+            // enough for there to be one, and a reader counting refusals should not
+            // count this as a decision the user made. Reads are still not logged — a
+            // client sends those constantly and they would bury the mutation lines.
+            let message = "Missing argument: \(missing)"
+            if tool.effect == .mutation {
+                audit.record(
+                    tool: name, arguments: normalized, outcome: "rejected", reason: message
+                )
+            }
+            return ToolOutcome(text: message, isError: true)
         }
 
         let isMutation = tool.effect == .mutation

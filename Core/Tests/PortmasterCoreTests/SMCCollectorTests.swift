@@ -140,10 +140,17 @@ final class SMCCollectorTests: XCTestCase {
         engine.start()
         // Publish the first slow result, poll again after its five-second
         // cadence, then publish the failure. No real SMC/subprocess work.
+        //
+        // The 15s bound is not slack for this test's own work — there is none, and it
+        // lands in about 5.9s — it is slack for a machine that is busy running the rest
+        // of the suite's live collectors. 8s was 1.35x the measured time and starved
+        // once in a 903s run, which is a flaky test rather than a signal. The floor is
+        // the engine's own five-second slow-lane cadence, so no smaller bound can be
+        // honest here: the assertion needs a second slow pass to exist at all.
         for delay in [0.5, 5.2, 5.7] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { engine.refreshNow() }
         }
-        wait(for: [cleared], timeout: 8)
+        wait(for: [cleared], timeout: 15)
         engine.stop()
         subscription.cancel()
     }

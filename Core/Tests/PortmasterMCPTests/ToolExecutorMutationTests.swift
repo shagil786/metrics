@@ -44,6 +44,53 @@ final class ToolExecutorMutationTests: XCTestCase {
         )
     }
 
+    /// A mutation attempt that could not even be parsed is still an attempt.
+    ///
+    /// It returns before the gate, so it used to leave nothing at all behind — and
+    /// "an assistant tried to stop a container and nothing happened" is exactly the
+    /// question the audit log exists to answer. The gate allowing is deliberate here,
+    /// so the only thing that can produce a line is the malformed argument itself and
+    /// not a refusal: `rejected` has to mean "the request never got as far as a
+    /// decision", which is a different fact from `denied`.
+    ///
+    /// The second half is the boundary: a **read** with a missing argument is not a
+    /// mutation attempt and is not logged. Widening the audit to malformed calls
+    /// generally would bury the mutation lines under reads every client makes.
+    func testMalformedMutationIsAuditedAsRejectedAndReadsStayUnlogged() async throws {
+        let stub = StubProvider()
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
+
+        let outcome = await tool.execute(name: "stop_container", arguments: ["id": "   "])
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(outcome.text, "Missing argument: id")
+        XCTAssertEqual(
+            stub.stopContainerCallCount, 0,
+            "a blank id must never reach a mutation provider"
+        )
+
+        let entries = try auditEntries(in: dir)
+        XCTAssertEqual(entries.count, 1, "exactly one line per mutation attempt")
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry["tool"] as? String, "stop_container")
+        XCTAssertEqual(
+            entry["outcome"] as? String, "rejected",
+            "a call refused before the gate is neither allowed, denied nor failed"
+        )
+        XCTAssertEqual(
+            entry["reason"] as? String, "Missing argument: id",
+            "the log must name what the caller got wrong, not just that something was"
+        )
+
+        // A malformed *read* is not a mutation attempt, so it adds no line.
+        let read = await tool.execute(name: "get_top_apps", arguments: [:])
+        XCTAssertTrue(read.isError)
+        XCTAssertEqual(try auditEntries(in: dir).count, 1, "reads are never logged")
+    }
+
     // MARK: The gate is the only thing that decides whether a provider is called
 
     func testDeniedMutationAuditsDenial() async throws {

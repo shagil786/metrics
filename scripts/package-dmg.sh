@@ -1,5 +1,28 @@
 #!/bin/bash
 # Packages an already-built app without modifying or re-signing it.
+#
+# THE NEXT STEP FOR A RELEASE IS HERE, AND IT IS NOT DONE. This script re-signs
+# nothing, so whatever signature the app arrived with is the signature it ships
+# with. For a Developer ID build that is not enough: the nested
+# `Contents/Resources/portmaster-mcp` is ad-hoc signed by
+# `scripts/embed-mcp-cli.sh`, and a nested executable must carry the *app's* Developer
+# ID signature or Gatekeeper on another Mac refuses to run it — even when the app
+# itself is properly signed and notarized. The Settings page then names a binary that
+# will not start, which is the exact defect the embedded CLI exists to remove.
+#
+# So a release build must sign the bundle once, deepest first, before this runs:
+#
+#   codesign --force --options runtime --timestamp \
+#     --sign "Developer ID Application: …" \
+#     "$app/Contents/Resources/portmaster-mcp"
+#   codesign --force --options runtime --timestamp \
+#     --sign "Developer ID Application: …" "$app"
+#   codesign --verify --deep --strict "$app"
+#   # then notarize, then package.
+#
+# Nothing in this repository has been run against a notarized copy, so the sequence
+# above is written down rather than demonstrated. Treat it as release work, not as
+# something already handled.
 set -euo pipefail
 if [[ $# -ne 2 ]]; then
     echo 'Usage: package-dmg.sh /absolute/Portmaster.app /absolute/output.dmg' >&2

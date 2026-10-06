@@ -1,15 +1,263 @@
-// WirePayloads: the MCP wire contract for the reads that have their own shape.
+// WirePayloads: the MCP wire contract.
 //
 // PortmasterCore's models are display models, not wire models, and several are
 // not `Codable` at all. These payloads are the flat, stable, honest translation
 // the host sees: an unmeasured value stays `null` rather than becoming a zero,
 // and a subsystem that is unavailable reports that fact as data.
 //
-// They live apart from `ToolExecutor` because they are pure data: no gate, no
-// audit log, no dispatch. Internal rather than private so `ToolExecutor` and
-// this file can see each other (`TemperaturesPayload` embeds `FanPayload`).
+// They live apart from `ToolExecutor` because they are pure data: no gate, no audit
+// log, no dispatch. The executor names exactly two of them —
+// `SystemOverviewPayload` and `AppRollupPayload` — and every other type here exists
+// only as one of those two's fields.
+//
+// Internal rather than private throughout, because `Encodable`'s synthesized
+// conformance can only encode properties visible at the conforming type's own access
+// level: a `private` field inside an internal struct would be silently dropped from
+// the JSON rather than refused by the compiler.
 import Foundation
 import PortmasterCore
+
+// MARK: - The machine snapshot
+//
+// PortmasterCore's models are display models, not wire models, and several are not
+// `Codable` at all. The payloads below are the MCP contract: flat, stable, and
+// honest — an unmeasured value stays `null` rather than becoming a zero, and a
+// subsystem that is unavailable reports that fact as data.
+//
+// They live apart from `ToolExecutor` because they are pure data: no gate, no audit
+// log, no dispatch. Visibility is per struct rather than one blanket level, because
+// only the types the executor names need to be reachable from it.
+
+// MARK: The overview's slice of one system sample.
+
+struct CPUPayload: Encodable {
+    let totalPercent: Double
+    let userPercent: Double
+    let systemPercent: Double
+    let idlePercent: Double
+    let coreCount: Int
+    let corePercents: [Double]
+
+    init(_ cpu: SystemCPU) {
+        totalPercent = cpu.totalPercent
+        userPercent = cpu.userPercent
+        systemPercent = cpu.systemPercent
+        idlePercent = cpu.idlePercent
+        coreCount = cpu.coreCount
+        corePercents = cpu.corePercents
+    }
+}
+
+struct MemoryPayload: Encodable {
+    let totalBytes: UInt64
+    let usedBytes: UInt64
+    let pressureLevel: String
+    let pressureRatio: Double
+    let swapBytes: UInt64?
+    let freeBytes: UInt64?
+    let appBytes: UInt64?
+    let wiredBytes: UInt64?
+    let compressedBytes: UInt64?
+
+    init(_ memory: SystemMemory) {
+        totalBytes = memory.totalBytes
+        usedBytes = memory.usedBytes
+        pressureLevel = memory.pressureLevel.rawValue
+        pressureRatio = memory.pressureRatio
+        swapBytes = memory.swapBytes
+        freeBytes = memory.freeBytes
+        appBytes = memory.appBytes
+        wiredBytes = memory.wiredBytes
+        compressedBytes = memory.compressedBytes
+    }
+}
+
+struct NetworkPayload: Encodable {
+    let downBytesPerSec: Double
+    let upBytesPerSec: Double
+
+    init(_ network: NetworkSample) {
+        downBytesPerSec = network.downBytesPerSec
+        upBytesPerSec = network.upBytesPerSec
+    }
+}
+
+struct DiskPayload: Encodable {
+    let freeBytes: UInt64
+    let totalBytes: UInt64
+    let readBytesPerSec: Double?
+    let writeBytesPerSec: Double?
+
+    init(_ disk: DiskSample) {
+        freeBytes = disk.freeBytes
+        totalBytes = disk.totalBytes
+        readBytesPerSec = disk.readBytesPerSec
+        writeBytesPerSec = disk.writeBytesPerSec
+    }
+}
+
+struct BatteryPayload: Encodable {
+    let percentage: Double?
+    let timeToEmptyMinutes: Int?
+    let isCharging: Bool
+    let source: String
+    let wattage: Double?
+    let healthPercent: Double?
+    let cycleCount: Int?
+
+    init(_ battery: BatterySample) {
+        percentage = battery.percentage
+        timeToEmptyMinutes = battery.timeToEmptyMinutes
+        isCharging = battery.isCharging
+        source = battery.source.rawValue
+        wattage = battery.wattage
+        healthPercent = battery.healthPercent
+        cycleCount = battery.cycleCount
+    }
+}
+
+struct GPUPayload: Encodable {
+    let utilizationPercent: Double?
+    let rendererPercent: Double?
+    let tilerPercent: Double?
+    let inUseMemoryBytes: UInt64?
+    let coreCount: Int?
+
+    init(_ gpu: GPUSample) {
+        utilizationPercent = gpu.utilizationPercent
+        rendererPercent = gpu.rendererPercent
+        tilerPercent = gpu.tilerPercent
+        inUseMemoryBytes = gpu.inUseMemoryBytes
+        coreCount = gpu.coreCount
+    }
+}
+
+struct FanPayload: Encodable {
+    let name: String?
+    let currentRPM: Double?
+
+    init(_ fan: FanSample) {
+        name = fan.name
+        currentRPM = fan.currentRPM
+    }
+}
+
+// `TemperaturesPayload` below answers the same sensors with the same three states;
+// this one is the overview's slice of the same sample, where the surrounding sections
+// are independently optional. It therefore carries `availability` too: the section's
+// own presence says only that a pass has answered, not that the sensors produced
+// readings, so the state has to be named or a caller would read presence as
+// availability.
+struct ThermalPayload: Encodable {
+    let availability: String
+    let available: Bool
+    let cpuTempC: Double?
+    let gpuTempC: Double?
+    let hottestTempC: Double?
+    let fans: [FanPayload]
+
+    init(_ thermal: ThermalSample) {
+        switch thermal.availability {
+        case .available: availability = "available"
+        case .noSensors: availability = "noSensors"
+        case .notSampledYet: availability = "notSampledYet"
+        }
+        available = thermal.availability == .available
+        cpuTempC = thermal.cpuTempC
+        gpuTempC = thermal.gpuTempC
+        hottestTempC = thermal.hottestTempC
+        fans = thermal.fans.map(FanPayload.init)
+    }
+}
+
+struct SystemOverviewPayload: Encodable {
+    let at: Date
+    let cpu: CPUPayload
+    let memory: MemoryPayload
+    let network: NetworkPayload?
+    let disk: DiskPayload?
+    let battery: BatteryPayload?
+    let gpu: GPUPayload?
+    let thermal: ThermalPayload?
+
+    init(_ sample: SystemSample) {
+        at = sample.at
+        cpu = CPUPayload(sample.cpu)
+        memory = MemoryPayload(sample.memory)
+        network = sample.network.map(NetworkPayload.init)
+        disk = sample.disk.map(DiskPayload.init)
+        battery = sample.battery.map(BatteryPayload.init)
+        gpu = sample.gpu.map(GPUPayload.init)
+        thermal = sample.thermal.map(ThermalPayload.init)
+    }
+}
+
+// MARK: - The app rollup
+//
+// `get_top_apps` and `get_app_detail` answer with this, so it carries the per-process
+// breakdown rather than totals alone: the id is what a caller passes to a mutation, so
+// an app whose membership is not visible would be un-actionable.
+
+struct ProcessPayload: Encodable {
+    let pid: Int32
+    let name: String
+    let isAppBundle: Bool
+    let cpuPercent: Double?
+    let memoryBytes: UInt64?
+    let projectID: String?
+    let lifecycle: String
+    let netInBytesPerSec: Double?
+    let netOutBytesPerSec: Double?
+    let diskReadBytesPerSec: Double?
+    let diskWriteBytesPerSec: Double?
+
+    init(_ process: ProcessRow) {
+        pid = process.pid
+        name = process.displayName
+        isAppBundle = process.isAppBundle
+        cpuPercent = process.cpuPercent
+        memoryBytes = process.memoryBytes
+        projectID = process.projectID
+        switch process.lifecycle {
+        case .continuing: lifecycle = "continuing"
+        case .exited: lifecycle = "exited"
+        case .reused: lifecycle = "reused"
+        }
+        netInBytesPerSec = process.netInBytesPerSec
+        netOutBytesPerSec = process.netOutBytesPerSec
+        diskReadBytesPerSec = process.diskReadBytesPerSec
+        diskWriteBytesPerSec = process.diskWriteBytesPerSec
+    }
+}
+
+struct AppRollupPayload: Encodable {
+    let id: String
+    let displayName: String
+    let isAppBundle: Bool
+    let pidCount: Int
+    /// Sorted so the payload is byte-stable for a given snapshot.
+    let projectIDs: [String]
+    let totalCPU: Double
+    let totalMemory: UInt64
+    let netInBytesPerSec: Double?
+    let diskWriteBytesPerSec: Double?
+    let processes: [ProcessPayload]
+
+    init(_ rollup: AppRollup) {
+        id = rollup.id
+        displayName = rollup.displayName
+        isAppBundle = rollup.isAppBundle
+        pidCount = rollup.pidCount
+        projectIDs = rollup.projectIDs.sorted()
+        totalCPU = rollup.totalCPU
+        totalMemory = rollup.totalMemory
+        netInBytesPerSec = rollup.totalNetInBytesPerSec
+        diskWriteBytesPerSec = rollup.totalDiskWriteBytesPerSec
+        processes = rollup.processes.map(ProcessPayload.init)
+    }
+}
+
+// MARK: - The reads with their own shape
 
 struct ContainerPayload: Encodable {
     let id: String
