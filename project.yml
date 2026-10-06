@@ -28,6 +28,7 @@ targets:
     platform: macOS
     sources:
       - path: App
+      #
     dependencies:
       - package: Sparkle
         product: Sparkle
@@ -37,6 +38,31 @@ targets:
       # links the module the CLI is built from rather than a second copy of it.
       - package: PortmasterCore
         product: PortmasterMCP
+      # The client-side half of the MCP feature, shipped inside the app.
+      #
+      # Settings → MCP offers a "Copy install command" button, and a button that names a
+      # path only the build machine has is a button no real user can press: a checkout
+      # lookup (#filePath) resolves on the machine that compiled the app and nowhere else.
+      # So the executable travels with it, in Contents/Resources, which is where
+      # `MCPInstallCommand.binaryCandidates` looks first.
+      #
+      # Declared as a dependency so Xcode *builds* the executable and links its output into
+      # this target's products directory, and with `link: false` because an executable
+      # cannot be linked against — only copied. The copy itself is the `copyFiles` phase
+      # below.
+      - package: PortmasterCore
+        product: portmaster-mcp
+        link: false
+    # Copy the built CLI into Contents/Resources. A post-build script rather than an Xcode
+    # Copy Files phase: XcodeGen only emits one from a *source* path that exists when the
+    # project is generated, and this file's path only exists once Xcode has built it.
+    # The script copies what Xcode built — it never invokes `swift build`, so it takes no
+    # SwiftPM build lock and does not make an app build depend on the toolchain.
+    postBuildScripts:
+      - path: scripts/embed-mcp-cli.sh
+        name: Embed portmaster-mcp
+        basedOnDependencyAnalysis: false
+        showEnvVars: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.portmaster.app
