@@ -262,18 +262,22 @@ final class AgentSessionWiringTests: XCTestCase {
 
     // MARK: - The CLI
 
-    /// The CLI refuses, and says the thing that would fix it.
+    /// The CLI refuses, and says something true.
     ///
     /// Not a test that it *can* refuse — it already did, being unwired. It is pinned
-    /// because the refusal is the decision: the on-demand CLI has no connection to
-    /// attribute a report to, and opening the app's SQLite file from a second process
-    /// is not covered by `AgentSessionStore`'s `NSLock`, which is per-process. Wiring
-    /// it would produce records the app's own `ModelContext` may never see — a report
-    /// acknowledged to an agent and absent from the file the user later reads.
+    /// because the refusal is the decision: on this path the process taking the report
+    /// *is* `portmaster-mcp`, so there is no agent to attribute the tokens to, and a
+    /// second `ModelContext` over the app's file would write rows the app's own reader
+    /// never observes. See `LocalMCPCallContext.noSessionNote` for the full reasoning.
     ///
-    /// So the message names the fix. A refusal that only said "unavailable" would leave
-    /// an agent with nothing to do but retry, forever.
-    func testTheOnDemandCLIRefusesWithTheReasonThatCanBeActedOn() async throws {
+    /// **What the message must not say is the assertion.** `.onDemand` is reached
+    /// because the user forced `PORTMASTER_MCP=on-demand` as well as because no app
+    /// answered, and in the forced case an app is very likely up and healthy — that is
+    /// usually why it was forced. A refusal claiming Portmaster is not running would be
+    /// the one untrue thing this process says, and an agent may act on it. `MCPRoute`
+    /// already splits its stderr notice for exactly this reason; this result must not
+    /// reintroduce the claim the split exists to avoid.
+    func testTheOnDemandCLIRefusesWithoutClaimingPortmasterIsNotRunning() async throws {
         let directory = try makeTemporaryDirectory(prefix: "pmusage")
         let context = LocalMCPCallContext(
             provider: StubProvider(),
@@ -288,9 +292,22 @@ final class AgentSessionWiringTests: XCTestCase {
 
         XCTAssertTrue(outcome.isError)
         XCTAssertEqual(outcome.text, LocalMCPCallContext.noSessionNote)
+        // The false claims, named so a reworded message cannot reintroduce any of them.
+        for claim in ["not running", "Start Portmaster", "isn't running"] {
+            XCTAssertFalse(
+                outcome.text.contains(claim),
+                "the on-demand path may be forced while an app is up and healthy, so the "
+                    + "refusal must not claim Portmaster is not running: \(outcome.text)"
+            )
+        }
+        // The true statement: it is about this session, and it names the path that works.
         XCTAssertTrue(
-            outcome.text.contains("Start Portmaster"),
-            "the refusal must name what would make the report recordable: \(outcome.text)"
+            outcome.text.contains("not connected to Portmaster"),
+            "the refusal must be about the session's own connection: \(outcome.text)"
+        )
+        XCTAssertTrue(
+            outcome.text.contains("socket session"),
+            "and must name the route that would record it: \(outcome.text)"
         )
     }
 

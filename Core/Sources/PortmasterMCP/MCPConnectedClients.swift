@@ -174,6 +174,12 @@ final class ClientRegistry: @unchecked Sendable {
 /// for two connections to share. The distinction is invisible while a single
 /// connection reports and produces a wrong number — a valid id, an existing row, a
 /// read that succeeds — the moment a second one does.
+///
+/// **And this two-argument method is the load-bearing line for the whole binding.**
+/// `MCPDispatch` calls it and never the three-argument form, so this is the only place
+/// the id crosses from the connection into the executor. Everything else — the protocol
+/// requirement, `HostMCPCallContext`'s session-aware overload — is reachable from here
+/// and from nowhere else.
 struct RecordingContext: MCPToolCalling {
     let base: any MCPToolCalling
     /// Which connection this context speaks for, or nil when its session row could
@@ -189,11 +195,10 @@ struct RecordingContext: MCPToolCalling {
     /// The session-aware overload, which ignores a session handed in from outside and
     /// answers with its own.
     ///
-    /// A call arrives here from `MCPDispatch`, which knows only a name and arguments.
-    /// Were this to prefer an incoming session over its own, a caller that reached the
-    /// decorator could stamp one connection's report with another's id — the same
-    /// wrong number as putting the id on the shared context, arrived at from the other
-    /// direction. The decorator is the connection, so it is the authority.
+    /// A call that reached the decorator could otherwise stamp one connection's report
+    /// with another's id — the same wrong number as putting the id on the shared
+    /// context, arrived at from the other direction. The decorator is the connection,
+    /// so it is the authority and the argument is discarded.
     func call(
         name: String, arguments: [String: String], session _: MCPConnectionSession?
     ) async -> ToolOutcome {

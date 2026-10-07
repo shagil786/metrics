@@ -152,11 +152,15 @@ public protocol MCPToolCalling: Sendable {
     /// once and shared by every connection the socket host admits, so an id held on
     /// it would stamp each connection's reports with the same one — silent, valid,
     /// and wrong, which is the failure this whole design is shaped against. Passing
-    /// it per call makes "which connection" unanswerable at construction time.
+    /// it per call is what keeps "which connection" out of anything constructed once.
     ///
-    /// Required rather than defaulted, so a new call surface cannot compile without
-    /// answering the question. The default implementation below exists for the
-    /// surfaces whose answer is genuinely "there is no connection".
+    /// Declared as its own requirement so the question is *written down* where a new
+    /// surface will read it. It is not enforcement, and should not be mistaken for it:
+    /// the extension below implements it, so a conformer that forgets compiles and
+    /// silently drops every session id — the hazard class this parameter exists to
+    /// close. What makes production correct is one line elsewhere:
+    /// `RecordingContext.call(name:arguments:)` forwards its own session, and it is
+    /// the only path `MCPDispatch` takes.
     func call(
         name: String, arguments: [String: String], session: MCPConnectionSession?
     ) async -> ToolOutcome
@@ -171,6 +175,13 @@ extension MCPToolCalling {
     /// under a connection nobody made. `ToolExecutor.requireSessionID` is what
     /// refuses, and it is why a surface that declines to bind an id must not be
     /// given one to forward.
+    ///
+    /// **Honest, and not silent-by-accident — but a surface that *should* know its
+    /// connection must override it.** The drop is invisible: nothing throws here, and
+    /// a caller sees only the refusal further down. That is the right failure for
+    /// `LocalMCPCallContext`, which genuinely has no connection, and the wrong one for
+    /// anything that does have one. This is what "a conformer forgets" looks like, so
+    /// it is stated here rather than discovered.
     ///
     /// **No surface that answers a relayed call may use this.** The relay client is
     /// the case that looks like an exception and is not: it is a client on one side of
@@ -217,29 +228,49 @@ public struct LocalMCPCallContext: MCPToolCalling {
     /// What a refused `report_usage` says on this path, and **why the CLI is left
     /// unwired on purpose.**
     ///
-    /// Two reasons, and the second is the one that would have been easiest to miss.
+    /// The message is about **this session**, not about whether Portmaster is running,
+    /// and that is not a matter of tone. `MCPRouteSelector.select` builds this context
+    /// on two branches: the user forcing it with `PORTMASTER_MCP=on-demand`, and
+    /// falling back when no endpoint file, a stale one, or a refused connect says no
+    /// app is there. In the forced case an app is very likely up and perfectly healthy —
+    /// that is usually *why* it was forced — so a message claiming Portmaster is not
+    /// running would be the one untrue thing this process says, and an agent may act on
+    /// it. `MCPRoute.forcedNotice` already states that rule for the stderr line, and this
+    /// is the same rule applied to the tool result.
     ///
-    /// The obvious one: this stdio session is not an MCP *connection*. It has no peer
-    /// pid, no client name, and it ends when the pipe ends, so there is no connection
-    /// to attribute a report to — and minting a row for it anyway would put a session
-    /// in the user's history that no agent ever held.
+    /// One message for both branches, deliberately. They differ in what is worth telling
+    /// the *user* — who set the variable knows, and is told on stderr — but not in what is
+    /// true of the *session*, and splitting this would mean routing a liveness claim
+    /// through `MCPRouteSelector` for no gain in what the agent can act on.
     ///
-    /// The one that decides it: **wiring the CLI would mean opening the app's SQLite
-    /// file from a second process.** `AgentSessionStore`'s `NSLock` is a per-process
-    /// lock. It serialises two threads inside one `portmaster-mcp` and does nothing at
-    /// all for the app's writer in another process. SQLite's own file locking would
-    /// keep two writers from corrupting the file, and that is a much weaker guarantee
-    /// than it looks: a report this process acknowledges to an agent can still be
-    /// absent from the file the app later reads, because nothing coordinates the two
-    /// `ModelContext`s. A refusal is visible; a lost record the agent was told was
-    /// saved is a wrong number, which is the failure everything here exists to
-    /// prevent.
+    /// ### Why the CLI does not record
     ///
-    /// So the CLI refuses with a reason, and the app — which really does have
-    /// connections — records.
+    /// **Attribution, which decides it.** A stdio session is not an MCP connection: no
+    /// handshake, no `initialize`, no lifetime beyond the pipe. And on this path the
+    /// process taking the report *is* `portmaster-mcp` — so a `peerPID` read here would
+    /// be the relay's own pid, not the agent's. A row written from this side files an
+    /// agent's tokens against Portmaster's own process. That is a wrong number, not an
+    /// absence, and it would read as confidently as any correct one.
+    ///
+    /// **Staleness, in the harmful direction.** Opening this store from here would put
+    /// a second `ModelContext` on the file, and nothing coordinates the two: no merge
+    /// policy, no persistent-history tracking, no remote-change notification. The app's
+    /// context would not observe these inserts — and the app is the *reader* the user
+    /// sees. So the cost is not a lost write but a session the user's own Portmaster
+    /// never shows.
+    ///
+    /// This is the same mechanism `StoreHistoryReading.defaultStore` already uses
+    /// cross-process, and the verdict differs only because the roles are swapped: there
+    /// the app writes history and the CLI reads, so staleness lands on a CLI read. Here
+    /// the app reads, so it would land on the user.
+    ///
+    /// `AgentSessionStore`'s `NSLock` does not help either: it is a per-process lock, so
+    /// it serialises this process's threads and nothing in the app's. It is worth naming
+    /// only so no reader mistakes it for cross-process protection — the reasons above do
+    /// not rest on it.
     public static let noSessionNote =
-        "Portmaster is not running, so this session has nowhere to record usage. "
-        + "Start Portmaster and this report will be recorded."
+        "This session is not connected to Portmaster, so it has nowhere to record "
+        + "usage. Reported over a Portmaster socket session, it will be recorded."
 
     /// Built once, in `init`, and shared by every call. A provider owns a
     /// `LiveSnapshotSource`, which owns a `SamplingEngine`, which owns the
@@ -285,12 +316,9 @@ public struct LocalMCPCallContext: MCPToolCalling {
         await makeExecutor().execute(name: name, arguments: arguments)
     }
 
-    /// A call with no connection behind it, which is every call on this path.
-    ///
-    /// Declared rather than left to the protocol's default so the decision is visible
-    /// here: this is the one surface where refusing `report_usage` is the answer, and
-    /// the reason it gives (`noSessionNote`) is this type's own. `makeExecutor` supplies
-    /// the recorder that refuses with it.
+    /// Refuses `report_usage` with `noSessionNote`, which is this type's own reason and
+    /// the only surface's. Declared here rather than left to the protocol's default so
+    /// the decision is visible at the point it is made; the behaviour is identical.
     public func call(
         name: String, arguments: [String: String], session _: MCPConnectionSession?
     ) async -> ToolOutcome {
@@ -319,10 +347,8 @@ public struct LocalMCPCallContext: MCPToolCalling {
             gate: PermissionGate(settings: loadSettings(), appRunning: appRunning()),
             audit: AuditLog(directory: auditDirectory),
             settingsDirectory: settingsDirectory,
-            // Refuses with this path's own reason. Nothing is opened: a second writer
-            // over the app's SQLite file is not something a per-process lock covers,
-            // and this process has no connection to attribute a report to anyway.
-            // See `noSessionNote`.
+            // Refuses with this path's own reason. Nothing is opened and
+            // nothing is bound; `noSessionNote` is the whole of the reasoning.
             sessionRecorder: UnavailableSessionRecorder(message: Self.noSessionNote)
         )
     }
@@ -340,6 +366,12 @@ public enum MCPDispatch {
     /// `context` is asked to answer the call rather than asked for an executor, so
     /// whether it runs the call here or forwards it to a running app is not this
     /// function's business — and cannot become its bug.
+    ///
+    /// The two-argument form is deliberate, and it is where the session is bound. This
+    /// layer knows a name and arguments and nothing about connections, so it has no
+    /// session to pass; the context it is handed is the per-connection one
+    /// (`RecordingContext`), and forwarding through its two-argument `call` is what puts
+    /// that connection's id on the executor.
     public static func call(
         name: String,
         arguments: [String: String],
