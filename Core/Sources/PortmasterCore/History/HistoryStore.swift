@@ -36,13 +36,9 @@ public final class HistoryStore: @unchecked Sendable {
         let url = storeURL ?? Self.defaultStoreURL()
         let config = ModelConfiguration(url: url)
         do {
-            // Every model is listed, because SwiftData only persists models named
-            // here — one left out of this list simply never saves, with nothing
-            // failing. Adding a model means adding it here too.
             container = try ModelContainer(
                 for: CPUSample.self, MemSample.self, ProcessPoint.self, PortEvent.self,
                 AppHistoryPoint.self, ResourceHistoryPoint.self,
-                AgentSession.self, TokenUsageRecordRow.self, ModelPriceEntry.self,
                 configurations: config
             )
         } catch {

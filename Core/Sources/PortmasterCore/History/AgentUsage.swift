@@ -145,11 +145,20 @@ public enum SessionCost: Hashable, Sendable {
     case priced(usd: Decimal, priceTableVersion: Int)
     /// The model has no entry in the price table. An unknown price, not a free one.
     case notPriced(modelID: String)
+    /// Sources disagree about which model ran, so there is no figure to price. Kept
+    /// apart from `notPriced` because it is a different fact with a different repair:
+    /// both models here may be priced perfectly well, so "enter a price" would do
+    /// nothing, and reporting a missing price for a model that has one is a claim the
+    /// user can disprove.
+    case conflict(models: [String])
     /// Nothing to price yet.
     case noUsage
 
     public var usd: Decimal? {
-        if case .priced(let usd, _) = self { return usd }
-        return nil
+        switch self {
+        case .priced(let usd, _): return usd
+        // Every other case is absence of a figure, never a figure of zero.
+        case .notPriced, .conflict, .noUsage: return nil
+        }
     }
 }

@@ -208,16 +208,26 @@ public final class AgentSessionStore: @unchecked Sendable {
         let descriptor = FetchDescriptor<AgentSession>(
             sortBy: [SortDescriptor(\.connectedAt)]
         )
-        return try context.fetch(descriptor).map { row in
-            AgentSessionSnapshot(
+        let rows = try context.fetch(descriptor)
+        // Three queries for the whole list, never three per row. Usage and cost both
+        // need the session's records, and both need prices, so reading inside the map
+        // repeats the same work once per session — an N+1 that gets worse the longer
+        // history runs, against tables this file never prunes. The batching is the
+        // reason to keep these two fetches above the loop: moving them back inside
+        // would restore the per-row queries without changing any result.
+        let recordsBySession = usageRecordsGroupedLocked()
+        let table = priceTableLocked()
+        return rows.map { row in
+            let records = recordsBySession[row.id] ?? []
+            return AgentSessionSnapshot(
                 id: row.id,
                 peerPID: row.peerPID,
                 clientName: row.clientName,
                 clientVersion: row.clientVersion,
                 connectedAt: row.connectedAt,
                 endedAt: row.endedAt,
-                usage: TokenUsage.aggregating(usageRecordsLocked(for: row.id)),
-                cost: costLocked(for: row.id)
+                usage: TokenUsage.aggregating(records),
+                cost: costLocked(records: records, table: table)
             )
         }
     }
@@ -229,7 +239,7 @@ public final class AgentSessionStore: @unchecked Sendable {
 
     public func cost(for sessionID: UUID) throws -> SessionCost {
         lock.lock(); defer { lock.unlock() }
-        return costLocked(for: sessionID)
+        return costLocked(records: usageRecordsLocked(for: sessionID), table: priceTableLocked())
     }
 
     // MARK: - Locked helpers (callers already hold the lock)
@@ -258,6 +268,21 @@ public final class AgentSessionStore: @unchecked Sendable {
         return ((try? context.fetch(descriptor)) ?? []).map(\.value)
     }
 
+    /// Every session's records in one query. Grouping must not reorder a session's
+    /// own records: `latestPerProvenance` breaks equal timestamps by array position,
+    /// so the global sort by `recordedAt` is what keeps each slice equivalent to the
+    /// per-session fetch above.
+    private func usageRecordsGroupedLocked() -> [UUID: [TokenUsageRecord]] {
+        let descriptor = FetchDescriptor<TokenUsageRecordRow>(
+            sortBy: [SortDescriptor(\.recordedAt)]
+        )
+        var grouped: [UUID: [TokenUsageRecord]] = [:]
+        for row in (try? context.fetch(descriptor)) ?? [] {
+            grouped[row.sessionID, default: []].append(row.value)
+        }
+        return grouped
+    }
+
     private func currentVersionLocked() -> Int {
         let descriptor = FetchDescriptor<ModelPriceEntry>(
             sortBy: [SortDescriptor(\.tableVersion, order: .reverse)]
@@ -266,25 +291,34 @@ public final class AgentSessionStore: @unchecked Sendable {
         return all.first?.tableVersion ?? 0
     }
 
-    private func priceLocked(_ key: String) -> (Decimal, Int)? {
-        guard let entry = fetchPrice(key) else { return nil }
-        return (entry.pricePerToken, entry.tableVersion)
+    /// The whole price table in one query, keyed for lookup. Costing needs several
+    /// components per session, and each would otherwise be its own fetch — the same
+    /// multiplication repeated in SQL rather than in memory.
+    private func priceTableLocked() -> PriceTable {
+        let all = (try? context.fetch(FetchDescriptor<ModelPriceEntry>())) ?? []
+        var byKey: [String: (price: Decimal, version: Int)] = [:]
+        var version = 0
+        for entry in all {
+            byKey[entry.key] = (entry.pricePerToken, entry.tableVersion)
+            version = max(version, entry.tableVersion)
+        }
+        return PriceTable(byKey: byKey, currentVersion: version)
     }
 
-    private func costLocked(for sessionID: UUID) -> SessionCost {
-        let records = usageRecordsLocked(for: sessionID)
+    private func costLocked(records: [TokenUsageRecord], table: PriceTable) -> SessionCost {
         guard !records.isEmpty else { return .noUsage }
 
         let latest = TokenUsage.latestPerProvenance(records)
         // The conflict rule lives in `TokenUsage`, and costing asks it rather than
         // re-deriving "do the sources disagree" from the raw records: one source
         // escalating models mid-session is history, not a disagreement, and pricing
-        // it against the newest model is not ambiguous. Naming every model involved
-        // keeps the reason visible instead of collapsing it to whichever sorted first.
+        // it against the newest model is not ambiguous.
+        //
+        // This is its own case, not `notPriced`. Both models named here may be
+        // priced already, so `notPriced` would assert a missing price that does not
+        // exist and send the user to enter one that nothing would ever read.
         if TokenUsage.hasModelConflict(records) {
-            return .notPriced(
-                modelID: Set(latest.values.map(\.modelID)).sorted().joined(separator: "/")
-            )
+            return .conflict(models: Set(latest.values.map(\.modelID)).sorted())
         }
         guard let record = latest[.selfReported] ?? latest[.parsedFromLog] else { return .noUsage }
         let modelID = record.modelID
@@ -303,14 +337,14 @@ public final class AgentSessionStore: @unchecked Sendable {
             // Zero tokens cost zero under any table, so the figure is exact; it
             // still names the prices it stands under rather than a version of 0,
             // which would read as "priced from nothing".
-            return .priced(usd: 0, priceTableVersion: currentVersionLocked())
+            return .priced(usd: 0, priceTableVersion: table.currentVersion)
         }
 
         var total = Decimal(0)
         var version = 0
         for (component, count) in spent {
             guard let count,
-                  let (price, entryVersion) = priceLocked("\(modelID)#\(component.keySuffix)")
+                  let (price, entryVersion) = table.price("\(modelID)#\(component.keySuffix)")
             else {
                 return .notPriced(modelID: modelID)
             }
@@ -318,5 +352,22 @@ public final class AgentSessionStore: @unchecked Sendable {
             version = max(version, entryVersion)
         }
         return .priced(usd: total, priceTableVersion: version)
+    }
+
+    /// A read-only view of the price table for one costing pass. Small enough to be a
+    /// value, so a caller cannot hold a half-read table across a later write.
+    private struct PriceTable {
+        private let byKey: [String: (price: Decimal, version: Int)]
+        let currentVersion: Int
+
+        init(byKey: [String: (price: Decimal, version: Int)], currentVersion: Int) {
+            self.byKey = byKey
+            self.currentVersion = currentVersion
+        }
+
+        func price(_ key: String) -> (Decimal, Int)? {
+            guard let entry = byKey[key] else { return nil }
+            return (entry.price, entry.version)
+        }
     }
 }
