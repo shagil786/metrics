@@ -97,6 +97,12 @@ struct MainWindow: View {
             if let err = model.historyError {
                 ErrorBanner(message: err)
             }
+            // Its own banner rather than folded into the history one: two databases fail
+            // independently, and merging the messages would make an unreadable agent
+            // session store look like a history problem.
+            if let err = model.agentSessionError {
+                ErrorBanner(message: err)
+            }
             if let err = model.engine.collectionError {
                 ErrorBanner(message: err) {
                     model.engine.clearCollectionError()

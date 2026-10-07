@@ -108,9 +108,29 @@ public final class ModelPriceEntry {
     /// row that cannot be read is a price that is not known, and zero would turn an
     /// unreadable row into a figure that looks computed.
     public var pricePerToken: Decimal? {
+        // Strict before lenient: `Decimal(string:)` parses what it can and ignores the
+        // rest, so `"1,5"` returns 1 and `"1.5abc"` returns 1.5. A wrong price is the
+        // worse failure of the two — a missing one is visibly missing, a wrong one is
+        // a figure that looks computed and cannot reconcile with an invoice.
+        guard ModelPriceEntry.isDecimalNumber(pricePerTokenText) else { return nil }
         // `en_US_POSIX` so the decimal separator is a period whatever the user's locale
         // is — a price written under one locale must not stop parsing under another.
-        Decimal(string: pricePerTokenText, locale: Locale(identifier: "en_US_POSIX"))
+        return Decimal(string: pricePerTokenText, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Whether `text` is a decimal number and nothing else: digits, with at most one
+    /// decimal point and at least one digit somewhere.
+    ///
+    /// The shape `text(for:)` writes, and the shape nothing else should be accepted as.
+    /// Deliberately narrower than what `Decimal(string:)` tolerates, because tolerating
+    /// `"1,5"` is a silently wrong price rather than a rejected one.
+    static func isDecimalNumber(_ text: String) -> Bool {
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 2 else { return false }
+        for part in parts where !part.isEmpty {
+            guard part.allSatisfy({ $0.isASCII && $0.isNumber }) else { return false }
+        }
+        return parts.contains { !$0.isEmpty }
     }
 
     /// `NSDecimalNumber` rather than `Decimal.description`: the latter is a rendering
@@ -147,9 +167,11 @@ public final class AgentSessionStore: @unchecked Sendable {
     /// error should not be able to read it as the other.
     public enum StoreError: LocalizedError {
         case initFailed(underlying: Error)
+        case deleteFailed(underlying: Error)
         public var errorDescription: String? {
             switch self {
             case .initFailed(let e): "Could not open the local agent session database: \(e.localizedDescription)"
+            case .deleteFailed(let e): "Could not delete stored agent sessions: \(e.localizedDescription)"
             }
         }
     }
@@ -270,6 +292,60 @@ public final class AgentSessionStore: @unchecked Sendable {
         return costLocked(records: usageRecordsLocked(for: sessionID), table: priceTableLocked())
     }
 
+    // MARK: - Retention & clear
+
+    /// Delete every session and every usage record. Irreversible; the UI confirms
+    /// first. Throws when deletion fails so the UI can tell the user (never silent).
+    ///
+    /// Both tables or neither: deleting the session rows alone would leave usage records
+    /// under an id no row names, which every session-scoped read ignores and which
+    /// `clearAll` would then report as cleared while it stayed on disk.
+    ///
+    /// The price table is kept, and that is the one thing here that is not history: it
+    /// is configuration the user typed. Clearing samples does not un-type them.
+    public func clearAll() throws {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            _ = try context.delete(model: TokenUsageRecordRow.self)
+            _ = try context.delete(model: AgentSession.self)
+            try context.save()
+        } catch {
+            context.rollback()
+            throw StoreError.deleteFailed(underlying: error)
+        }
+    }
+
+    /// Drop sessions that connected before `cutoff`, and the usage records belonging to
+    /// them. Best-effort and non-throwing, matching `HistoryStore.prune`: a retention
+    /// sweep that failed on one row must not abort the rest, and the error is logged.
+    ///
+    /// The records have to go with the session for the same reason `clearAll` deletes
+    /// both — an orphaned usage record is invisible to every read here but still on
+    /// disk, so pruning the parent alone would leave the numbers behind.
+    public func prune(olderThan cutoff: Date) {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            let stale = try context.fetch(FetchDescriptor<AgentSession>(
+                predicate: #Predicate { $0.connectedAt < cutoff }
+            ))
+            for session in stale {
+                let id = session.id
+                _ = try context.delete(
+                    model: TokenUsageRecordRow.self,
+                    where: #Predicate { $0.sessionID == id }
+                )
+            }
+            _ = try context.delete(
+                model: AgentSession.self,
+                where: #Predicate { $0.connectedAt < cutoff }
+            )
+            try context.save()
+        } catch {
+            context.rollback()
+            NSLog("Portmaster agent session prune failed: \(error)")
+        }
+    }
+
     // MARK: - Locked helpers (callers already hold the lock)
 
     private func fetchSession(_ id: UUID) -> AgentSession? {
@@ -357,9 +433,12 @@ public final class AgentSessionStore: @unchecked Sendable {
 
         let latest = TokenUsage.latestPerProvenance(records)
         // The conflict rule lives in `TokenUsage`, and costing asks it rather than
-        // re-deriving "do the sources disagree" from the raw records: one source
-        // escalating models mid-session is history, not a disagreement, and pricing
-        // it against the newest model is not ambiguous.
+        // re-deriving "do the sources disagree" from the raw records, so the list
+        // view and a single-session read cannot price the same session differently.
+        //
+        // What asking it does not solve: one source that escalated models mid-session
+        // prices its whole cumulative total at the newest model's rate. That figure is
+        // known-unsound rather than ambiguous — see `TokenUsage.hasModelConflict`.
         //
         // This is its own case, not `notPriced`. Both models named here may be
         // priced already, so `notPriced` would assert a missing price that does not

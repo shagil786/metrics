@@ -1,8 +1,17 @@
 # Agent Sessions & Cost Attribution — Design
 
 Date: 2026-10-07
-Status: Approved design, pending spec review
+Status: Approved design; amended 2026-10-07 after implementation and review
 Path: Architectural
+
+> **Amendment, 2026-10-07.** This spec was written before the code. Five statements
+> below no longer describe what shipped, and are corrected in place: the persistence
+> section (a separate database, not the history store), `priceTableVersion` (travels
+> inside `SessionCost.priced`, never stored on the row), the `SessionCost` enum (four
+> cases, not three), the conflict rule's scope (latest record per provenance), and two
+> overclaims ("same migration discipline", "queryable through Core **and the MCP
+> surface**"). Two lines that were specified are deliberately *not* implemented, and
+> both substitutions improve on what was written — see *Two deliberate substitutions*.
 
 ## Goal
 
@@ -55,11 +64,24 @@ discards it. Phase A records it.
 
 ### Persistence
 
-`AgentSession` is a SwiftData `@Model` in `PortmasterCore/Models/`, alongside
-the existing `Preferences` models, in the same store and same migration
-discipline: additive only, defaults that reproduce current behaviour, and
-existing stores must load unchanged. Sessions are queryable with the rest of
-history and inherit its retention behaviour.
+`AgentSession` is a SwiftData `@Model` in `PortmasterCore/History/`, alongside the
+`HistoryStore` code that owns the rest of the history models.
+
+**It is a separate database, not a table in the history store.** `agent-sessions.sqlite`
+sits beside `history.sqlite` under Application Support/Portmaster, in its own
+`ModelContainer`. This diverges from the design below, which said "the same store and
+same migration discipline, additive only, defaults that reproduce current behaviour,
+and existing stores must load unchanged". That claim was wrong twice over: the repo
+contains no `VersionedSchema` anywhere, so there is no migration discipline here to
+share, and adding three models to the history container widens every existing install's
+schema for no benefit. The separate file is also what makes retention honest — the
+store carries its own `clearAll()` and `prune(olderThan:)`, so **Clear All History** and
+the retention picker reach agent sessions and their usage records instead of leaving
+peer pids, client identity and token counts on disk. Prices are deliberately kept by
+both, being configuration the user typed rather than history.
+
+So: additive-only and existing stores load unchanged, both of which hold. "Same
+migration discipline" and "same store" do not, and are not claimed.
 
 Usage figures are **not** a SwiftData field on the session. They arrive
 asynchronously — an agent reports at its own pace, and a log adapter may be
@@ -68,7 +90,7 @@ reading while the app writes — so they are appended to a separate
 `TokenUsage` enum directly would mean every report rewrites the session row and
 concurrent adapters contend for one object.
 
-`PriceTable` is a `@Model` in the same store, version-stamped.
+`PriceTable` is a `@Model` in the same store as the sessions, version-stamped.
 
 ### `AgentSession`
 
@@ -79,7 +101,7 @@ concurrent adapters contend for one object.
 | `clientName`, `clientVersion` | from `initialize`'s `clientInfo`; nil when absent |
 | `connectedAt`, `lastToolCallAt`, `endedAt` | a connection may outlive its process |
 | `usageRecords` | not a field: appended `TokenUsageRecord`s, aggregated on read |
-| `priceTableVersion` | the table that produced the session's current cost |
+| `priceTableVersion` | **not a field.** The version travels inside `SessionCost.priced`, computed on read |
 
 One process may back several sessions (two connections, one agent); one session
 may outlive its process while the socket stays open. Both are already true of
@@ -127,6 +149,17 @@ different provenances are combined only when they agree on `modelID`; when they
 disagree, the session keeps both and reports the conflict rather than picking
 one silently.
 
+"Disagree" is scoped to **one record per provenance**: the latest of each. Two
+sources naming different models is a conflict. One source escalating
+`model-a` → `model-b` mid-session is not — the superseded model is history.
+
+That scoping leaves a known-unsound case, recorded here and in the README
+because a spec is not the place to fix it: reports are cumulative, so an
+escalated session's newest total still contains the earlier model's tokens, and
+costing prices all of them at the newest model's rate. That figure cannot be
+reconciled with an invoice, and no output says so. Representing usage as
+per-model segments is a phase-C data-model change.
+
 `notReported(.unrecognizedFormat)` is the important one: an agent that upgrades
 and changes its log layout must degrade to "not reported", **not** to a
 plausible-looking wrong number. This is the exact failure the whole three-state
@@ -144,24 +177,40 @@ entry carries the date it was set.
 
 Cost is **not stored** — it is computed from a session's latest usage records
 and the current table, so that a price change re-costs historical sessions
-rather than leaving stale figures behind. What is stored alongside a session is
-the `priceTableVersion` that produced whatever cost the user last saw, so a
-figure can always be traced to the prices behind it. A model with no entry in
+rather than leaving stale figures behind. The `priceTableVersion` that produced
+whatever cost the user last saw travels *inside* the `priced` case rather than
+being stored on the session row, so a figure can still be traced to the prices
+behind it while nothing on the row goes stale. (The design had it as a session
+field; it is not stored, and the field table above now says so.) A model with no entry in
 the table yields **no cost**, distinct from a cost of zero: an unpriced model is
 an unknown price, not a free one.
 
-Cost is its own three-state value, for the same reason `TokenUsage` is:
+Cost is its own multi-state value, for the same reason `TokenUsage` is — each
+case is a different fact needing a different word, not a number with a flag on it:
 
 ```swift
 enum SessionCost {
     case priced(usd: Decimal, priceTableVersion: Int)
-    case notPriced(modelID: String)  // no entry in the table
-    case noUsage                     // nothing to price yet
+    case notPriced(modelID: String)   // no entry in the table
+    case conflict(models: [String])   // two sources, different models
+    case noUsage                      // nothing to price yet
 }
 ```
 
+Four cases, not the three written before implementation. The design asked for
+"both plus a conflict flag" and had nowhere to put a flag: neither `SessionCost`
+nor `AgentSessionSnapshot` has a place to hang one, and folding a conflict into
+`notPriced` would be a lie the user can disprove — both models in a conflict may
+be priced perfectly well, so "enter a price" would do nothing. Hence its own
+case, carrying both models.
+
 `Decimal`, not `Double`: money arithmetic in binary floating point cannot
 reconcile with a provider invoice, which is the whole reason to show a cost.
+The stored price is exact decimal **text**, because SQLite has no decimal
+storage class: a column declared `DECIMAL` is stored as a binary float, and
+`0.1234567890123456` comes back as `0.123456789012346`. Parsing that text back
+into a `Decimal` is **strict** — `Decimal(string:)` would accept `"1,5"` as 1 and
+`"1.5abc"` as 1.5, turning a typo into a wrong price rather than an absent one.
 
 ## Sources
 
@@ -172,8 +221,10 @@ Precise when the agent is honest; absent when it is not. Recorded as
 `.selfReported`.
 
 Validation is the same allowlist discipline as `set_preference`: non-negative
-integers, a known-or-user-added model id, and an explicit `source` string so a
-number can be traced to the agent that sent it.
+integers, a non-blank model id, and provenance that comes from the authenticated
+connection rather than from the caller's own word. See *Two deliberate
+substitutions* for why the model id is not allowlisted and why there is no
+self-asserted `source` argument.
 
 ### 2. `TokenSourceAdapter` protocol
 
@@ -201,8 +252,11 @@ visible and their breakage becomes someone's problem.
 
 Stated so the scope is not quietly widened later:
 
-- **No UI.** Sessions are queryable through Core and the MCP surface, not shown
-  in the app.
+- **No UI.** Sessions are queryable through Core, not shown in the app. This corrects
+  an earlier version of this line, which said "Core **and the MCP surface**": there is
+  no MCP read tool for sessions, no app surface, and no way to enter a price, so
+  "queryable" means `AgentSessionStore`'s own API and nothing a person or an agent can
+  reach today.
 - **No real log adapters.** Fixture only (see above).
 - **No budget alerts, no currency conversion, no cost rollups** — phase C.
 - **No changes to the permission gate's mode semantics.** `report_usage` is
@@ -210,6 +264,28 @@ Stated so the scope is not quietly widened later:
   amendment, not an implementation detail.
 - **No changes to audit logging.** Tool calls are already audited; phase A
   attaches a session to them but does not alter the format.
+
+## Two deliberate substitutions
+
+Two specified behaviours are not implemented, and neither is a gap to be closed by
+writing the code as written here.
+
+1. **The model id is not allowlisted.** This design asked for "a known-or-user-added
+   model id", which reads as an allowlist of recognized ids. Enforcing one would
+   contradict the central rule: an unpriced model must yield `notPriced`, never a
+   rejection. A model Portmaster has never heard of is *not priced* — that is the
+   honest answer, and it is already a distinct state that displays which id to price.
+   Rejecting the report instead would turn "we do not know this model's price" into
+   "your report was refused", discarding a real observation because the model list is
+   behind. Validation is: non-negative integers, and a non-blank model id.
+2. **There is no self-asserted `source` argument.** This design asked for "an explicit
+   `source` string so a number can be traced to the agent that sent it". A source the
+   caller supplies is provenance that can be lied in — the agent that reports tokens is
+   precisely the party a wrong number would be worth checking. Attribution comes from
+   the authenticated connection instead: the session is written at accept time from the
+   peer pid and the per-connection id the host itself minted, so a report cannot claim
+   to be someone else's. The stored provenance is therefore about *how* the figure was
+   obtained (`selfReported`), never about *who claims* it.
 
 ## Risks
 
@@ -232,8 +308,10 @@ Stated so the scope is not quietly widened later:
   naive sum over records inflates usage. Mitigation: aggregation takes the
   latest record per provenance, asserted by a test with three cumulative
   reports for one session.
-- **LOW — SwiftData migration.** New model, additive only. Existing stores must
-  load unchanged, which is asserted.
+- **LOW — SwiftData migration.** Not a question any more: the models live in their
+  own file, so no existing store's schema changes and there is nothing to migrate. The
+  repo has no `VersionedSchema`, so a design that promised shared "migration discipline"
+  promised something that does not exist.
 
 ## Testing
 
@@ -243,22 +321,26 @@ Stated so the scope is not quietly widened later:
   `unrecognizedFormat`), and a missing file (→ `noSource`).
 - Session identity: one pid, two connections → two sessions; process exits,
   socket stays open → session survives with `endedAt` nil.
-- `report_usage` validation: negatives, unknown model, absent fields.
+- `report_usage` validation: negatives, blank model, absent fields — and an *unpriced*
+  model id accepted and costed to `notPriced` rather than refused.
 - Cost arithmetic against a known price table, in `Decimal`, asserting exact
   equality (not approximate).
 - `notPriced` for a model absent from the table, asserted **not** equal to
   `priced(0)`.
 - Cumulative aggregation: three cumulative reports for one session yield the
   latest total, not the sum.
-- Provenance conflict: self-reported and parsed records disagreeing on
-  `modelID` yields both plus a conflict flag, not a silent pick.
+- Provenance conflict: self-reported and parsed records disagreeing on `modelID`
+  yields `.conflict(models:)`, not a silent pick, and not a missing price for a model
+  that has one.
 - Existing audit-log and MCP tests pass unchanged — phase A must not alter
   either surface.
 
 ## Verification bar
 
-`cd Core && swift test` green, plus a new `AgentSessionTests` and
-`TokenUsageTests`. No UI, so no browser verification. Nothing here may be
+`cd Core && swift test` green — `PortmasterCoreTests` and `PortmasterMCPTests` run as
+separate bundles with separate totals — plus the new suites: `AgentUsageTests`,
+`AgentSessionStoreTests`, `TokenSourceAdapterTests` (Core) and `AgentUsageToolTests`,
+`AgentSessionWiringTests` (MCP). No UI, so no browser verification. Nothing here may be
 claimed as verified against a real agent session until one has actually run —
 the fixture adapter is a fixture, and saying otherwise is the failure this
 project has repeatedly corrected for.

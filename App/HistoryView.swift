@@ -111,7 +111,7 @@ struct HistoryView: View {
         .confirmationDialog("Clear all stored history?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Clear All History", role: .destructive) { model.clearHistory(); reload() }
             Button("Cancel", role: .cancel) {}
-        } message: { Text("This deletes all system, app, process and port history stored on this Mac. It cannot be undone.") }
+        } message: { Text("This deletes all system, app, process and port history, and every recorded agent session and its token usage, stored on this Mac. It cannot be undone.") }
     }
 
     private var controls: some View {

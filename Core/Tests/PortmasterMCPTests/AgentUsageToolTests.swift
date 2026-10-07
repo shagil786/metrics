@@ -288,10 +288,13 @@ final class AgentUsageToolTests: XCTestCase {
     /// connection layer had already recorded correctly. Asserted against a real store
     /// rather than a spy because the harm is to the row, which a spy never had.
     func testRecordingAUsageReportLeavesTheConnectionOwnSessionRowIntact() throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("agent-sessions-\(UUID().uuidString).sqlite")
-        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
-        let store = try AgentSessionStore(storeURL: url)
+        // A directory, via the shared helper: removing the `.sqlite` path alone leaves
+        // the `-wal` and `-shm` sidecars SQLite writes beside it, so a store opened
+        // this way leaks two files per run.
+        let directory = try makeTemporaryDirectory(prefix: "agent-sessions")
+        let store = try AgentSessionStore(
+            storeURL: directory.appendingPathComponent("agent-sessions.sqlite")
+        )
 
         let sessionID = UUID()
         let connectedAt = Date(timeIntervalSince1970: 1_700_000_000)
@@ -309,7 +312,9 @@ final class AgentUsageToolTests: XCTestCase {
         )
         XCTAssertFalse(note.isEmpty)
 
-        let reopened = try AgentSessionStore(storeURL: url)
+        let reopened = try AgentSessionStore(
+            storeURL: directory.appendingPathComponent("agent-sessions.sqlite")
+        )
         let sessions = try reopened.sessions()
         XCTAssertEqual(sessions.count, 1, "a report must not create a second session")
         XCTAssertEqual(sessions.first?.id, sessionID)

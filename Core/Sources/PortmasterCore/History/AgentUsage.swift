@@ -129,10 +129,15 @@ public enum TokenUsage: Hashable, Sendable {
     /// never resolved: both figures stay visible and the cost cannot be computed
     /// without the user saying which to believe.
     ///
-    /// Scoped to the latest record per provenance, matching "sources disagree". One
-    /// source that escalates models mid-session is not a disagreement — the
-    /// superseded model is history, and reading it as a conflict would block a cost
-    /// that has no ambiguity in it.
+    /// Scoped to the latest record per provenance, matching "sources disagree". What
+    /// that scoping does *not* do is make an intra-provenance model change safe.
+    /// Reports are cumulative, so a session that escalated `model-a` → `model-b` still
+    /// carries `model-a`'s tokens in its newest total, and costing prices every token
+    /// at `model-b`'s rate. That figure cannot be reconciled with an invoice. Fixing it
+    /// means recording usage as per-model segments rather than one figure per session,
+    /// which is a data-model change for a later phase; the behaviour here is unchanged
+    /// and the limitation is recorded in the README rather than hidden behind a claim
+    /// that the case cannot arise.
     public static func hasModelConflict(_ records: [TokenUsageRecord]) -> Bool {
         let models = Set(latestPerProvenance(records).values.map(\.modelID))
         return models.count > 1

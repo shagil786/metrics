@@ -34,7 +34,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// what the app will do and it is the only way to prove the record was flushed: an
     /// unsaved insert is visible to the context that made it and to nothing else.
     func testARealUsageReportOverTheSocketIsVisibleToASessionScopedRead() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         let harness = try MCPHostHarness.make(
             self, context: fixture.context, sessionStore: fixture.store
         )
@@ -71,7 +73,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// its own at report time would pass every assertion above and leave the user with
     /// a session attributed to nobody.
     func testTheSessionRowTheConnectionWroteSurvivesTheUsageReport() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         let harness = try MCPHostHarness.make(
             self, context: fixture.context, sessionStore: fixture.store
         )
@@ -118,7 +122,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// Asserted on both sides: the ids differ, and each session holds only its own
     /// connection's report.
     func testTwoConnectionsAreTwoSessionsAndNeitherSeesTheOtherUsage() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         let harness = try MCPHostHarness.make(
             self, context: fixture.context, sessionStore: fixture.store
         )
@@ -173,7 +179,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// would still produce the reporting session, and only this assertion would notice
     /// the silent one.
     func testAConnectionThatReportsNothingIsStillASession() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         let harness = try MCPHostHarness.make(
             self, context: fixture.context, sessionStore: fixture.store
         )
@@ -205,7 +213,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// usage record under an id no row names, which passes every check here and is
     /// invisible to every session-scoped read.
     func testWithNoStoreTheToolRefusesWithAReasonAndTheServerStillWorks() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         // No `sessionStore`, and no recorder either: this is the shape of an app whose
         // database could not be opened.
         let harness = try MCPHostHarness.make(
@@ -252,10 +262,10 @@ final class AgentSessionWiringTests: XCTestCase {
         }
         // A real recorder stays silent: the "nowhere to record" check is about the
         // store, and an available one must not claim otherwise.
+        let directory = try makeTemporaryDirectory(prefix: "agent-sessions")
         XCTAssertNoThrow(
             try StoreSessionRecorder(store: AgentSessionStore(
-                storeURL: FileManager.default.temporaryDirectory
-                    .appendingPathComponent("agent-sessions-\(UUID().uuidString).sqlite")
+                storeURL: directory.appendingPathComponent("agent-sessions.sqlite")
             )).requireAvailable()
         )
     }
@@ -319,7 +329,9 @@ final class AgentSessionWiringTests: XCTestCase {
     /// connection. If a future change stopped the host binding one, this fails while
     /// the refusal test above keeps passing.
     func testARelayedReportIsRecordedByTheHostOnTheClientsBehalf() async throws {
-        let fixture = try SessionFixture()
+        let fixture = try SessionFixture(
+            directory: try makeTemporaryDirectory(prefix: "agent-sessions")
+        )
         let harness = try MCPHostHarness.make(
             self, context: fixture.context, sessionStore: fixture.store
         )
@@ -355,15 +367,17 @@ final class AgentSessionWiringTests: XCTestCase {
         let contextWithoutRecorder: HostMCPCallContext
         private let url: URL
 
-        init() throws {
-            url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("agent-sessions-\(UUID().uuidString).sqlite")
+        /// Everything the fixture writes lives inside `directory`, which the calling test
+        /// case owns and removes when the test ends — `makeTemporaryDirectory`, which
+        /// registers that teardown itself.
+        ///
+        /// A directory rather than a bare `.sqlite` path in `$TMPDIR`, because SQLite
+        /// writes `-wal` and `-shm` beside the database file: deleting only the named
+        /// path leaves both behind, two orphans per test, which is how one run left
+        /// hundreds of files that no later run would clean up.
+        init(directory: URL) throws {
+            url = directory.appendingPathComponent("agent-sessions.sqlite")
             store = try AgentSessionStore(storeURL: url)
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("pmusage-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true
-            )
             context = Self.context(in: directory, recorder: StoreSessionRecorder(store: store))
             contextWithoutRecorder = Self.context(in: directory, recorder: nil)
         }

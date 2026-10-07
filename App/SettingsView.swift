@@ -170,7 +170,7 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("History is stored in Application Support/Portmaster on this Mac and is never uploaded.")
+            Text("History is stored in Application Support/Portmaster on this Mac and is never uploaded. Agent sessions and their token usage are kept for the same period and are deleted with it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -188,7 +188,7 @@ struct SettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This deletes all system, app, process and port history stored on this Mac. It cannot be undone.")
+                Text("This deletes all system, app, process and port history, and every recorded agent session and its token usage, stored on this Mac. It cannot be undone.")
             }
 
             // Clear failures are shown verbatim — never swallowed silently.

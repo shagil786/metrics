@@ -7,17 +7,35 @@ import Foundation
 
 final class AgentSessionStoreTests: XCTestCase {
 
-    private func makeStore() throws -> (AgentSessionStore, URL) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("agent-session-test-\(UUID().uuidString).sqlite")
+    /// A store in a directory of its own, removed when the test ends.
+    ///
+    /// A directory rather than a bare `.sqlite` path because SQLite writes two sidecar
+    /// files beside the database — `-wal` and `-shm` — and deleting only the file named
+    /// in the path leaves both behind, which is how a test run leaks two files per test.
+    /// Self-registering teardown rather than a `defer` in each test, matching
+    /// `TestJSON.makeTemporaryDirectory`: a `defer` that runs after a test has failed
+    /// adds a second, unrelated error to the output.
+    private func makeStore() throws -> AgentSessionStore {
+        try makeStoreOnDisk().0
+    }
+
+    /// The same store with the path it was opened at, for the tests that reopen the
+    /// file and read back what was flushed.
+    private func makeStoreOnDisk() throws -> (AgentSessionStore, URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-session-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let url = directory.appendingPathComponent("agent-sessions.sqlite")
         return (try AgentSessionStore(storeURL: url), url)
     }
 
     // MARK: - Round trip
 
     func testSessionSurvivesAWriteAndReload() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         let sessionID = UUID()
         try store.recordSession(
@@ -41,8 +59,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// the useful half of the row, so a missing clientInfo is nil rather than a
     /// session that failed to open.
     func testSessionWithoutClientInfoStillRecords() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let id = UUID()
         try store.recordSession(
@@ -57,8 +74,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// One process may back several connections. Collapsing them would make
     /// `Identifiable` a lie a SwiftUI List acts on by merging rows.
     func testOnePIDTwoConnectionsAreTwoSessions() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let a = UUID(), b = UUID()
         let now = Date()
@@ -71,8 +87,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// A connection may outlive its process while the socket stays open, so a
     /// session must survive the pid going away with no end time set.
     func testSessionSurvivesProcessExit() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         let id = UUID()
         try store.recordSession(id: id, peerPID: 7, clientName: "gone", clientVersion: nil, connectedAt: Date())
@@ -85,8 +100,7 @@ final class AgentSessionStoreTests: XCTestCase {
     // MARK: - Usage
 
     func testUsageRecordsAggregateByLatestNotSum() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -106,8 +120,7 @@ final class AgentSessionStoreTests: XCTestCase {
     }
 
     func testSessionWithNoUsageReadsNotReported() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -117,8 +130,7 @@ final class AgentSessionStoreTests: XCTestCase {
     // MARK: - Cost
 
     func testCostUsesDecimalArithmeticExactly() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         try store.setPrice(Decimal(string: "0.0000015")!, modelID: "m")
         try store.setPrice(Decimal(string: "0.000006")!, modelID: "m", component: .output)
@@ -139,8 +151,7 @@ final class AgentSessionStoreTests: XCTestCase {
     }
 
     func testUnpricedModelIsNotPricedZero() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -155,8 +166,7 @@ final class AgentSessionStoreTests: XCTestCase {
     }
 
     func testSessionWithNoUsageHasNoCostRatherThanZero() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -166,8 +176,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// Changing a price re-costs history rather than leaving a stale figure, and the
     /// version changes so a displayed number can be traced to the prices behind it.
     func testPriceChangeBumpsVersionAndRecosts() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
         let sid = UUID()
@@ -193,12 +202,13 @@ final class AgentSessionStoreTests: XCTestCase {
 
     // MARK: - Cost wiring to TokenUsage's conflict rule
 
-    /// One agent escalating models mid-session has an unambiguous newest figure, so
-    /// it costs. Treating the superseded model as a conflict would block a cost that
-    /// has no disagreement in it — the same scoping `TokenUsage.hasModelConflict` uses.
+    /// One agent escalating models mid-session costs rather than blocking. This pins the
+    /// current behaviour, not its soundness: reports are cumulative, so the whole
+    /// total is priced at the newest model's rate and the figure cannot be reconciled
+    /// with an invoice. See `TokenUsage.hasModelConflict` and the README's honesty
+    /// section — a per-model usage segment is a data-model change for a later phase.
     func testCostSurvivesOneSourceSwitchingModelsMidSession() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -212,7 +222,7 @@ final class AgentSessionStoreTests: XCTestCase {
         try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-b")
 
         guard case .priced(let usd, let version) = try store.cost(for: sid) else {
-            return XCTFail("a single source switching models is history, not a conflict")
+            return XCTFail("a single source switching models is not two sources disagreeing")
         }
         XCTAssertEqual(usd, Decimal(string: "0.001")!)
         XCTAssertEqual(version, 1)
@@ -221,8 +231,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// The other direction, protecting the fix from over-correcting: two sources that
     /// disagree are still a conflict, and the cost stays unpriced with both models named.
     func testCostIsBlockedWhenSourcesDisagreeAboutTheModel() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -247,8 +256,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// reporting a missing price would point the user at the price table — the one
     /// recovery that cannot possibly work, because the block is the disagreement.
     func testConflictIsNotReportedAsAMissingPrice() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -282,8 +290,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// and they disagree — which is what a conflict is. Ruled a conflict, so the cost
     /// stays blocked rather than being priced against whichever source wins.
     func testCostIsBlockedWhenAnEscalatingSourceIsOutrunByALaggingOne() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -319,8 +326,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// `0.004500000000000001`. Reopening the same URL is the only thing that tests the
     /// value as it lies at rest, which is the value an invoice has to reconcile with.
     func testDecimalCostSurvivesAReopenedStore() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         try store.setPrice(Decimal(string: "0.0000015")!, modelID: "m")
         try store.setPrice(Decimal(string: "0.000006")!, modelID: "m", component: .output)
@@ -342,8 +348,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// The price itself, read back from disk rather than recomputed from the input,
     /// so a coercion shows up as a wrong price and not only as a wrong total.
     func testDecimalPriceIsExactAfterAReopen() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         try store.setPrice(Decimal(string: "0.0000015")!, modelID: "m")
         try store.flush()
@@ -374,8 +379,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// and lands back on the original; that is exactly why the short reopen tests are
     /// kept but are not the ones to trust.
     func testSixteenDigitPriceSurvivesTheStoreExactly() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         let written = Decimal(string: "0.1234567890123456")!
         try store.setPrice(written, modelID: "m")
@@ -397,8 +401,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// A high-precision price multiplied by a real token count, so the digits have to
     /// survive both the write and the arithmetic, not merely sit in a file.
     func testSixteenDigitPriceMultipliesExactlyAfterAReopen() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let (store, url) = try makeStoreOnDisk()
 
         let written = Decimal(string: "0.0000001234567890123456")!
         try store.setPrice(written, modelID: "m")
@@ -430,8 +433,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// number to arbitrate — so the assertion is not that a particular record wins. It
     /// is that every path picks the same one, and keeps picking it.
     func testTiedTimestampsCostTheSameWhicheverPathReadsThem() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
@@ -472,8 +474,7 @@ final class AgentSessionStoreTests: XCTestCase {
     /// sessions here are deliberately unlike each other so a shared-slice mistake has
     /// somewhere to show up.
     func testBatchedSessionReadsMatchThePerSessionReads() throws {
-        let (store, url) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try makeStore()
 
         let base = Date(timeIntervalSince1970: 1_000)
 
@@ -517,5 +518,115 @@ final class AgentSessionStoreTests: XCTestCase {
             return XCTFail("expected the cached session to price")
         }
         XCTAssertEqual(cached, Decimal(string: "0.002")!)
+    }
+
+    // MARK: - Retention & clear
+
+    /// "Clear All History" has to mean it. Read through a **reopened** store, because
+    /// the user clears the database and the app reads it back from disk: a clear that
+    /// only emptied the in-memory context would pass a check against the live store
+    /// while every row stayed in the file.
+    ///
+    /// Asserted field by field rather than as a row count, because a count of zero from
+    /// the session list alone would still leave the usage records — the token counts —
+    /// behind, which is the half of the data this is about.
+    func testClearAllLeavesNoSessionAndNoUsageBehind() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let sid = UUID()
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        try store.recordSession(
+            id: sid, peerPID: 4242, clientName: "probe-agent", clientVersion: "1.2.3",
+            connectedAt: Date(timeIntervalSince1970: 1000)
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sid, recordedAt: Date(), input: 900_000, output: 12_345,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        try store.flush()
+
+        try store.clearAll()
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(try reopened.sessions().count, 0, "the session row must be gone")
+        XCTAssertEqual(
+            try reopened.usage(for: sid), .notReported(reason: .awaitingFirstReport),
+            "the usage records must be gone too, not just the row naming them"
+        )
+        XCTAssertEqual(try reopened.cost(for: sid), .noUsage)
+        // The one thing `clearAll` deliberately keeps: prices the user typed are
+        // configuration, and clearing samples does not un-type them.
+        let sid2 = UUID()
+        try reopened.recordSession(
+            id: sid2, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
+        )
+        try reopened.recordUsage(TokenUsageRecord(
+            sessionID: sid2, recordedAt: Date(), input: 1_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        XCTAssertEqual(try reopened.cost(for: sid2), .priced(usd: Decimal(string: "0.001")!, priceTableVersion: 1))
+    }
+
+    /// Retention keeps recent sessions and drops old ones, usage records included.
+    ///
+    /// The records matter as much as the row: deleting the session alone would leave
+    /// the token counts on disk where no read can see them, which is the same leak as
+    /// a clear that reports success and deletes nothing.
+    func testPruneDropsOldSessionsAndTheirUsage() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let old = UUID(), recent = UUID()
+        try store.recordSession(
+            id: old, peerPID: 1, clientName: "old", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-60)
+        )
+        try store.recordSession(
+            id: recent, peerPID: 1, clientName: "recent", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(60)
+        )
+        for id in [old, recent] {
+            try store.recordUsage(TokenUsageRecord(
+                sessionID: id, recordedAt: Date(), input: 500, output: 0,
+                cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+            ))
+        }
+        try store.flush()
+
+        store.prune(olderThan: cutoff)
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(try reopened.sessions().map(\.id), [recent])
+        XCTAssertEqual(
+            try reopened.usage(for: old), .notReported(reason: .awaitingFirstReport),
+            "a pruned session's usage must not survive as an orphan record"
+        )
+        guard case .reported(let input, _, _) = try reopened.usage(for: recent) else {
+            return XCTFail("the recent session must keep its usage")
+        }
+        XCTAssertEqual(input, 500)
+    }
+
+    // MARK: - Price text is parsed strictly
+
+    /// Text that is not a number must be *absent*, not *nearly* a number.
+    ///
+    /// `Decimal(string:)` is lenient: it returns 1 for `"1,5"` and 1.5 for `"1.5abc"`,
+    /// quietly rounding off or ignoring the rest. A missing price shows as missing, but
+    /// a mis-parsed one is a wrong figure that looks computed and cannot reconcile with
+    /// an invoice — the worse of the two failures, and the one this test pins.
+    func testATextThatIsNotADecimalNumberIsNoPriceRatherThanAWrongOne() {
+        for garbage in ["1,5", "1.5abc", "1 000", "", ".", "1.2.3", "0x10", "1e5", " 1"] {
+            let entry = ModelPriceEntry(key: "m#input", pricePerToken: Decimal(0), tableVersion: 1)
+            // Written directly, because the public path only ever writes canonical text.
+            entry.pricePerTokenText = garbage
+            XCTAssertNil(
+                entry.pricePerToken,
+                "\"\(garbage)\" is not a price, so it must not price anything"
+            )
+        }
+        for canonical in ["0.0000015", "1", "0", "1234567.89", ".5"] {
+            let entry = ModelPriceEntry(key: "m#input", pricePerToken: Decimal(0), tableVersion: 1)
+            entry.pricePerTokenText = canonical
+            XCTAssertNotNil(entry.pricePerToken, "\"\(canonical)\" is a price")
+        }
     }
 }

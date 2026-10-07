@@ -33,7 +33,11 @@ final class AppModel: ObservableObject {
     /// database is allowed to fail, and pretending otherwise would mean an MCP client
     /// reporting tokens into a store nobody can read.
     var agentSessionStore: AgentSessionStore?
-    private(set) var agentSessionError: String?
+    /// Published and surfaced like `historyError` above, because a store that could not
+    /// be opened is otherwise invisible: `report_usage` refuses forever with a generic
+    /// reason and nothing anywhere says why, which reads as a broken tool rather than an
+    /// unreadable database.
+    @Published private(set) var agentSessionError: String?
     /// Kept for the detail sheet's on-demand lookups (path/args/cwd).
     private(set) var processCollectorRef: ProcessCollector?
 
@@ -243,10 +247,22 @@ final class AppModel: ObservableObject {
 
     private func pruneHistory() {
         guard let store = historyStore else { return }
-        store.prune(olderThan: Date().addingTimeInterval(-prefs.retention.seconds))
+        let cutoff = Date().addingTimeInterval(-prefs.retention.seconds)
+        store.prune(olderThan: cutoff)
+        // The same retention, the same sweep. Leaving agent sessions out of it is what
+        // made this table grow forever while the picker said older records were
+        // deleted automatically.
+        agentSessionStore?.prune(olderThan: cutoff)
         lastPrune = Date()
     }
 
+    /// Clears both databases, because the button says all of it.
+    ///
+    /// Agent sessions are a second file, and leaving them behind would mean a button
+    /// labelled "Clear All History" reports success while peer pids, client identity,
+    /// model ids and token counts stay on disk — data on a category the user was never
+    /// told was kept. The two clears are reported separately so neither failure can be
+    /// hidden behind the other's success.
     func clearHistory() {
         clearHistoryError = nil
         historyActionStatus = nil
@@ -256,10 +272,21 @@ final class AppModel: ObservableObject {
         }
         do {
             try store.clearAll()
-            historyActionStatus = "History cleared. New readings will be recorded while Portmaster runs."
         } catch {
             clearHistoryError = "Clear failed: \(error.localizedDescription). Stored history is unchanged."
+            return
         }
+        do {
+            // Nil store means nothing was ever written, so there is nothing to clear
+            // and the message below is still true of it.
+            try agentSessionStore?.clearAll()
+        } catch {
+            clearHistoryError = "System history is cleared, but agent sessions were not: "
+                + "\(error.localizedDescription). Stored session records are unchanged."
+            return
+        }
+        historyActionStatus = "History cleared. New readings, and any new agent sessions, "
+            + "will be recorded while Portmaster runs."
     }
 
     /// Surfaced in Settings when clear/retention writes fail.
