@@ -17,6 +17,29 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Both architectures. Xcode's default is `ARCHS = arm64` with
+    # `ONLY_ACTIVE_ARCH = YES`, which is right for a fast local build and wrong
+    # for anything shipped: it silently produces a Mac-only app that claims to
+    # run everywhere. No source file has an `#if arch` guard and no test gates on
+    # architecture, so this is a packaging concern rather than a port — the app
+    # cross-compiled for x86_64 before this line existed.
+    #
+    # KNOWN LIMIT: this does NOT by itself produce a universal binary. The `Core`
+    # Swift package linked into the app does not inherit the app target's ARCHS,
+    # so it compiles for the host slice only; the app then links one architecture
+    # and the build still succeeds. Passing ARCHS on the xcodebuild command line
+    # (`ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO`) does build both, and README
+    # "Building" documents it as required for anything shipped.
+    # scripts/package-dmg.sh asserts both slices are present, so a single-arch
+    # product fails at package time rather than in a user's hands.
+    #
+    # Intel sensor coverage still varies by model: the SMC key names differ from
+    # Apple silicon (`SMCCollector`'s TC* handling covers both), GPU state comes
+    # back nil on Intel, and per-app audio needs macOS 14.2+. Those report
+    # honestly through the existing `ThermalAvailability` states rather than
+    # showing zero — see README "Hardware & Sensors".
+    ARCHS: "arm64 x86_64"
+    ONLY_ACTIVE_ARCH: "NO"
     CODE_SIGN_STYLE: Automatic
     PORTMASTER_UPDATE_FEED_URL: ""
     PORTMASTER_UPDATE_PUBLIC_KEY: ""

@@ -12,7 +12,9 @@ All observation is local. No account, no analytics, no telemetry, no cloud uploa
 
 ## Build & run
 
-Requires Xcode with the macOS 14 SDK or newer and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+Requires Xcode with the macOS 14 SDK or newer and [xcodegen](https://github.com/yonaskolb/XcodeGen). Portmaster builds for **Apple silicon and Intel** (macOS 14 or later); `project.yml` pins both architectures, and `scripts/package-dmg.sh` refuses to package a bundle that is missing either.
+
+What a given Mac actually reports still depends on the model. GPU state comes back nil on Intel, SMC sensor keys are named differently from Apple silicon, and per-app volume needs macOS 14.2 or later. Those cases read as absent rather than as zero — see *Hardware & Sensors* below — so a Mac that cannot report something shows "—" instead of a number nobody measured. **Intel hardware has not been exercised on this build**: the app cross-compiles and the app-level behaviour above is by design, but the per-model sensor coverage is unverified until someone runs it on an Intel Mac.
 
 ```sh
 xcodegen generate          # creates Portmaster.xcodeproj from project.yml
@@ -24,6 +26,22 @@ Or from the shell:
 ```sh
 xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build
 open ~/Library/Developer/Xcode/DerivedData/Portmaster-*/Build/Products/Debug/Portmaster.app
+```
+
+A Cmd+R build is single-architecture and fine for local work. Anything you intend to **ship or hand to someone else** needs both architectures on the command line:
+
+```sh
+xcodebuild -project Portmaster.xcodeproj -scheme Portmaster \
+  -configuration Release ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO build
+```
+
+The `ARCHS` override is load-bearing, not decoration. `project.yml` already pins `ARCHS = arm64 x86_64`, but the `Core` Swift package that the app links does not inherit the app target's settings — it builds for the host architecture. Without the command-line override the package compiles one slice, the app links a single-architecture binary, and **the build still reports success**; only `lipo -archs` on the product reveals it. `scripts/package-dmg.sh` asserts both slices are present and refuses to package otherwise, which is why the failure surfaces at package time rather than in a user's hands.
+
+Verify before shipping:
+
+```sh
+lipo -archs ~/Library/Developer/Xcode/DerivedData/Portmaster-*/Build/Products/Release/Portmaster.app/Contents/MacOS/Portmaster
+# expect: arm64 x86_64
 ```
 
 Core tests (parser, attribution, sampling math, plus live-system smoke tests):
@@ -38,7 +56,7 @@ The same package also builds the MCP server, which has its own build and registr
 
 - **Menu bar readouts** — separate native items for CPU, kernel memory-pressure state, memory used, busiest-process CPU, GPU, temperature, download, upload and disk writes. Each can show a value, graph or both, with optional icon/caption and compact sizing. macOS owns their ⌘-drag order. Right-click opens window/Settings/Quit actions; the shared dropdown has its own configurable tabs and overview tiles/list.
 - **Overview** — machine summary, CPU history, memory-pressure bar, busiest processes, plus a "Worth a Look" strip of the newest acting-up alerts and an explicit pill whenever sampling is paused.
-- **Hardware & Sensors** — read-only AppleSMC temperature and fan readings. The Overview Hardware card shows the hottest sensor, CPU/GPU maxima, and maximum fan RPM; the popover Sensors tab lists individual fans. Discovery runs off the sampling queue, caches temperature-type keys, and re-reads them about every 5 s while a surface is open (slower in the background). Absent or invalid readings show “—”; fanless and unreadable fans are not conflated with 0 RPM. Settings can show the hottest temperature in the menu bar. Battery capacity health and charge cycles appear only when battery IORegistry metadata supplies them.
+- **Hardware & Sensors** — read-only AppleSMC temperature and fan readings. The Overview Hardware card shows the hottest sensor, CPU/GPU maxima, and maximum fan RPM; the popover Sensors tab lists individual fans. Discovery runs off the sampling queue, caches temperature-type keys, and re-reads them about every 5 s while a surface is open (slower in the background). Absent or invalid readings show “—”; fanless and unreadable fans are not conflated with 0 RPM. Settings can show the hottest temperature in the menu bar. Battery capacity health and charge cycles appear only when battery IORegistry metadata supplies them. Coverage varies by model: which SMC keys a Mac exposes differs between Apple silicon and Intel, and a machine that publishes none of them reports "No sensors" as its own state rather than as an absence of readings.
 - **Inside App** — the app-detail sheet behind every rollup's Details button: the app's processes grouped into semantic categories (browsers get their real anatomy — Tabs / GPU / Extensions / Browser / Network — Docker splits out its Linux-VM engine), a headline sentence ("Tabs use 82% of its memory"), a segmented share bar with a Memory/CPU toggle, and expandable member lists. Categorization is pure Core code with tests.
 - **Projects & Ports** — listening services grouped by detected project, with search and an activity filter. Quiet services are labeled "No recent CPU activity (observed over the last 5 minutes)" — an observation, never a recommendation.
 - **Containers** — Docker containers via the docker CLI (`docker ps` + `docker stats --no-stream`, slow lane, fixed argv, hard timeout). Availability is stated verbatim: not installed / daemon down / running; per-container CPU and memory appear only when docker stats answers.
