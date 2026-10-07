@@ -31,7 +31,10 @@ public enum UsageUnavailableReason: String, Hashable, Sendable {
 }
 
 /// One observation of a session's usage. Records are appended; a session's usage
-/// is an aggregate of them, never a stored total.
+/// is an aggregate of them, never a stored total. This assumes an agent's counters
+/// only ever accumulate — a session that reset its own total mid-flight would drop
+/// the earlier spend here, so a reset needs its own representation, not a
+/// compensating record.
 public struct TokenUsageRecord: Hashable, Sendable {
     public let id: UUID
     public let sessionID: UUID
@@ -110,6 +113,9 @@ public enum TokenUsage: Hashable, Sendable {
     ) -> [TokenProvenance: TokenUsageRecord] {
         var latest: [TokenProvenance: TokenUsageRecord] = [:]
         for record in records {
+            // `>=` means equal timestamps keep the earlier element: reports sharing a
+            // timestamp are one instant described twice, and array order is the only
+            // tie-break available without a sequence number to arbitrate.
             if let existing = latest[record.provenance],
                existing.recordedAt >= record.recordedAt {
                 continue
@@ -122,8 +128,13 @@ public enum TokenUsage: Hashable, Sendable {
     /// True when sources disagree about which model ran. A conflict is reported,
     /// never resolved: both figures stay visible and the cost cannot be computed
     /// without the user saying which to believe.
+    ///
+    /// Scoped to the latest record per provenance, matching "sources disagree". One
+    /// source that escalates models mid-session is not a disagreement — the
+    /// superseded model is history, and reading it as a conflict would block a cost
+    /// that has no ambiguity in it.
     public static func hasModelConflict(_ records: [TokenUsageRecord]) -> Bool {
-        let models = Set(records.map(\.modelID))
+        let models = Set(latestPerProvenance(records).values.map(\.modelID))
         return models.count > 1
     }
 }
