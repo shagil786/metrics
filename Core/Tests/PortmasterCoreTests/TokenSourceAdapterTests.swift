@@ -11,12 +11,12 @@ struct FixtureTokenAdapter: TokenSourceAdapter {
     let identifier = "fixture-agent"
     var root: URL
 
-    func locateSessionLog(for session: AgentSessionSnapshot) -> URL? {
+    func candidateLogs(for session: AgentSessionSnapshot) -> [URL] {
         let url = root.appendingPathComponent("\(session.id.uuidString).json")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        return FileManager.default.fileExists(atPath: url.path) ? [url] : []
     }
 
-    func parse(_ url: URL) throws -> RawAgentUsage {
+    func parse(_ url: URL) throws -> [RawAgentUsage] {
         let data = try Data(contentsOf: url)
         // `try?` on the decode, not just on the cast: a file that is not JSON at all
         // fails inside `JSONSerialization`, and letting that error out would break
@@ -31,12 +31,12 @@ struct FixtureTokenAdapter: TokenSourceAdapter {
             // A shape we do not understand is its own outcome, not a zero.
             throw TokenSourceError.unrecognizedFormat
         }
-        return RawAgentUsage(
+        return [RawAgentUsage(
             input: input, output: output,
             cacheRead: object["cache"] as? Int,
             reasoning: nil,
             modelID: model
-        )
+        )]
     }
 }
 
@@ -48,12 +48,12 @@ struct ThrowingTokenAdapter: TokenSourceAdapter {
     let identifier = "throwing-agent"
     var root: URL
 
-    func locateSessionLog(for session: AgentSessionSnapshot) -> URL? {
+    func candidateLogs(for session: AgentSessionSnapshot) -> [URL] {
         let url = root.appendingPathComponent("\(session.id.uuidString).json")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        return FileManager.default.fileExists(atPath: url.path) ? [url] : []
     }
 
-    func parse(_ url: URL) throws -> RawAgentUsage {
+    func parse(_ url: URL) throws -> [RawAgentUsage] {
         throw NSError(domain: "fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
     }
 }
@@ -83,7 +83,7 @@ final class TokenSourceAdapterTests: XCTestCase {
 
     func testMissingLogIsNoSourceNotAFailure() {
         let adapter = FixtureTokenAdapter(root: root)
-        XCTAssertNil(adapter.locateSessionLog(for: session()))
+        XCTAssertTrue(adapter.candidateLogs(for: session()).isEmpty)
     }
 
     // MARK: - Parsing
@@ -94,7 +94,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         try #"{"input": 1200, "output": 300, "model": "m1", "cache": 50}"#
             .write(to: url, atomically: true, encoding: .utf8)
 
-        let raw = try FixtureTokenAdapter(root: root).parse(url)
+        let raw = try XCTUnwrap(try FixtureTokenAdapter(root: root).parse(url).first)
         XCTAssertEqual(raw.input, 1200)
         XCTAssertEqual(raw.output, 300)
         XCTAssertEqual(raw.modelID, "m1")
@@ -131,7 +131,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
             .run(session: s)
 
-        guard case .reported(let record) = outcome else {
+        guard case .reported(let records) = outcome, let record = records.first else {
             return XCTFail("expected a record, got \(outcome)")
         }
         XCTAssertEqual(record.provenance, .parsedFromLog)
@@ -177,7 +177,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
             .run(session: located)
 
-        guard case .reported(let record) = outcome else {
+        guard case .reported(let records) = outcome, let record = records.first else {
             return XCTFail("expected a record, got \(outcome)")
         }
         XCTAssertEqual(record.sessionID, located.id)

@@ -28,6 +28,12 @@ public enum UsageUnavailableReason: String, Hashable, Sendable {
     case unrecognizedFormat
     /// A source exists and is readable, but has not reported yet.
     case awaitingFirstReport
+    /// More than one candidate log could belong to this session, and nothing ties
+    /// them to it. A distinct case rather than a silent pick: two agents running side
+    /// by side both overlap one session's window, and choosing between them would
+    /// file each one's tokens against the other session — a wrong number, which is
+    /// worse than no number.
+    case ambiguousMatch
 }
 
 /// One observation of a session's usage. Records are appended; a session's usage

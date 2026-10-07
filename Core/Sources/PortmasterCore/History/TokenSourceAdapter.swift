@@ -19,7 +19,15 @@ public enum TokenSourceError: Error, Hashable, Sendable {
     case unreadable
 }
 
-/// Counts as they appear in a vendor's log, before conversion.
+/// One model's counts as they appear in a vendor's log, before conversion.
+///
+/// **One per model, not one per log.** A session that escalated `model-a` →
+/// `model-b` has its first model's tokens inside the second model's total, and
+/// pricing that whole total at the newest model's rate is the known-unsound case
+/// this design documents. A log that breaks usage down per model can be recorded
+/// as one entry per model, and each priced at its own rate — so an adapter that
+/// can see the breakdown should always return several rather than collapsing them
+/// into a single total.
 public struct RawAgentUsage: Hashable, Sendable {
     public let input: Int
     public let output: Int
@@ -40,19 +48,25 @@ public protocol TokenSourceAdapter: Sendable {
     /// Stable name for this source, used in diagnostics.
     var identifier: String { get }
 
-    /// The log file for a session, or nil when there is none. **Nil is normal**, not
-    /// an error: most sessions have no readable log, and that must read as "no
-    /// source" rather than as a failure.
-    func locateSessionLog(for session: AgentSessionSnapshot) -> URL?
+    /// Log files that *could* belong to this session. **Empty is normal**, not an
+    /// error: most sessions have no readable log, and that must read as "no source"
+    /// rather than as a failure.
+    ///
+    /// A list rather than one chosen file, because choosing is not this method's
+    /// job. A session's id and an agent's log filename share no key, so the only
+    /// correlation is time, and *what counts as a unique match* is a policy every
+    /// adapter must apply identically. `TokenSourceRunner` applies it, once.
+    func candidateLogs(for session: AgentSessionSnapshot) -> [URL]
 
-    /// Parses a located log. Throws `TokenSourceError.unrecognizedFormat` rather
-    /// than returning partial counts.
-    func parse(_ url: URL) throws -> RawAgentUsage
+    /// Parses a located log into one entry per model. Throws
+    /// `TokenSourceError.unrecognizedFormat` rather than returning partial counts.
+    func parse(_ url: URL) throws -> [RawAgentUsage]
 }
 
-/// What an adapter run produced: a record to append, or a reason there is none.
+/// What an adapter run produced: records to append, or a reason there are none.
 public enum TokenSourceOutcome: Hashable, Sendable {
-    case reported(TokenUsageRecord)
+    /// One record per model the log attributed usage to. Never collapsed to one.
+    case reported([TokenUsageRecord])
     case notReported(reason: UsageUnavailableReason)
 }
 
@@ -76,21 +90,39 @@ public struct TokenSourceRunner: Sendable {
     }
 
     public func run(session: AgentSessionSnapshot) -> TokenSourceOutcome {
-        guard let url = adapter.locateSessionLog(for: session) else {
+        let candidates = adapter.candidateLogs(for: session)
+        guard !candidates.isEmpty else {
             return .notReported(reason: .noSource)
         }
+        // **Only a unique match is a match.** A session id and an agent's log
+        // filename share no key, so the correlation is time — and two agents running
+        // side by side produce two logs overlapping one session's window. Taking the
+        // most recent would file each one's tokens against the other, which is a
+        // wrong number rather than an absence: the failure this whole design exists
+        // to prevent. Two candidates are a fact about the machine, not about this
+        // session, so it says so.
+        guard candidates.count == 1 else {
+            return .notReported(reason: .ambiguousMatch)
+        }
+        let url = candidates[0]
         do {
             let raw = try adapter.parse(url)
-            return .reported(TokenUsageRecord(
-                sessionID: session.id,
-                recordedAt: now(),
-                input: raw.input,
-                output: raw.output,
-                cacheRead: raw.cacheRead,
-                reasoning: raw.reasoning,
-                modelID: raw.modelID,
-                provenance: .parsedFromLog
-            ))
+            // Every model gets its own record at the same instant: they are one
+            // observation, and recording them at different times would let the
+            // latest-per-provenance fold see a disagreement that is not there.
+            let at = now()
+            return .reported(raw.map { entry in
+                TokenUsageRecord(
+                    sessionID: session.id,
+                    recordedAt: at,
+                    input: entry.input,
+                    output: entry.output,
+                    cacheRead: entry.cacheRead,
+                    reasoning: entry.reasoning,
+                    modelID: entry.modelID,
+                    provenance: .parsedFromLog
+                )
+            })
         } catch TokenSourceError.unrecognizedFormat {
             return .notReported(reason: .unrecognizedFormat)
         } catch TokenSourceError.unreadable {

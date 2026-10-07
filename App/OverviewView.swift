@@ -982,13 +982,17 @@ private struct SessionLine: View {
         case .reported(let input, let output, _):
             return "\(Fmt.tokens(input + output)) tok"
         case .notReported(let reason):
-            // The four reasons in one short word each, so a row says which rather
+            // Every reason in one short phrase each, so a row says which rather
             // than showing a dash that reads as zero.
             switch reason {
             case .noSource: return "no source"
             case .logUnreadable: return "log unreadable"
             case .unrecognizedFormat: return "log format unknown"
             case .awaitingFirstReport: return "not reported yet"
+            // Two agent logs overlap this session and nothing ties either to it.
+            // Said plainly rather than as a dash, because "which one?" is the whole
+            // explanation and the user may be able to resolve it by closing one.
+            case .ambiguousMatch: return "2 logs match"
             }
         }
     }
