@@ -207,17 +207,17 @@ final class ToolExecutorReadTests: XCTestCase {
 
     // MARK: Catalog
 
-    func testCatalogDeclaresThirteenToolsAndClassifiesEffects() {
+    func testCatalogDeclaresFourteenToolsAndClassifiesEffects() {
         let catalog = ToolExecutor.catalog
-        XCTAssertEqual(catalog.count, 13, "catalog must declare all 13 tools")
+        XCTAssertEqual(catalog.count, 14, "catalog must declare all 14 tools")
 
         let names = catalog.map(\.name)
-        XCTAssertEqual(Set(names).count, 13, "tool names must be unique")
+        XCTAssertEqual(Set(names).count, 14, "tool names must be unique")
 
         let expected: Set<String> = [
             "get_system_overview", "get_top_apps", "get_app_detail", "get_containers",
             "get_projects", "get_history_rankings", "get_temperatures_fans",
-            "get_active_alerts", "get_settings",
+            "get_active_alerts", "get_settings", "report_usage",
             "quit_app", "stop_container", "stop_project", "set_preference"
         ]
         XCTAssertEqual(Set(names), expected)
@@ -227,7 +227,7 @@ final class ToolExecutorReadTests: XCTestCase {
             mutations,
             ["quit_app", "stop_container", "stop_project", "set_preference"]
         )
-        XCTAssertEqual(catalog.filter { $0.effect == .read }.count, 9)
+        XCTAssertEqual(catalog.filter { $0.effect == .read }.count, 10)
         for tool in catalog {
             XCTAssertFalse(tool.description.isEmpty, "\(tool.name) needs a description")
         }

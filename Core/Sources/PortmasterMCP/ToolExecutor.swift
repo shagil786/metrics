@@ -58,20 +58,26 @@ public struct ToolExecutor: Sendable {
     /// (`~/.portmaster`); the parameter exists so a test can write somewhere
     /// disposable instead.
     private let settingsDirectory: URL?
+    /// Where `report_usage` appends. Optional so the tool can exist in contexts with
+    /// no store; `UnavailableSessionRecorder` then refuses with a reason rather than
+    /// accepting a report that would be dropped.
+    private let sessionRecorder: any SessionRecording
 
     public init(
         provider: DataProvider,
         gate: PermissionGate,
         audit: AuditLog,
-        settingsDirectory: URL? = nil
+        settingsDirectory: URL? = nil,
+        sessionRecorder: (any SessionRecording)? = nil
     ) {
         self.provider = provider
         self.gate = gate
         self.audit = audit
         self.settingsDirectory = settingsDirectory
+        self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
     }
 
-    /// All 13 tools the MCP server exposes. Names wired into dispatch stay in
+    /// All 14 tools the MCP server exposes. Names wired into dispatch stay in
     /// step with this list, because `execute` refuses anything not declared here.
     public static let catalog: [ToolDefinition] = [
         // Reads
@@ -146,6 +152,23 @@ public struct ToolExecutor: Sendable {
             name: "get_settings",
             description: "Current preferences, including the MCP mutation mode.",
             arguments: [],
+            effect: .read
+        ),
+        // A declaration, not an observation — but still not a mutation. See
+        // `SessionRecorder.swift` for why the click it would otherwise cost is
+        // not worth taking.
+        ToolDefinition(
+            name: "report_usage",
+            description: "Report your own token usage for this session. Optional: Portmaster "
+                + "can read some agents' usage from their own logs instead, and says so when "
+                + "it has no figure rather than reporting zero.",
+            arguments: [
+                (name: "input", required: true, help: "Input tokens used so far this session"),
+                (name: "output", required: true, help: "Output tokens used so far this session"),
+                (name: "model", required: true, help: "The model id these counts are for"),
+                (name: "cache_read", required: false, help: "Cache-read tokens, if you track them"),
+                (name: "reasoning", required: false, help: "Reasoning tokens, if you track them")
+            ],
             effect: .read
         ),
         // Mutations — every one of these is default-deny and audit-logged.
@@ -355,6 +378,23 @@ public struct ToolExecutor: Sendable {
             }
             return try await setPreference(key: key, value: value)
 
+        case "report_usage":
+            // Counts are parsed and range-checked before the recorder is touched, so
+            // an invalid report cannot leave a partial record behind.
+            let input = try Self.nonNegative(arguments["input"], field: "input")
+            let output = try Self.nonNegative(arguments["output"], field: "output")
+            let model = try Self.nonBlank(arguments["model"], field: "model")
+            let cacheRead = try Self.optionalNonNegative(
+                arguments["cache_read"], field: "cache_read"
+            )
+            let reasoning = try Self.optionalNonNegative(arguments["reasoning"], field: "reasoning")
+            let note = try sessionRecorder.record(
+                sessionID: nil, clientName: nil, clientVersion: nil,
+                input: input, output: output,
+                cacheRead: cacheRead, reasoning: reasoning, modelID: model
+            )
+            return AgentUsageRecordedPayload(note: note)
+
         // Unreachable while the catalog and this switch stay in step: `execute`
         // refuses any name the catalog does not declare, and every declared name
         // is handled above. Kept so a tool added to the catalog without a
@@ -524,6 +564,33 @@ public struct ToolExecutor: Sendable {
     /// range is stated the same way however it was missed.
     private static func invalidLimit(_ raw: String) -> String {
         "Invalid limit: \(raw) (must be 1...\(maxTopApps))"
+    }
+
+    /// A token count. Negative is refused rather than clamped: a negative count is a
+    /// caller bug, and clamping would record a plausible number for a broken report.
+    static func nonNegative(_ raw: String?, field: String) throws -> Int {
+        guard let raw, let value = Int(raw.trimmingCharacters(in: .whitespaces)) else {
+            throw MCPToolError(message: "\(field) must be a whole number.")
+        }
+        guard value >= 0 else {
+            throw MCPToolError(message: "\(field) must not be negative.")
+        }
+        return value
+    }
+
+    /// Absent and blank are both "not supplied", which is a distinct answer from
+    /// zero — a component nobody tracks is not a component that cost nothing.
+    static func optionalNonNegative(_ raw: String?, field: String) throws -> Int? {
+        guard let raw, !raw.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return try nonNegative(raw, field: field)
+    }
+
+    static func nonBlank(_ raw: String?, field: String) throws -> String {
+        let trimmed = raw?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !trimmed.isEmpty else {
+            throw MCPToolError(message: "\(field) is required.")
+        }
+        return trimmed
     }
 
     // MARK: Ranking

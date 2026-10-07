@@ -405,6 +405,20 @@ struct AlertsPayload: Encodable {
     }
 }
 
+/// The answer to `report_usage`. `recorded` is always true here — a refusal
+/// arrives as a tool error, not as a payload saying `false`, because "Portmaster
+/// declined to store this" and "this tool succeeded" must not be the same wire
+/// shape for a caller reading them programmatically.
+struct AgentUsageRecordedPayload: Encodable {
+    let recorded: Bool
+    let note: String
+
+    init(note: String) {
+        self.recorded = true
+        self.note = note
+    }
+}
+
 /// One recorded reading of a single resource. When the sensor had nothing to
 /// report the synthesized `Encodable` omits `value` rather than emitting `null`,
 /// so an unavailable reading is an absent key and the line breaks there instead
