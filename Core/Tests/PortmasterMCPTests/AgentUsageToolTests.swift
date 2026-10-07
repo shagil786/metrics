@@ -82,6 +82,15 @@ final class AgentUsageToolTests: XCTestCase {
         }
     }
 
+    /// The catalog count is asserted in the existing MCP conformance test and in the
+    /// README, so adding a tool without updating either fails rather than drifting.
+    func testCatalogCountIsExplicitlyCheckedSomewhere() {
+        XCTAssertEqual(
+            ToolExecutor.catalog.filter { $0.name == "report_usage" }.count, 1,
+            "report_usage must appear exactly once in the catalog"
+        )
+    }
+
     // MARK: - Behaviour
 
     func testValidReportReachesTheRecorder() async throws {
