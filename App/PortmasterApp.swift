@@ -70,6 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PortmasterShortcuts.updateAppShortcutParameters()
         // Once per launch, not per surface: the host is a socket, not a window.
         mcpHost.start()
+        // The retention sweep needs to know which sessions are still connected, and the
+        // host is owned here rather than by `AppModel`. Weak, for the same reason the
+        // approval presenter below is: the delegate owns the controller, so a strong
+        // capture would be a cycle nothing releases until the process exits.
+        AppModel.shared.liveSessionIDs = { [weak mcpHost] in mcpHost?.connectedSessionIDs ?? [] }
         // …and once per launch, the window its confirmations are asked in. Created here
         // rather than on the first request so the first request does not pay for it, and
         // installed unconditionally: with no presenter the host denies a confirmation

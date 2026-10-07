@@ -23,6 +23,50 @@ final class PresentationTests: XCTestCase {
         XCTAssertEqual(preferences.presentation.panelTiles, LayoutOrder())
         XCTAssertFalse(preferences.presentation.windowShortcut.enabled)
     }
+    /// Agent session retention is **absent** in every blob an older build wrote, and
+    /// absent means keep everything rather than "apply the floor".
+    ///
+    /// The distinction is the whole point of the setting: its floor is 30 days, so
+    /// defaulting an unreadable value to the floor would delete billing-relevant token
+    /// counts on a schedule the user never chose — the same defect as an agent that
+    /// reported nothing being shown as one that reported zero.
+    func testUnsetAgentSessionRetentionIsAbsentRatherThanTheFloor() throws {
+        let legacy = try JSONDecoder().decode(
+            AppPreferences.self, from: Data(#"{"menuBarMetric":"temperature"}"#.utf8)
+        )
+        XCTAssertNil(legacy.agentSessionRetention)
+        XCTAssertNil(legacy.agentSessionRetention?.seconds, "absent keeps everything")
+
+        let empty = try JSONDecoder().decode(AppPreferences.self, from: Data("{}".utf8))
+        XCTAssertNil(empty.agentSessionRetention)
+
+        // A value this build cannot parse is absent for the same reason, not a guess.
+        let unknown = try JSONDecoder().decode(
+            AppPreferences.self, from: Data(#"{"agentSessionRetention":"sixWeeks"}"#.utf8)
+        )
+        XCTAssertNil(unknown.agentSessionRetention)
+    }
+
+    /// A chosen period survives a save/load round trip, and "forever" survives as
+    /// forever rather than becoming a very large number.
+    func testAgentSessionRetentionRoundTripsIncludingForever() throws {
+        for value in [AgentSessionRetention.days30, .days90, .days365, .keepForever] {
+            var preferences = AppPreferences(agentSessionRetention: value)
+            preferences.agentSessionRetention = value
+            let copy = try JSONDecoder().decode(
+                AppPreferences.self, from: JSONEncoder().encode(preferences)
+            )
+            XCTAssertEqual(copy.agentSessionRetention, value)
+        }
+        XCTAssertNil(AgentSessionRetention.keepForever.seconds, "forever has no expiry")
+        XCTAssertEqual(AgentSessionRetention.floor, .days30)
+        XCTAssertEqual(AgentSessionRetention.floor.seconds, 30 * 86400)
+        // The floor is a floor: nothing on offer deletes spend sooner.
+        for value in AgentSessionRetention.allCases {
+            XCTAssertGreaterThanOrEqual(value.seconds ?? .infinity, 30 * 86400)
+        }
+    }
+
     func testPresentationRoundTripKeepsIndependentLayoutsAndUnits() throws {
         var preferences = AppPreferences()
         preferences.presentation.networkUnit = .bits

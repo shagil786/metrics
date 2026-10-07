@@ -85,6 +85,51 @@ public enum HistoryRetention: String, CaseIterable, Sendable, Identifiable, Coda
     }
 }
 
+/// How long agent sessions and their token usage are kept.
+///
+/// **Not `HistoryRetention`, and not the same setting.** A sample is a reading and a
+/// session is spend: it holds token counts and the model ids they were billed under,
+/// and `HistoryRetention`'s floor is 24 hours. A user who wants a day of CPU history
+/// would lose agent spend irrecoverably on a schedule chosen for a different purpose,
+/// so the two are set and stated separately, and the floor here is 30 days.
+///
+/// Nil seconds for `.keepForever` rather than a very large number: keeping everything
+/// is not a long window, and giving it one would put an expiry on a setting that has
+/// none. `AppPreferences.agentSessionRetention` being nil — never chosen, or not
+/// readable — keeps everything too, for the same reason.
+public enum AgentSessionRetention: String, CaseIterable, Sendable, Identifiable, Codable {
+    case days30
+    case days90
+    case days365
+    case keepForever
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .days30: "30 days"
+        case .days90: "90 days"
+        case .days365: "1 year"
+        case .keepForever: "Forever"
+        }
+    }
+
+    /// Nil when nothing is ever deleted, which is a different thing from "a long time".
+    public var seconds: TimeInterval? {
+        switch self {
+        case .days30: 30 * 86400
+        case .days90: 90 * 86400
+        case .days365: 365 * 86400
+        case .keepForever: nil
+        }
+    }
+
+    /// The shortest period on offer. Also the value a caller must never fall back to
+    /// for a setting it could not read: guessing the floor here would delete spend on
+    /// a schedule nobody chose.
+    public static let floor: AgentSessionRetention = .days30
+}
+
 /// Viewing ranges are independent from retention: choosing 1h must not delete older data.
 public enum HistoryRange: String, CaseIterable, Sendable, Identifiable {
     case hour1, hours12, hours24, days7, days30
@@ -103,6 +148,10 @@ public struct AppPreferences: Sendable, Codable {
     public var menuBarMetric: MenuBarMetric
     public var cadence: SamplingCadence
     public var retention: HistoryRetention
+    /// How long agent sessions are kept. **Nil is a value**: never chosen, or not
+    /// readable, and it keeps everything rather than falling back to the floor. A
+    /// preference that cannot be read must not turn into a deletion schedule.
+    public var agentSessionRetention: AgentSessionRetention?
     public var launchAtLogin: Bool
     public var fixtureMode: Bool
     /// Plain-language "acting up" notifications (sustained CPU, memory growth,
@@ -117,6 +166,7 @@ public struct AppPreferences: Sendable, Codable {
         menuBarMetric: MenuBarMetric = .cpu,
         cadence: SamplingCadence = .standard,
         retention: HistoryRetention = .hours24,
+        agentSessionRetention: AgentSessionRetention? = nil,
         launchAtLogin: Bool = false,
         fixtureMode: Bool = false,
         alertsEnabled: Bool = true,
@@ -127,6 +177,7 @@ public struct AppPreferences: Sendable, Codable {
         self.menuBarMetric = menuBarMetric
         self.cadence = cadence
         self.retention = retention
+        self.agentSessionRetention = agentSessionRetention
         self.launchAtLogin = launchAtLogin
         self.fixtureMode = fixtureMode
         self.alertsEnabled = alertsEnabled
@@ -135,7 +186,7 @@ public struct AppPreferences: Sendable, Codable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case menuBarMetric, cadence, retention, launchAtLogin, fixtureMode, alertsEnabled, showInDock, presentation, hasCompletedOnboarding
+        case menuBarMetric, cadence, retention, agentSessionRetention, launchAtLogin, fixtureMode, alertsEnabled, showInDock, presentation, hasCompletedOnboarding
     }
 
     public init(from decoder: Decoder) throws {
@@ -148,6 +199,18 @@ public struct AppPreferences: Sendable, Codable {
         presentation.statusItems = presentation.effectiveStatusItems
         cadence = try c.decodeIfPresent(SamplingCadence.self, forKey: .cadence) ?? .standard
         retention = try c.decodeIfPresent(HistoryRetention.self, forKey: .retention) ?? .hours24
+        // No `?? .floor`: a build that never wrote this key keeps every session rather
+        // than deleting spend for 30 days because a preference was unreadable.
+        //
+        // `try?` as well as `decodeIfPresent`, and that is not belt-and-braces:
+        // `decodeIfPresent` **throws** for a present-but-invalid value, so a raw value
+        // this build does not know would fail the decode of every other preference in
+        // the blob and reset the lot — including this one, to the floor, by a longer
+        // route than the one being guarded against. Unreadable here means absent, and
+        // absent keeps everything.
+        agentSessionRetention = (try? c.decodeIfPresent(
+            AgentSessionRetention.self, forKey: .agentSessionRetention
+        )) ?? nil
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         fixtureMode = try c.decodeIfPresent(Bool.self, forKey: .fixtureMode) ?? false
         alertsEnabled = try c.decodeIfPresent(Bool.self, forKey: .alertsEnabled) ?? true

@@ -227,6 +227,21 @@ final class MCPHostController: ObservableObject {
         clients = host?.connectedClients() ?? []
     }
 
+    /// The ids of the sessions this host is serving right now.
+    ///
+    /// Read from the host rather than from `clients`, which is a display cache
+    /// refreshed when Settings opens: a retention sweep may run minutes after the last
+    /// refresh, and a stale list would let it delete the row of a connection that is
+    /// still there — after which that connection's next report lands under an id no
+    /// row names.
+    ///
+    /// `MCPConnectedClient.id` is the same UUID the host minted for the connection and
+    /// wrote as the session's id at accept time, so this set is the set of session ids
+    /// that can still receive reports.
+    var connectedSessionIDs: Set<UUID> {
+        Set(host?.connectedClients().map(\.id) ?? [])
+    }
+
     /// Changes the mutation policy and persists it.
     ///
     /// Writes the same file the executor and the CLI read, so the three cannot

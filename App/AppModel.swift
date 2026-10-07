@@ -246,15 +246,40 @@ final class AppModel: ObservableObject {
     @Published var gpuHistory: [Double] = []
 
     private func pruneHistory() {
+        // Before the history guard, deliberately. Two databases fail independently, and
+        // bounding the agent table must not depend on the other one opening — that is
+        // the path B1 was raised about, and it was unreachable whenever the history
+        // file was unreadable.
+        pruneAgentSessions()
         guard let store = historyStore else { return }
-        let cutoff = Date().addingTimeInterval(-prefs.retention.seconds)
-        store.prune(olderThan: cutoff)
-        // The same retention, the same sweep. Leaving agent sessions out of it is what
-        // made this table grow forever while the picker said older records were
-        // deleted automatically.
-        agentSessionStore?.prune(olderThan: cutoff)
+        store.prune(olderThan: Date().addingTimeInterval(-prefs.retention.seconds))
         lastPrune = Date()
     }
+
+    /// Sweeps agent sessions on **their own** retention, not the sample picker's.
+    ///
+    /// Absent or unreadable retention keeps everything. Falling back to the 30-day floor
+    /// would delete spend on a schedule the user never chose, which is the same defect
+    /// as an agent that reported nothing being shown as one that reported zero.
+    func pruneAgentSessions() {
+        guard let store = agentSessionStore,
+              let seconds = prefs.agentSessionRetention?.seconds
+        else { return }
+        store.prune(
+            olderThan: Date().addingTimeInterval(-seconds),
+            keepingSessionIDs: liveSessionIDs()
+        )
+    }
+
+    /// The session ids the MCP host is serving right now, for the sweep above.
+    ///
+    /// Injected rather than reached for: the host is owned by `AppDelegate` and this is
+    /// its own singleton, so the seam has to be filled deliberately by whoever owns
+    /// both. **Empty means nothing is connected**, which is why the default is empty
+    /// rather than absent — this process is the only writer of that store, so while the
+    /// host is not serving there is no connection left that could report again, and an
+    /// empty set is the true answer rather than a guess.
+    var liveSessionIDs: @MainActor () -> Set<UUID> = { [] }
 
     /// Clears both databases, because the button says all of it.
     ///

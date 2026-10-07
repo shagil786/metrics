@@ -163,6 +163,22 @@ struct SettingsView: View {
             }
             .accessibilityHint("Older samples are deleted automatically")
 
+            // Its own setting, deliberately not the picker above: a session's tokens and
+            // model ids are spend, and a user who wants 24 hours of CPU history should
+            // not lose that spend on a schedule chosen for samples.
+            Picker("Keep agent sessions for", selection: Binding(
+                get: { model.prefs.agentSessionRetention },
+                set: { model.prefs.agentSessionRetention = $0; model.pruneAgentSessions() }
+            )) {
+                Text("Not set — keep everything").tag(nil as AgentSessionRetention?)
+                ForEach(AgentSessionRetention.allCases) { r in
+                    Text(r.label).tag(r as AgentSessionRetention?)
+                }
+            }
+            .accessibilityHint(
+                "Agent sessions and the token counts they reported. Not set keeps everything"
+            )
+
             let counts = model.historyRowCounts
             let extended = model.historyStore?.extendedRowCounts() ?? (apps: 0, resources: 0)
             Text("Stored now: \(extended.apps) app samples, \(extended.resources) resource samples; \(counts.cpu) CPU samples, \(counts.mem) memory samples, \(counts.process) process points, \(counts.port) port events")
@@ -170,7 +186,7 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("History is stored in Application Support/Portmaster on this Mac and is never uploaded. Agent sessions and their token usage are kept for the same period and are deleted with it.")
+            Text("History is stored in Application Support/Portmaster on this Mac and is never uploaded. Agent sessions are stored there too, in their own database, and are kept for the period set above.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

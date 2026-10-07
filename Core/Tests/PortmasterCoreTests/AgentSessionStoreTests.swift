@@ -1,6 +1,6 @@
-// Persistence and cost computation for agent sessions. The store registers its
-// models explicitly in HistoryStore's container, so a model missing from that list
-// would silently never persist — the round-trip test below is what catches it.
+// Persistence and cost computation for agent sessions. The store owns its own
+// container at `agent-sessions.sqlite`, so a model missing from that list would
+// silently never persist — the round-trip test below is what catches it.
 import XCTest
 import Foundation
 @testable import PortmasterCore
@@ -566,43 +566,165 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertEqual(try reopened.cost(for: sid2), .priced(usd: Decimal(string: "0.001")!, priceTableVersion: 1))
     }
 
-    /// Retention keeps recent sessions and drops old ones, usage records included.
+    /// The basic sweep: a session that connected long ago and has said nothing since
+    /// goes, with its records, while one inside the window stays.
     ///
-    /// The records matter as much as the row: deleting the session alone would leave
-    /// the token counts on disk where no read can see them, which is the same leak as
-    /// a clear that reports success and deletes nothing.
-    func testPruneDropsOldSessionsAndTheirUsage() throws {
+    /// Both go together on purpose. Leaving the records behind would be an orphan no
+    /// read can see and no later sweep can collect; leaving the row behind would be a
+    /// session whose usage was deleted underneath it, which reads as "has not reported
+    /// yet" — a lie about a session that did report.
+    func testPruneDropsAStaleSessionThatHasNotReportedSinceTheCutoff() throws {
         let (store, url) = try makeStoreOnDisk()
         let cutoff = Date(timeIntervalSince1970: 1_000)
-        let old = UUID(), recent = UUID()
+        let stale = UUID(), recent = UUID()
         try store.recordSession(
-            id: old, peerPID: 1, clientName: "old", clientVersion: nil,
+            id: stale, peerPID: 1, clientName: "stale", clientVersion: nil,
             connectedAt: cutoff.addingTimeInterval(-60)
         )
         try store.recordSession(
             id: recent, peerPID: 1, clientName: "recent", clientVersion: nil,
             connectedAt: cutoff.addingTimeInterval(60)
         )
-        for id in [old, recent] {
+        // Both sessions' last report predates the cutoff, so age is decided by the
+        // reports rather than by `connectedAt` alone.
+        for id in [stale, recent] {
             try store.recordUsage(TokenUsageRecord(
-                sessionID: id, recordedAt: Date(), input: 500, output: 0,
-                cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+                sessionID: id, recordedAt: cutoff.addingTimeInterval(-10), input: 500,
+                output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+                provenance: .selfReported
             ))
         }
         try store.flush()
 
-        store.prune(olderThan: cutoff)
+        store.prune(olderThan: cutoff, keepingSessionIDs: [])
 
         let reopened = try AgentSessionStore(storeURL: url)
         XCTAssertEqual(try reopened.sessions().map(\.id), [recent])
         XCTAssertEqual(
-            try reopened.usage(for: old), .notReported(reason: .awaitingFirstReport),
-            "a pruned session's usage must not survive as an orphan record"
+            try reopened.usage(for: stale), .notReported(reason: .awaitingFirstReport),
+            "a pruned session's records must go with it, not survive as orphans"
         )
         guard case .reported(let input, _, _) = try reopened.usage(for: recent) else {
             return XCTFail("the recent session must keep its usage")
         }
         XCTAssertEqual(input, 500)
+    }
+
+    /// The defect this round exists to fix: a session the host is still serving must
+    /// survive a sweep, so the next report is not an orphan.
+    ///
+    /// The sequence is the reviewer's, in order — connect long ago, prune, report, prune
+    /// again — because the second prune is what exposes the bug: it cannot collect
+    /// anything, the parent row having been deleted by the first one while the
+    /// connection carried on writing. `sessions()` returning empty at the end, with a
+    /// usage record still in the file, is exactly the orphan state.
+    func testPruneKeepsAStillConnectedSessionSoALaterReportIsNotAnOrphan() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let live = UUID()
+        try store.recordSession(
+            id: live, peerPID: 4242, clientName: "long-lived", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-3_600)
+        )
+        try store.flush()
+
+        // Stale by an hour, but the host says it is still serving this connection.
+        store.prune(olderThan: cutoff, keepingSessionIDs: [live])
+
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: live, recordedAt: cutoff.addingTimeInterval(60), input: 900,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .selfReported
+        ))
+        try store.flush()
+        // And again, after the report: the newest sweep must not collect the row now
+        // that it carries a record.
+        store.prune(olderThan: cutoff, keepingSessionIDs: [live])
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(
+            try reopened.sessions().map(\.id), [live],
+            "a connection that is still serving keeps its session row through every sweep"
+        )
+        XCTAssertEqual(
+            try reopened.usage(for: live), .reported(input: 900, output: 0, provenance: .selfReported),
+            "and the report it made after the sweep is readable, not an orphan"
+        )
+    }
+
+    /// A still-connected session that has not reported recently keeps its **old** record
+    /// too.
+    ///
+    /// Deleting it would leave the row present and empty, which this store reads as
+    /// `awaitingFirstReport` — "a source exists and is readable, but has not reported
+    /// yet". That is false: it did report, and Portmaster deleted the figure. The
+    /// connection is what bounds this growth, and until it closes, its history is the
+    /// user's.
+    func testPruneKeepsAnOldRecordForAStillConnectedSession() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let live = UUID()
+        try store.recordSession(
+            id: live, peerPID: 1, clientName: "quiet", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-3_600)
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: live, recordedAt: cutoff.addingTimeInterval(-600), input: 42,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .selfReported
+        ))
+        try store.flush()
+
+        store.prune(olderThan: cutoff, keepingSessionIDs: [live])
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(
+            try reopened.usage(for: live),
+            .reported(input: 42, output: 0, provenance: .selfReported),
+            "deleting this record would make the session read as one that never reported"
+        )
+    }
+
+    /// A stale session that is still reporting is kept, and its older records are
+    /// trimmed — which changes nothing this store reports, because aggregation reads
+    /// only the latest record per provenance.
+    ///
+    /// The trimming is what keeps a chatty session from growing without bound, and the
+    /// figure being identical before and after is what makes it safe: a sum would
+    /// change here, a latest-record read cannot.
+    func testPruneTrimsOldRecordsOfAStaleSessionThatIsStillReporting() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let active = UUID()
+        try store.recordSession(
+            id: active, peerPID: 1, clientName: "chatty", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-3_600)
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: active, recordedAt: cutoff.addingTimeInterval(-600), input: 100,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: active, recordedAt: cutoff.addingTimeInterval(60), input: 900,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .selfReported
+        ))
+        try store.flush()
+        let before = try store.usage(for: active)
+
+        store.prune(olderThan: cutoff, keepingSessionIDs: [])
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(try reopened.sessions().map(\.id), [active])
+        XCTAssertEqual(
+            try reopened.usage(for: active), before,
+            "trimming records older than the cutoff cannot move a latest-record figure"
+        )
+        guard case .reported(let input, _, _) = try reopened.usage(for: active) else {
+            return XCTFail("an actively reporting session must keep reporting")
+        }
+        XCTAssertEqual(input, 900)
     }
 
     // MARK: - Price text is parsed strictly

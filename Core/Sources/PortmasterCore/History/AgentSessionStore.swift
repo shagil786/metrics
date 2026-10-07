@@ -315,30 +315,73 @@ public final class AgentSessionStore: @unchecked Sendable {
         }
     }
 
-    /// Drop sessions that connected before `cutoff`, and the usage records belonging to
-    /// them. Best-effort and non-throwing, matching `HistoryStore.prune`: a retention
-    /// sweep that failed on one row must not abort the rest, and the error is logged.
+    /// Drop what the user asked to keep no longer than, best-effort and
+    /// non-throwing, matching `HistoryStore.prune`: a retention sweep that failed on
+    /// one row must not abort the rest, and the error is logged.
     ///
-    /// The records have to go with the session for the same reason `clearAll` deletes
-    /// both — an orphaned usage record is invisible to every read here but still on
-    /// disk, so pruning the parent alone would leave the numbers behind.
-    public func prune(olderThan cutoff: Date) {
+    /// `keepingSessionIDs` is the host's live set, and the parameter has no default
+    /// because a sweep must be told what is still connected rather than guess. Deleting
+    /// the row of a session the host is still serving is the orphan this method exists
+    /// to avoid: the connection keeps its id in memory, `recordUsage` is a bare
+    /// `context.insert` with no referential check, and every later report would land
+    /// under an id no row names — invisible to every read here, and not collectable by
+    /// the next sweep because the parent row is gone for good.
+    ///
+    /// **Usage is judged by `recordedAt`, never by the session's `connectedAt`.** The
+    /// two are different questions: `connectedAt` is written once, at accept time, so a
+    /// connection open for a month has a month-old stamp and a second-old figure.
+    ///
+    /// Sessions fall into three groups, and each is kept or dropped for its own reason:
+    ///
+    /// - **dropped whole** — stale, not connected, and nothing reported since the
+    ///   cutoff. The row and all of its records go together, so a session is never
+    ///   left claiming it has not reported when its records were deleted underneath it
+    ///   (`awaitingFirstReport` would be a lie) and never left with records and no row.
+    /// - **kept, records trimmed** — stale but still reporting. Records older than the
+    ///   cutoff go; the newest survives, and since aggregation reads only the latest per
+    ///   provenance, every figure this store reports is unchanged.
+    /// - **kept whole** — the host is serving it. Nothing of it is touched, including a
+    ///   record older than the cutoff: if it were deleted the session would read as
+    ///   never having reported. The connection is what bounds that growth.
+    public func prune(olderThan cutoff: Date, keepingSessionIDs live: Set<UUID>) {
         lock.lock(); defer { lock.unlock() }
         do {
             let stale = try context.fetch(FetchDescriptor<AgentSession>(
                 predicate: #Predicate { $0.connectedAt < cutoff }
             ))
+            // One query for "who reported since the cutoff", not one per session.
+            let recentlyReported = try context.fetch(FetchDescriptor<TokenUsageRecordRow>(
+                predicate: #Predicate { $0.recordedAt >= cutoff }
+            )).reduce(into: Set<UUID>()) { $0.insert($1.sessionID) }
+
+            var dropped: [UUID] = []
+            var trimmed: [UUID] = []
             for session in stale {
                 let id = session.id
+                if live.contains(id) {
+                    continue
+                } else if recentlyReported.contains(id) {
+                    trimmed.append(id)
+                } else {
+                    dropped.append(id)
+                }
+            }
+            for id in dropped {
                 _ = try context.delete(
                     model: TokenUsageRecordRow.self,
                     where: #Predicate { $0.sessionID == id }
                 )
+                _ = try context.delete(
+                    model: AgentSession.self,
+                    where: #Predicate { $0.id == id }
+                )
             }
-            _ = try context.delete(
-                model: AgentSession.self,
-                where: #Predicate { $0.connectedAt < cutoff }
-            )
+            for id in trimmed {
+                _ = try context.delete(
+                    model: TokenUsageRecordRow.self,
+                    where: #Predicate { $0.sessionID == id && $0.recordedAt < cutoff }
+                )
+            }
             try context.save()
         } catch {
             context.rollback()
