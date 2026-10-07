@@ -326,7 +326,13 @@ final class MCPHostController: ObservableObject {
                 return await MainActor.run {
                     controller?.connectedSessionIDs ?? Set<UUID>()
                 }
-            }
+            },
+            // The same store the recorder appends to, so a price and the figures it
+            // prices read one file. Resolved here rather than per call, like the
+            // recorder above: the store is opened once at launch and never replaced,
+            // so there is nothing later to pick up. Nil means `set_model_price`
+            // refuses with a reason rather than accepting a price into nothing.
+            priceWriter: AppModel.shared.agentSessionStore.map(StoreModelPriceWriter.init)
         )
     }
 
@@ -423,14 +429,14 @@ final class MCPHostController: ObservableObject {
     /// Whether resolving this request depends on the app's current reading.
     ///
     /// A quit and a project are decided by which processes exist right now, so they are
-    /// refused when no reading can be had. A container stop and a preference change are
-    /// not: the first is docker's business and the second is the preferences blob's, and
-    /// both would be refused by their own path with their own words if they could not be
-    /// performed.
+    /// refused when no reading can be had. A container stop, a preference change and a
+    /// price are not: the first is docker's business, the second is the preferences
+    /// blob's and the third is a number the client already has, and each would be
+    /// refused by its own path with its own words if it could not be performed.
     static func needsReading(_ request: MCPApprovalRequest) -> Bool {
         switch request.kind {
         case .quitApp, .stopProject: return true
-        case .stopContainer, .setPreference: return false
+        case .stopContainer, .setPreference, .setModelPrice: return false
         }
     }
 

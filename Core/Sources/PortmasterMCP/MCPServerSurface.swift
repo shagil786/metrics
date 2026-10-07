@@ -349,7 +349,18 @@ public struct LocalMCPCallContext: MCPToolCalling {
             settingsDirectory: settingsDirectory,
             // Refuses with this path's own reason. Nothing is opened and
             // nothing is bound; `noSessionNote` is the whole of the reasoning.
-            sessionRecorder: UnavailableSessionRecorder(message: Self.noSessionNote)
+            sessionRecorder: UnavailableSessionRecorder(message: Self.noSessionNote),
+            // A price carries no attribution problem — nothing about it belongs to a
+            // process — so the reason here is not the one above. Writing it from here
+            // would make this process a second writer to a database the app also
+            // writes, and the app's context would not observe the write: the price
+            // would be on disk and absent from every figure the app computes. Same
+            // direction as reading is safe; writing is not.
+            priceWriter: UnavailableModelPriceWriter(
+                reason: "Prices are set through Portmaster's running app. This session "
+                    + "is not connected to one, so a price written here would not be "
+                    + "seen by the figures it prices."
+            )
         )
     }
 }

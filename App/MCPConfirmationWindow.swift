@@ -480,6 +480,31 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
                 return .refused("\(error.localizedDescription)")
             }
             return .shown(Resolved(stopTarget: nil, targets: ["\(key) = \(value)"]))
+
+        case .setModelPrice:
+            // Validated here for the same reason `set_preference` is: asking a
+            // person to approve a price that the write would then refuse wastes the
+            // click and teaches them the window does not know what it is asking.
+            // `ModelPriceEntry.isDecimalNumber` rather than a `Decimal(string:)` that
+            // would also accept "1,5" — silently wrong, not refused.
+            let model = request.arguments["model"] ?? ""
+            let price = request.arguments["price"] ?? ""
+            let component = request.arguments["component"]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let which = (component?.isEmpty ?? true) ? "input" : component!
+            guard !model.isEmpty else {
+                return .refused("No model was named, so there is nothing to price.")
+            }
+            guard ModelPriceEntry.isDecimalNumber(price) else {
+                return .refused(
+                    "\"\(price)\" is not a decimal number, so it cannot be a price."
+                )
+            }
+            return .shown(Resolved(
+                stopTarget: nil,
+                targets: ["\(model) — \(which) price: $\(price) per token"]
+            ))
         }
     }
 }

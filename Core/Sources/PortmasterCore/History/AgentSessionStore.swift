@@ -124,7 +124,12 @@ public final class ModelPriceEntry {
     /// The shape `text(for:)` writes, and the shape nothing else should be accepted as.
     /// Deliberately narrower than what `Decimal(string:)` tolerates, because tolerating
     /// `"1,5"` is a silently wrong price rather than a rejected one.
-    static func isDecimalNumber(_ text: String) -> Bool {
+    ///
+    /// Public because it is the same question wherever a price arrives from — a
+    /// typed price in Settings and a price over MCP are one rule, not two, and two
+    /// implementations of "is this a number" is how `"1,5"` comes to be accepted on
+    /// one surface and rejected on the other.
+    public static func isDecimalNumber(_ text: String) -> Bool {
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count <= 2 else { return false }
         for part in parts where !part.isEmpty {
@@ -148,6 +153,10 @@ public enum PriceComponent: String, Sendable {
     case reasoning
 
     var keySuffix: String { rawValue }
+
+    /// The component a model id names when no component is given, which is the
+    /// common case: a caller setting "the price of gpt-5" means the input price.
+    public static let named: PriceComponent = .input
 }
 
 public struct AgentSessionSnapshot: Sendable {
@@ -249,6 +258,76 @@ public final class AgentSessionStore: @unchecked Sendable {
     public func flush() throws {
         lock.lock(); defer { lock.unlock() }
         try context.save()
+    }
+
+    // MARK: - Price table reads
+
+    /// One price, as the surfaces show it.
+    public struct ModelPrice: Hashable, Sendable {
+        public let modelID: String
+        public let component: PriceComponent
+        public let pricePerToken: Decimal
+        /// The table version that last wrote this price. Carried so a figure can be
+        /// traced to the price behind it, and so a table edit is visible as a version
+        /// change rather than only as a different number.
+        public let tableVersion: Int
+    }
+
+    /// Every price in the table, ordered by model then component so a UI list has a
+    /// stable order without sorting one itself.
+    ///
+    /// A row whose stored text will not parse is **left out**, not shown as zero.
+    /// The same reason the costing path treats it as absent: an unparseable price is
+    /// an unknown price, and listing it as 0 would offer the user a figure to
+    /// correct that looks like a real one.
+    public func prices() throws -> [ModelPrice] {
+        lock.lock(); defer { lock.unlock() }
+        let table = priceTableLocked()
+        var prices: [ModelPrice] = []
+        prices.reserveCapacity(table.byKey.count)
+        for key in table.byKey.keys.sorted() {
+            guard let entry = table.byKey[key],
+                  let pair = Self.splitPriceKey(key)
+            else { continue }
+            prices.append(ModelPrice(
+                modelID: pair.0,
+                component: pair.1,
+                pricePerToken: entry.price,
+                tableVersion: entry.version
+            ))
+        }
+        return prices
+    }
+
+    /// Models that appear in recorded usage but have no input price.
+    ///
+    /// The list a price-entry surface should show first: these are the sessions
+    /// currently reading *not priced*, so they are the ones whose numbers are
+    /// missing. Distinct from "every model in the table", which says what is set
+    /// rather than what is missing.
+    public func modelsMissingAPrice() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var priced = Set<String>()
+        for key in priceTableLocked().byKey.keys {
+            guard let pair = Self.splitPriceKey(key), pair.1 == .input else { continue }
+            priced.insert(pair.0)
+        }
+        let descriptor = FetchDescriptor<TokenUsageRecordRow>()
+        let rows = (try? context.fetch(descriptor)) ?? []
+        var seen = Set<String>()
+        for row in rows { seen.insert(row.modelID) }
+        return seen.subtracting(priced).sorted()
+    }
+
+    /// Splits the composite key `model#component`. Nil for anything else, so a
+    /// malformed key is skipped rather than parsed into a model with no component.
+    static func splitPriceKey(_ key: String) -> (String, PriceComponent)? {
+        guard let hash = key.lastIndex(of: "#") else { return nil }
+        let modelID = String(key[key.startIndex..<hash])
+        guard !modelID.isEmpty,
+              let component = PriceComponent(rawValue: String(key[key.index(after: hash)...]))
+        else { return nil }
+        return (modelID, component)
     }
 
     // MARK: - Reads
@@ -545,7 +624,9 @@ public final class AgentSessionStore: @unchecked Sendable {
     /// A read-only view of the price table for one costing pass. Small enough to be a
     /// value, so a caller cannot hold a half-read table across a later write.
     private struct PriceTable {
-        private let byKey: [String: (price: Decimal, version: Int)]
+        /// Internal rather than private: `prices()` and `modelsMissingAPrice()`
+        /// read it, and both are on the lock-holding side already.
+        let byKey: [String: (price: Decimal, version: Int)]
         let currentVersion: Int
 
         init(byKey: [String: (price: Decimal, version: Int)], currentVersion: Int) {

@@ -33,6 +33,30 @@ final class AppModel: ObservableObject {
     /// database is allowed to fail, and pretending otherwise would mean an MCP client
     /// reporting tokens into a store nobody can read.
     var agentSessionStore: AgentSessionStore?
+    /// Prices set in Settings, refreshed after each edit rather than observed.
+    ///
+    /// A `@Published` pair rather than one value because the Settings page shows two
+    /// lists and either changing should redraw both — a model that just gained an
+    /// input price moves from "needs a price" to "priced", and the row it leaves
+    /// behind has to disappear with it.
+    @Published private(set) var pricedModels: [String: AgentSessionStore.ModelPrice] = [:]
+    @Published private(set) var modelsMissingAPrice: [String] = []
+
+    /// Re-reads both price lists from the store. Called when the Prices page appears
+    /// and after every save, so what is on screen is what is on disk rather than a
+    /// copy that can drift from it.
+    func refreshPrices() {
+        guard let store = agentSessionStore else {
+            pricedModels = [:]
+            modelsMissingAPrice = []
+            return
+        }
+        pricedModels = Dictionary(
+            uniqueKeysWithValues: (try? store.prices())?
+                .map { ($0.modelID, $0) } ?? []
+        )
+        modelsMissingAPrice = (try? store.modelsMissingAPrice()) ?? []
+    }
     /// Published and surfaced like `historyError` above, because a store that could not
     /// be opened is otherwise invisible: `report_usage` refuses forever with a generic
     /// reason and nothing anywhere says why, which reads as a broken tool rather than an

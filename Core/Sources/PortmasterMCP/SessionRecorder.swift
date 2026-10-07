@@ -12,6 +12,72 @@
 import Foundation
 import PortmasterCore
 
+/// Writes prices. Separate from `SessionRecording` because the two have nothing in
+/// common: a report appends to a session the caller is already attached to, while a
+/// price is configuration that applies to every future figure.
+public protocol ModelPriceWriting: Sendable {
+    /// Sets one component's price for a model. Returns a sentence the caller can hand
+    /// back, so a success and a refusal are both legible.
+    func setPrice(
+        modelID: String, component: PriceComponent, price: Decimal
+    ) throws -> String
+
+    /// Every price currently set, for reading back.
+    func prices() throws -> [AgentSessionStore.ModelPrice]
+
+    /// Models seen in recorded usage with no input price — the ones whose sessions
+    /// currently read *not priced*.
+    func modelsMissingAPrice() throws -> [String]
+}
+
+public struct StoreModelPriceWriter: ModelPriceWriting {
+    private let store: AgentSessionStore
+
+    public init(store: AgentSessionStore) {
+        self.store = store
+    }
+
+    public func setPrice(
+        modelID: String, component: PriceComponent, price: Decimal
+    ) throws -> String {
+        try store.setPrice(price, modelID: modelID, component: component)
+        // Flushed here rather than left to a later call: an agent that set a price and
+        // was told "recorded" must find it on disk, because costing reads through a
+        // reopened store on the CLI path and a buffered write would be invisible there.
+        try store.flush()
+        return "Set the \(component.rawValue) price for \(modelID)."
+    }
+
+    public func prices() throws -> [AgentSessionStore.ModelPrice] {
+        try store.prices()
+    }
+
+    public func modelsMissingAPrice() throws -> [String] {
+        try store.modelsMissingAPrice()
+    }
+}
+
+/// Refuses every price with a reason rather than accepting one that is dropped —
+/// an agent told a price was set when nothing was stored would then read *not
+/// priced* and have no way to tell why.
+public struct UnavailableModelPriceWriter: ModelPriceWriting {
+    private let reason: String
+
+    public init(
+        reason: String = "Portmaster has no session store available, so this price was not saved."
+    ) {
+        self.reason = reason
+    }
+
+    public func setPrice(modelID: String, component: PriceComponent, price: Decimal) throws -> String {
+        throw MCPToolError(message: reason)
+    }
+
+    public func prices() throws -> [AgentSessionStore.ModelPrice] { [] }
+
+    public func modelsMissingAPrice() throws -> [String] { [] }
+}
+
 public protocol SessionRecording: Sendable {
     /// Checks that this recorder can record at all, before a report is attributed to
     /// a session.

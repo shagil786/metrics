@@ -54,6 +54,7 @@ public enum MCPApprovalCopy {
         case .stopContainer: return "Stop a container"
         case .stopProject: return "Stop a project"
         case .setPreference: return "Change a Portmaster preference"
+        case .setModelPrice: return "Set a token price"
         }
     }
 
@@ -67,6 +68,7 @@ public enum MCPApprovalCopy {
         case .stopContainer: return "Stop Container"
         case .stopProject: return "Quit Project"
         case .setPreference: return "Change Preference"
+        case .setModelPrice: return "Set Price"
         }
     }
 
@@ -121,6 +123,14 @@ public enum MCPApprovalCopy {
             let key = named(arguments["key"], fallback: "a preference the client did not name")
             let value = named(arguments["value"], fallback: "a value the client did not name")
             return "Change Portmaster's \(key) preference to \(value)."
+        case .setModelPrice:
+            let model = named(arguments["model"], fallback: "a model the client did not name")
+            let price = named(arguments["price"], fallback: "a price the client did not name")
+            let component = arguments["component"]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let which = (component?.isEmpty ?? true) ? "input" : component!
+            return "Set the \(which) price of \(model) to $\(price) per token."
         }
     }
 
@@ -135,6 +145,8 @@ public enum MCPApprovalCopy {
             return "Portmaster will run 'docker stop' on:"
         case .setPreference:
             return "Portmaster will change:"
+        case .setModelPrice:
+            return "Every session already recorded for this model will be re-costed:"
         }
     }
 

@@ -66,6 +66,10 @@ public struct ToolExecutor: Sendable {
     /// is how a payload's liveness and the store's would come to disagree, which is
     /// the shape of bug the session-identity work already hit once.
     private let openSessionIDs: @Sendable () async -> Set<UUID>
+    /// Where `set_model_price` writes. Optional so the tool can exist where no store
+    /// does; `UnavailableModelPriceWriter` then refuses with a reason rather than
+    /// accepting a price that would be dropped.
+    private let priceWriter: any ModelPriceWriting
     /// Where `report_usage` appends. Optional so the tool can exist in contexts with
     /// no store; `UnavailableSessionRecorder` then refuses with a reason rather than
     /// accepting a report that would be dropped.
@@ -84,7 +88,8 @@ public struct ToolExecutor: Sendable {
         settingsDirectory: URL? = nil,
         sessionRecorder: (any SessionRecording)? = nil,
         sessionID: UUID? = nil,
-        openSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() }
+        openSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() },
+        priceWriter: (any ModelPriceWriting)? = nil
     ) {
         self.provider = provider
         self.gate = gate
@@ -93,9 +98,10 @@ public struct ToolExecutor: Sendable {
         self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
         self.sessionID = sessionID
         self.openSessionIDs = openSessionIDs
+        self.priceWriter = priceWriter ?? UnavailableModelPriceWriter()
     }
 
-    /// All 15 tools the MCP server exposes. Names wired into dispatch stay in
+    /// All 17 tools the MCP server exposes. Names wired into dispatch stay in
     /// step with this list, because `execute` refuses anything not declared here.
     public static let catalog: [ToolDefinition] = [
         // Reads
@@ -229,6 +235,27 @@ public struct ToolExecutor: Sendable {
             effect: .mutation
         ),
         ToolDefinition(
+            name: "get_model_prices",
+            description: "The token prices Portmaster has been given, and which models "
+                + "it has seen usage for but has no price for. A model with no price is "
+                + "reported as missing rather than as costing nothing.",
+            arguments: [],
+            effect: .read
+        ),
+        ToolDefinition(
+            name: "set_model_price",
+            description: "Set the token price for one model, so its sessions stop reading "
+                + "as not priced. Prices are yours to set: Portmaster does not fetch them, "
+                + "because a price it looked up today would silently disagree with the "
+                + "one you meant.",
+            arguments: [
+                (name: "model", required: true, help: "The model id exactly as usage reports it"),
+                (name: "price", required: true, help: "Price per token, in US dollars, e.g. 0.0000015"),
+                (name: "component", required: false, help: "input | output | cache_read | reasoning (default input)")
+            ],
+            effect: .mutation
+        ),
+        ToolDefinition(
             name: "set_preference",
             description: "Change one allowlisted preference. Allowed keys: "
                 + allowedPreferenceKeysDescription() + ". "
@@ -354,6 +381,25 @@ public struct ToolExecutor: Sendable {
 
         case "get_app_detail":
             return AppRollupPayload(try await provider.appDetail(id: Self.id(arguments)))
+
+        case "get_model_prices":
+            let prices = try priceWriter.prices()
+            return ModelPricesPayload(
+                prices: prices.map(ModelPricePayload.init),
+                missingPricesFor: try priceWriter.modelsMissingAPrice()
+            )
+
+        case "set_model_price":
+            // Validated before the writer is touched, so a rejected price cannot
+            // half-apply. The component is optional and defaults to input, which is
+            // what "the price of gpt-5" means to a caller.
+            let modelID = try Self.nonBlank(arguments["model"], field: "model")
+            let component = try Self.priceComponent(arguments["component"])
+            let price = try Self.price(arguments["price"])
+            let note = try priceWriter.setPrice(
+                modelID: modelID, component: component, price: price
+            )
+            return ModelPriceSetPayload(note: note)
 
         case "get_agent_sessions":
             let sessionsLimit = try Self.sessionLimit(arguments["limit"])
@@ -614,6 +660,47 @@ public struct ToolExecutor: Sendable {
     /// range is stated the same way however it was missed.
     private static func invalidLimit(_ raw: String) -> String {
         "Invalid limit: \(raw) (must be 1...\(maxTopApps))"
+    }
+
+    /// A price per token. Refused rather than coerced on anything non-numeric, and
+    /// negatives are refused rather than clamped — a negative price is a caller bug,
+    /// and clamping would file a plausible figure for it. Zero is accepted: a free
+    /// model is a real answer, unlike a missing price.
+    static func price(_ raw: String?) throws -> Decimal {
+        guard let raw, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw MCPToolError(message: "price is required.")
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard ModelPriceEntry.isDecimalNumber(trimmed) else {
+            throw MCPToolError(message: "price must be a decimal number, such as 0.0000015.")
+        }
+        guard let value = Decimal(string: trimmed, locale: Locale(identifier: "en_US_POSIX")) else {
+            throw MCPToolError(message: "price must be a decimal number, such as 0.0000015.")
+        }
+        guard value >= 0 else {
+            throw MCPToolError(message: "price must not be negative.")
+        }
+        return value
+    }
+
+    static func priceComponent(_ raw: String?) throws -> PriceComponent {
+        guard let raw, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return PriceComponent.named
+        }
+        // Underscores and case are both forgiven, because they are spelling and a
+        // caller is not wrong about which component they meant. `cache_read` and
+        // `cacheRead` are the same request written twice.
+        let normalized = raw.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "_", with: "")
+            .lowercased()
+        switch normalized {
+        case "input": return .input
+        case "output": return .output
+        case "cacheread": return .cacheRead
+        case "reasoning": return .reasoning
+        default:
+            throw MCPToolError(message: "component must be input, output, cache_read or reasoning.")
+        }
     }
 
     /// How many sessions to return. Bounded because the list is unbounded in

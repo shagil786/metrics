@@ -79,6 +79,9 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// answer current, and a stale set would mark a just-closed session open — an
     /// absence of evidence read as evidence.
     private let liveSessionIDs: @Sendable () async -> Set<UUID>
+    /// Where `set_model_price` writes. A store like the recorder's: one for the
+    /// app's life, and nil here means the tool refuses rather than dropping a price.
+    private let priceWriter: any ModelPriceWriting
 
     /// - Parameters:
     ///   - provider: the app's own data. `LiveDataProvider` in production.
@@ -105,7 +108,8 @@ public struct HostMCPCallContext: MCPToolCalling {
         auditDirectory: URL? = nil,
         settingsDirectory: URL? = nil,
         sessionRecorder: (any SessionRecording)? = nil,
-        liveSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() }
+        liveSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() },
+        priceWriter: (any ModelPriceWriting)? = nil
     ) {
         self.provider = provider
         self.broker = broker
@@ -116,6 +120,7 @@ public struct HostMCPCallContext: MCPToolCalling {
         self.settingsDirectory = settingsDirectory
         self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
         self.liveSessionIDs = liveSessionIDs
+        self.priceWriter = priceWriter ?? UnavailableModelPriceWriter()
     }
 
     /// The two-argument entry point, for a call that arrived with no connection behind
@@ -293,6 +298,12 @@ public struct HostMCPCallContext: MCPToolCalling {
         case "set_preference":
             kind = .setPreference
             summary = "Change \(arguments["key"] ?? "") to \(arguments["value"] ?? "")?"
+        case "set_model_price":
+            kind = .setModelPrice
+            // "Set X?" rather than "Change X to Y?" — the figure is long and the
+            // detail sentence below carries it, so the one-line summary stays the
+            // question and not the arithmetic.
+            summary = "Set the price of \(arguments["model"] ?? "")?"
         default:
             // Unreachable for any declared mutation; a mutation added to the catalog
             // without a case here is asked about generically rather than silently,
@@ -349,7 +360,8 @@ public struct HostMCPCallContext: MCPToolCalling {
             settingsDirectory: settingsDirectory,
             sessionRecorder: sessionRecorder,
             sessionID: session?.id,
-            openSessionIDs: { await liveSessionIDs() }
+            openSessionIDs: { await liveSessionIDs() },
+            priceWriter: priceWriter
         )
     }
 

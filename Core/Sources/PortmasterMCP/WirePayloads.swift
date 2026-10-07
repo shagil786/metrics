@@ -568,3 +568,49 @@ struct AgentSessionsPayload: Encodable {
         self.note = note
     }
 }
+
+// MARK: - Model prices
+
+/// One price, as the surfaces show it.
+///
+/// `price` is a decimal string for the same reason a cost is: a JSON number would
+/// let a client round a money figure, and these are the inputs every cost is
+/// computed from.
+struct ModelPricePayload: Encodable {
+    let modelID: String
+    let component: String
+    let price: String
+    let tableVersion: Int
+
+    init(_ entry: AgentSessionStore.ModelPrice) {
+        self.modelID = entry.modelID
+        self.component = entry.component.rawValue
+        self.price = NSDecimalNumber(decimal: entry.pricePerToken).stringValue
+        self.tableVersion = entry.tableVersion
+    }
+}
+
+struct ModelPricesPayload: Encodable {
+    let prices: [ModelPricePayload]
+    /// Models seen in recorded usage with no input price.
+    ///
+    /// A separate field rather than something inferred from `prices`: a client
+    /// cannot tell "you have priced two models" from "these three sessions are
+    /// costing nothing" without it, and the second is the one worth acting on.
+    let missingPricesFor: [String]
+
+    init(prices: [ModelPricePayload], missingPricesFor: [String]) {
+        self.prices = prices
+        self.missingPricesFor = missingPricesFor
+    }
+}
+
+struct ModelPriceSetPayload: Encodable {
+    let saved: Bool
+    let note: String
+
+    init(note: String) {
+        self.saved = true
+        self.note = note
+    }
+}

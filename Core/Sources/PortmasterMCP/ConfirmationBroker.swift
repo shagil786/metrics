@@ -14,6 +14,11 @@ public struct MCPApprovalRequest: Identifiable, Sendable {
         case stopContainer
         case stopProject
         case setPreference
+        /// Setting a token price. Its own kind rather than a reuse of
+        /// `setPreference`, because a person asked to approve a price needs to be
+        /// told what the price will change *costs* to them — every past figure
+        /// priced at the old one is re-costed the moment it lands.
+        case setModelPrice
     }
 
     public let id: UUID

@@ -16,7 +16,7 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(["General", "Layout", "Alerts", "History", "Updates", "Privacy", "MCP"], id: \.self) { name in
+                ForEach(["General", "Layout", "Alerts", "History", "Prices", "Updates", "Privacy", "MCP"], id: \.self) { name in
                     Button { page = name } label: {
                         Text(name).frame(maxWidth: .infinity, alignment: .leading).padding(8)
                             .background(page == name ? Color.accentColor.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
@@ -30,6 +30,7 @@ struct SettingsView: View {
                 case "Layout": CustomizationSettings()
                 case "Alerts": alertsTab
                 case "History": historyTab
+                case "Prices": pricesTab
                 case "Updates":
                     if let updates = AppDelegate.shared?.updates { UpdateSettings(updates: updates) }
                 case "Privacy": privacyTab
@@ -222,6 +223,64 @@ struct SettingsView: View {
         .padding(20)
     }
 
+    // MARK: Prices
+
+    /// Token prices, entered by the person who knows them.
+    ///
+    /// Portmaster does not fetch prices, and that is the decision this page exists
+    /// because of: a price looked up today would silently disagree with the one the
+    /// user meant, and every cost it produced would be wrong in a way nothing on
+    /// screen could show.
+    ///
+    /// The list leads with models that have usage and no price — the sessions
+    /// currently reading *not priced* — because that is the set worth acting on.
+    /// A model already priced is listed after it, not instead of it: a price set
+    /// months ago still needs checking.
+    private var pricesTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Token prices")
+                .font(.headline)
+            Text("""
+                Used to cost agent sessions. Entered per token, in US dollars — for                 a model that bills $3.00 per million input tokens, that is 0.000003.                 Prices outlive history: clearing history keeps them, because they are                 configuration rather than a reading.
+                """)
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            if let failure = model.agentSessionError {
+                Text(failure).font(.callout).foregroundStyle(.orange)
+            }
+
+            let missing = model.modelsMissingAPrice
+            if !missing.isEmpty {
+                Text("Needs a price")
+                    .font(.subheadline).fontWeight(.semibold)
+                Text("These models have reported usage, so their sessions read as not priced.")
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(missing, id: \.self) { modelID in
+                    PriceRow(modelID: modelID, store: model.agentSessionStore) { model.refreshPrices() }
+                }
+            } else {
+                Text("Every model that has reported usage has a price.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+
+            let priced = model.pricedModels
+            if !priced.isEmpty {
+                Text("Priced")
+                    .font(.subheadline).fontWeight(.semibold)
+                // Sorted, because a dictionary has no order and a list that
+                // reshuffles when a price is edited is unreadable.
+                ForEach(priced.keys.sorted(), id: \.self) { modelID in
+                    PriceRow(modelID: modelID, store: model.agentSessionStore) {
+                        model.refreshPrices()
+                    }
+                }
+            }
+
+            Spacer()
+        }.padding(20)
+        .onAppear { model.refreshPrices() }
+    }
+
     // MARK: Privacy
 
     private var privacyTab: some View {
@@ -281,6 +340,112 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 6) {
             Text("•")
             Text(text)
+        }
+    }
+}
+
+/// One model's prices, editable in place.
+///
+/// The text field holds a `String` rather than a `Decimal` on purpose: a partially
+/// typed price must not be parsed, rounded or rejected mid-keystroke. It is parsed
+/// on submit, and an unparseable field is simply left alone — never coerced to 0,
+/// which would save a price the user did not mean and then quietly cost every
+/// session against it.
+private struct PriceRow: View {
+    let modelID: String
+    let store: AgentSessionStore?
+    /// Called after a successful save so the surrounding lists re-read the store.
+    /// Left as a closure rather than reaching for the shared model, so the row is
+    /// usable without one.
+    var onSaved: () -> Void = {}
+
+    @State private var input: String = ""
+    @State private var output: String = ""
+    @State private var problem: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(modelID).font(.system(.body, design: .monospaced))
+                Spacer()
+                if let problem {
+                    Text(problem).font(.caption).foregroundStyle(.orange)
+                }
+            }
+            HStack(spacing: 8) {
+                labelled("per input token")
+                TextField("0.0000015", text: $input)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+                    .focused($focused)
+                    .onSubmit { commit(.input, input) }
+                labelled("per output token")
+                TextField("0.000006", text: $output)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+                    .onSubmit { commit(.output, output) }
+                if input != stored(.input) || output != stored(.output) {
+                    Button("Save") {
+                        commit(.input, input)
+                        commit(.output, output)
+                    }
+                }
+            }
+        }
+        .onAppear { load() }
+        .padding(.vertical, 4)
+    }
+
+    private func labelled(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func stored(_ component: PriceComponent) -> String {
+        guard let entry = currentPrice(component) else { return "" }
+        return NSDecimalNumber(decimal: entry.pricePerToken).stringValue
+    }
+
+    private func currentPrice(_ component: PriceComponent) -> AgentSessionStore.ModelPrice? {
+        guard let store else { return nil }
+        return try? store.prices().first {
+            $0.modelID == modelID && $0.component == component
+        }
+    }
+
+    private func load() {
+        input = stored(.input)
+        output = stored(.output)
+        problem = nil
+    }
+
+    /// Parses and saves, or explains why not. Never writes a price it could not read.
+    private func commit(_ component: PriceComponent, _ text: String) {
+        guard let store else {
+            problem = "The session store is unavailable."
+            return
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            // An emptied field means "leave it alone", not "set it to nothing".
+            problem = nil
+            load()
+            return
+        }
+        guard ModelPriceEntry.isDecimalNumber(trimmed),
+              let value = Decimal(string: trimmed, locale: Locale(identifier: "en_US_POSIX"))
+        else {
+            problem = "Not a decimal number — try 0.0000015."
+            return
+        }
+        do {
+            try store.setPrice(value, modelID: modelID, component: component)
+            try store.flush()
+            problem = nil
+            load()
+            onSaved()
+        } catch {
+            problem = "Could not save: \(error.localizedDescription)"
         }
     }
 }
