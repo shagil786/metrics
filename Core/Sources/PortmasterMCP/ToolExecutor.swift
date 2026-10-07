@@ -396,6 +396,12 @@ public struct ToolExecutor: Sendable {
                 arguments["cache_read"], field: "cache_read"
             )
             let reasoning = try Self.optionalNonNegative(arguments["reasoning"], field: "reasoning")
+            // **Where there is to record, then which session.** The order is the
+            // point and it used to be the reverse: a CLI with no app answered "cannot
+            // tell which session this belongs to", which is true and tells the agent
+            // nothing, instead of the one thing that would fix it — start Portmaster.
+            // Both refusals are still reachable, in this order.
+            try sessionRecorder.requireAvailable()
             let note = try sessionRecorder.record(
                 sessionID: try requireSessionID(),
                 input: input, output: output,

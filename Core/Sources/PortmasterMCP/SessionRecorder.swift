@@ -13,6 +13,22 @@ import Foundation
 import PortmasterCore
 
 public protocol SessionRecording: Sendable {
+    /// Checks that this recorder can record at all, before a report is attributed to
+    /// a session.
+    ///
+    /// Its own step, and it is first, because **the two refusals are not equally
+    /// informative and the order used to be arbitrary.** `ToolExecutor` also refuses a
+    /// report with no session id, and whether that check ran before this one decided
+    /// which reason the caller read. "There is nowhere to record" is the more
+    /// fundamental absence and the one worth acting on: a caller told only "I cannot
+    /// tell which session this is" cannot do anything with that, while the recorder
+    /// refusal can name what to change. So the recorder answers first, and a recorder
+    /// that is fine being called stays silent here.
+    ///
+    /// The default is the "fine" case, so adding a recorder does not have to
+    /// implement this to be usable.
+    func requireAvailable() throws
+
     /// Appends one self-reported usage observation against a session the caller
     /// already owns. Returns a sentence the caller can hand back to the agent, so a
     /// refusal and a success are both legible.
@@ -23,6 +39,11 @@ public protocol SessionRecording: Sendable {
         sessionID: UUID,
         input: Int, output: Int, cacheRead: Int?, reasoning: Int?, modelID: String
     ) throws -> String
+}
+
+extension SessionRecording {
+    /// Available by default: a recorder that cannot record says so by overriding this.
+    public func requireAvailable() throws {}
 }
 
 /// Writes into the SwiftData store. Fails loudly rather than swallowing: a report
@@ -43,6 +64,11 @@ public struct StoreSessionRecorder: SessionRecording {
     public init(store: AgentSessionStore) {
         self.store = store
     }
+
+    /// Available — and saying so with nothing is the point: a refusal here would be a
+    /// claim about *this* report's session id, which `ToolExecutor` checks separately
+    /// and better, because it is the one that has the id in hand.
+    public func requireAvailable() throws {}
 
     public func record(
         sessionID: UUID,
@@ -65,14 +91,29 @@ public struct StoreSessionRecorder: SessionRecording {
 /// accepted and dropped — an agent told "recorded" when nothing was is worse than
 /// one told it cannot report.
 public struct UnavailableSessionRecorder: SessionRecording {
-    public init() {}
+    private let message: String
+
+    /// - Parameter message: why there is nowhere to record. The default names the
+    ///   absence; a caller that knows *why* passes its own, because "no store" and
+    ///   "no app to own the store" send the reader to different places. The default
+    ///   exists so a caller with nothing to add cannot accidentally invent a reason.
+    public init(
+        message: String = "Portmaster has no session store available, so this report was not recorded."
+    ) {
+        self.message = message
+    }
+
+    /// Refuses here rather than in `record`, so the reason is given **before** a
+    /// report is attributed to a session it has nowhere to store. See
+    /// `SessionRecording.requireAvailable`.
+    public func requireAvailable() throws {
+        throw MCPToolError(message: message)
+    }
 
     public func record(
         sessionID: UUID,
         input: Int, output: Int, cacheRead: Int?, reasoning: Int?, modelID: String
     ) throws -> String {
-        throw MCPToolError(
-            message: "Portmaster has no session store available, so this report was not recorded."
-        )
+        throw MCPToolError(message: message)
     }
 }

@@ -156,7 +156,8 @@ final class ClientRegistry: @unchecked Sendable {
 
 // MARK: - Recording
 
-/// Stamps a connection's `lastCallAt` every time a call is asked of the context.
+/// Stamps a connection's `lastCallAt` every time a call is asked of the context, and
+/// carries which connection this decorator stands for.
 ///
 /// The stamp is the point, and it is exact: `MCPToolCalling.call` is reached once per
 /// `tools/call` and never once per process, so this fires for tool calls and for
@@ -165,12 +166,38 @@ final class ClientRegistry: @unchecked Sendable {
 /// Forwards rather than replacing, so the shared provider and the shared sampler
 /// behind `base` survive — and so nothing about who *answers* a call is changed by
 /// the fact that we are watching it.
+///
+/// **This is where the session id lives, and the reason it lives here is structural
+/// rather than stylistic.** One of these is built per connection, over a `base` that
+/// is shared by all of them. A session held on `base` would be one id for every
+/// connection the host ever serves; one held here cannot be, because there is no here
+/// for two connections to share. The distinction is invisible while a single
+/// connection reports and produces a wrong number — a valid id, an existing row, a
+/// read that succeeds — the moment a second one does.
 struct RecordingContext: MCPToolCalling {
     let base: any MCPToolCalling
+    /// Which connection this context speaks for, or nil when its session row could
+    /// not be written. Nil propagates: `base` then refuses an unattributable report
+    /// rather than inventing an id for it.
+    let session: MCPConnectionSession?
     let onCall: @Sendable () -> Void
 
     func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+        await call(name: name, arguments: arguments, session: session)
+    }
+
+    /// The session-aware overload, which ignores a session handed in from outside and
+    /// answers with its own.
+    ///
+    /// A call arrives here from `MCPDispatch`, which knows only a name and arguments.
+    /// Were this to prefer an incoming session over its own, a caller that reached the
+    /// decorator could stamp one connection's report with another's id — the same
+    /// wrong number as putting the id on the shared context, arrived at from the other
+    /// direction. The decorator is the connection, so it is the authority.
+    func call(
+        name: String, arguments: [String: String], session _: MCPConnectionSession?
+    ) async -> ToolOutcome {
         onCall()
-        return await base.call(name: name, arguments: arguments)
+        return await base.call(name: name, arguments: arguments, session: session)
     }
 }

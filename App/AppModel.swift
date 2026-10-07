@@ -19,6 +19,21 @@ final class AppModel: ObservableObject {
     var historyStore: HistoryStore?
     private(set) var historyReader: HistoryReader?
     @Published private(set) var historyError: String?
+    /// Agent sessions and their token usage, opened once and owned here for the app's
+    /// whole life — the same shape and the same reason as `historyStore` above.
+    ///
+    /// **Owned rather than opened per call**, and that is not tidiness: the MCP tool
+    /// surface builds a fresh `ToolExecutor` for every call by design (so the
+    /// permission gate re-reads the policy each time), so a store opened there would
+    /// be a store per call — many `ModelContext`s over one file, each with a lock that
+    /// only excludes the others inside this process.
+    ///
+    /// `nil` is a real state, not a failure to construct: the app then serves every
+    /// other tool normally and `report_usage` refuses with a reason. Opening a
+    /// database is allowed to fail, and pretending otherwise would mean an MCP client
+    /// reporting tokens into a store nobody can read.
+    var agentSessionStore: AgentSessionStore?
+    private(set) var agentSessionError: String?
     /// Kept for the detail sheet's on-demand lookups (path/args/cwd).
     private(set) var processCollectorRef: ProcessCollector?
 
@@ -93,6 +108,16 @@ final class AppModel: ObservableObject {
             historyReader = historyStore?.makeReader()
         } catch {
             historyError = (error as? HistoryStore.StoreError)?.errorDescription
+                ?? error.localizedDescription
+        }
+
+        // Separate from the history store, and separate in the `catch` too: two files
+        // that fail independently must not take each other down, or one unreadable
+        // database would look like both were gone.
+        do {
+            agentSessionStore = try AgentSessionStore()
+        } catch {
+            agentSessionError = (error as? AgentSessionStore.StoreError)?.errorDescription
                 ?? error.localizedDescription
         }
 

@@ -145,6 +145,67 @@ public protocol MCPToolCalling: Sendable {
     /// Runs one call and reports it as data, never as a thrown error: a failure is
     /// something the host has to render.
     func call(name: String, arguments: [String: String]) async -> ToolOutcome
+
+    /// Runs one call that arrived on a known connection, or did not.
+    ///
+    /// **The session is a parameter and never state.** `HostMCPCallContext` is built
+    /// once and shared by every connection the socket host admits, so an id held on
+    /// it would stamp each connection's reports with the same one — silent, valid,
+    /// and wrong, which is the failure this whole design is shaped against. Passing
+    /// it per call makes "which connection" unanswerable at construction time.
+    ///
+    /// Required rather than defaulted, so a new call surface cannot compile without
+    /// answering the question. The default implementation below exists for the
+    /// surfaces whose answer is genuinely "there is no connection".
+    func call(
+        name: String, arguments: [String: String], session: MCPConnectionSession?
+    ) async -> ToolOutcome
+}
+
+extension MCPToolCalling {
+    /// A surface that cannot name a connection drops the session rather than
+    /// inventing one.
+    ///
+    /// Dropping is the safe direction and the only honest one available here: the
+    /// refusal that follows names the absence, where guessing would file a report
+    /// under a connection nobody made. `ToolExecutor.requireSessionID` is what
+    /// refuses, and it is why a surface that declines to bind an id must not be
+    /// given one to forward.
+    ///
+    /// **No surface that answers a relayed call may use this.** The relay client is
+    /// the case that looks like an exception and is not: it is a client on one side of
+    /// a socket, and the session belongs to the connection at the other end, which
+    /// this process cannot see. Dropping it is what leaves the app free to attribute
+    /// the report to the connection it actually arrived on.
+    public func call(
+        name: String, arguments: [String: String], session _: MCPConnectionSession?
+    ) async -> ToolOutcome {
+        await call(name: name, arguments: arguments)
+    }
+}
+
+/// One authenticated connection, as the tool path sees it.
+///
+/// A value rather than a bare `UUID` because the identity is three facts that only
+/// make sense together — which connection, whose process, since when — and a bare
+/// id at the call site would invite the first two to be re-derived somewhere else.
+/// Only `id` is read downstream: the peer pid and connect time exist for the row
+/// `MCPHostServer` writes at accept time, and carrying them together is what keeps
+/// that row and the executor's `sessionID` describing the same connection.
+///
+/// Absence is `nil`, never a fabricated id: a report filed under an id no session
+/// row names passes every check and is invisible to every session-scoped read.
+public struct MCPConnectionSession: Sendable, Equatable {
+    public let id: UUID
+    /// `LOCAL_PEERPID`. 0 when the kernel will not say — the connection is real.
+    public let pid: Int32
+    public let connectedAt: Date
+
+    public init(id: UUID, pid: Int32, connectedAt: Date) {
+        self.id = id
+        self.pid = pid
+        self.connectedAt = connectedAt
+    }
 }
 
 /// The on-demand context: one real provider and the real audit log, plus a gate
@@ -153,6 +214,33 @@ public protocol MCPToolCalling: Sendable {
 /// Slice 1 has no `MCPHost`, so `confirmEach` always denies with its documented
 /// message — the app has no way to be asked, and no path here pretends otherwise.
 public struct LocalMCPCallContext: MCPToolCalling {
+    /// What a refused `report_usage` says on this path, and **why the CLI is left
+    /// unwired on purpose.**
+    ///
+    /// Two reasons, and the second is the one that would have been easiest to miss.
+    ///
+    /// The obvious one: this stdio session is not an MCP *connection*. It has no peer
+    /// pid, no client name, and it ends when the pipe ends, so there is no connection
+    /// to attribute a report to — and minting a row for it anyway would put a session
+    /// in the user's history that no agent ever held.
+    ///
+    /// The one that decides it: **wiring the CLI would mean opening the app's SQLite
+    /// file from a second process.** `AgentSessionStore`'s `NSLock` is a per-process
+    /// lock. It serialises two threads inside one `portmaster-mcp` and does nothing at
+    /// all for the app's writer in another process. SQLite's own file locking would
+    /// keep two writers from corrupting the file, and that is a much weaker guarantee
+    /// than it looks: a report this process acknowledges to an agent can still be
+    /// absent from the file the app later reads, because nothing coordinates the two
+    /// `ModelContext`s. A refusal is visible; a lost record the agent was told was
+    /// saved is a wrong number, which is the failure everything here exists to
+    /// prevent.
+    ///
+    /// So the CLI refuses with a reason, and the app — which really does have
+    /// connections — records.
+    public static let noSessionNote =
+        "Portmaster is not running, so this session has nowhere to record usage. "
+        + "Start Portmaster and this report will be recorded."
+
     /// Built once, in `init`, and shared by every call. A provider owns a
     /// `LiveSnapshotSource`, which owns a `SamplingEngine`, which owns the
     /// snapshot cache — so a per-call provider means a per-call engine, and the
@@ -197,6 +285,18 @@ public struct LocalMCPCallContext: MCPToolCalling {
         await makeExecutor().execute(name: name, arguments: arguments)
     }
 
+    /// A call with no connection behind it, which is every call on this path.
+    ///
+    /// Declared rather than left to the protocol's default so the decision is visible
+    /// here: this is the one surface where refusing `report_usage` is the answer, and
+    /// the reason it gives (`noSessionNote`) is this type's own. `makeExecutor` supplies
+    /// the recorder that refuses with it.
+    public func call(
+        name: String, arguments: [String: String], session _: MCPConnectionSession?
+    ) async -> ToolOutcome {
+        await call(name: name, arguments: arguments)
+    }
+
     /// A ready-to-run executor, built fresh for one call.
     ///
     /// Slice 1's seam, kept as it was rather than inlined into `call`, because both of
@@ -218,7 +318,12 @@ public struct LocalMCPCallContext: MCPToolCalling {
             provider: provider,
             gate: PermissionGate(settings: loadSettings(), appRunning: appRunning()),
             audit: AuditLog(directory: auditDirectory),
-            settingsDirectory: settingsDirectory
+            settingsDirectory: settingsDirectory,
+            // Refuses with this path's own reason. Nothing is opened: a second writer
+            // over the app's SQLite file is not something a per-process lock covers,
+            // and this process has no connection to attribute a report to anyway.
+            // See `noSessionNote`.
+            sessionRecorder: UnavailableSessionRecorder(message: Self.noSessionNote)
         )
     }
 }

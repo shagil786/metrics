@@ -60,6 +60,16 @@ public struct HostMCPCallContext: MCPToolCalling {
     private let appRunning: @Sendable () -> Bool
     private let auditDirectory: URL?
     private let settingsDirectory: URL?
+    /// Where `report_usage` appends. Shared, unlike the session id beside it: the
+    /// store is one object with its own lock, opened once by `AppModel`, and every
+    /// connection's records go into it. `nil` refuses the tool with a reason.
+    ///
+    /// **The session id is not here, and could not be.** This context is constructed
+    /// once (`MCPHostController.makeContext`) and handed to every connection the
+    /// socket host will serve, so a session stored on it would stamp all of them with
+    /// one id — valid UUIDs, existing rows, successful reads, all of them naming the
+    /// wrong connection. The id arrives per call instead; see `MCPConnectionSession`.
+    private let sessionRecorder: any SessionRecording
 
     /// - Parameters:
     ///   - provider: the app's own data. `LiveDataProvider` in production.
@@ -75,6 +85,8 @@ public struct HostMCPCallContext: MCPToolCalling {
     ///     so the two cannot disagree about what "running" means.
     ///   - auditDirectory: where mutation attempts are recorded.
     ///   - settingsDirectory: where `mcpMode` is written.
+    ///   - sessionRecorder: where `report_usage` appends. `nil` refuses the tool with
+    ///     a reason rather than accepting a report that would be dropped.
     public init(
         provider: any DataProvider,
         broker: ConfirmationBroker,
@@ -82,7 +94,8 @@ public struct HostMCPCallContext: MCPToolCalling {
         loadSettings: @escaping @Sendable () -> MCPSettings = { MCPSettings.load() },
         appRunning: @escaping @Sendable () -> Bool = { AppLiveness.isPortmasterRunning() },
         auditDirectory: URL? = nil,
-        settingsDirectory: URL? = nil
+        settingsDirectory: URL? = nil,
+        sessionRecorder: (any SessionRecording)? = nil
     ) {
         self.provider = provider
         self.broker = broker
@@ -91,16 +104,34 @@ public struct HostMCPCallContext: MCPToolCalling {
         self.appRunning = appRunning
         self.auditDirectory = auditDirectory
         self.settingsDirectory = settingsDirectory
+        self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
     }
 
+    /// The two-argument entry point, for a call that arrived with no connection behind
+    /// it.
+    ///
+    /// It forwards `session: nil` rather than holding an id, which is why a context
+    /// used this way refuses `report_usage`: there is genuinely no connection to
+    /// attribute it to, and the refusal says so.
     public func call(name: String, arguments: [String: String]) async -> ToolOutcome {
+        await call(name: name, arguments: arguments, session: nil)
+    }
+
+    /// Answers one call that arrived on `session`.
+    ///
+    /// The session travels through here as data and reaches exactly one place — the
+    /// `ToolExecutor` built for this call — so a connection's reports are stamped with
+    /// that connection's id and no other.
+    public func call(
+        name: String, arguments: [String: String], session: MCPConnectionSession?
+    ) async -> ToolOutcome {
         // The catalog's `effect`, never the caller's account of what it is asking
         // for. An unknown name has no declared effect, so it is treated as a read
         // and refused by the executor as before.
         guard let tool = ToolExecutor.catalog.first(where: { $0.name == name }),
             tool.effect == .mutation
         else {
-            return await run(name: name, arguments: arguments)
+            return await run(name: name, arguments: arguments, session: session)
         }
 
         // Normalized by the executor's own code, so the question a person is asked
@@ -146,7 +177,10 @@ public struct HostMCPCallContext: MCPToolCalling {
         guard settings.mode == .confirmEach else {
             // `.off` and `.allowSession` are `PermissionGate`'s answers, including
             // its liveness check — one policy, not two.
-            return await run(name: name, arguments: normalized, gate: makeGate(for: settings))
+            return await run(
+                name: name, arguments: normalized,
+                gate: makeGate(for: settings), session: session
+            )
         }
 
         let request = Self.request(for: tool, arguments: normalized)
@@ -164,7 +198,8 @@ public struct HostMCPCallContext: MCPToolCalling {
                     return abandoned(name: name, arguments: normalized, audit: audit)
                 }
                 return await run(
-                    name: name, arguments: normalized, gate: Self.approvedGate
+                    name: name, arguments: normalized,
+                    gate: Self.approvedGate, session: session
                 )
             case .denied(let reason):
                 return refusal(
@@ -279,17 +314,30 @@ public struct HostMCPCallContext: MCPToolCalling {
     private func run(
         name: String,
         arguments: [String: String],
-        gate: PermissionGate? = nil
+        gate: PermissionGate? = nil,
+        session: MCPConnectionSession?
     ) async -> ToolOutcome {
-        await executor(gate).execute(name: name, arguments: arguments)
+        await executor(gate, session: session).execute(name: name, arguments: arguments)
     }
 
-    private func executor(_ gate: PermissionGate? = nil) -> ToolExecutor {
+    /// The executor for one call, carrying the id of the connection that made it.
+    ///
+    /// Built per call, and that is what makes the session binding per call too: there
+    /// is nowhere to cache an executor, so there is nowhere for a stale connection's
+    /// id to survive between two calls. The recorder is the opposite — one store for
+    /// the app's life — and it takes the id per record, which is why it never holds
+    /// one: an id in the recorder would be shared by every connection exactly as
+    /// surely as one on this context.
+    private func executor(
+        _ gate: PermissionGate? = nil, session: MCPConnectionSession?
+    ) -> ToolExecutor {
         ToolExecutor(
             provider: provider,
             gate: gate ?? makeGate(for: loadSettings()),
             audit: AuditLog(directory: auditDirectory),
-            settingsDirectory: settingsDirectory
+            settingsDirectory: settingsDirectory,
+            sessionRecorder: sessionRecorder,
+            sessionID: session?.id
         )
     }
 

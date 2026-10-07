@@ -639,14 +639,18 @@ struct MCPHostHarness {
     /// holds on Darwin. The name here is short so the socket always fits.
     static func make(
         _ test: XCTestCase,
-        socketName: String = "mcp.sock"
+        socketName: String = "mcp.sock",
+        context: (any MCPToolCalling)? = nil,
+        sessionStore: AgentSessionStore? = nil
     ) throws -> MCPHostHarness {
         let directory = try test.makeTemporaryDirectory(prefix: "pm")
         let socketURL = directory.appendingPathComponent(socketName)
         let host = MCPHostServer(
             socketURL: socketURL,
             endpointDirectory: directory,
-            context: StubMCPContext(auditDirectory: directory, settingsDirectory: directory)
+            context: context
+                ?? StubMCPContext(auditDirectory: directory, settingsDirectory: directory),
+            sessionStore: sessionStore
         )
         let harness = MCPHostHarness(
             host: host, socketURL: socketURL, endpointDirectory: directory

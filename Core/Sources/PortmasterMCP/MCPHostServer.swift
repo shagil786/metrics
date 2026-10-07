@@ -38,6 +38,7 @@
 
 import Foundation
 import MCP
+import PortmasterCore
 
 #if canImport(Darwin)
     import Darwin
@@ -62,6 +63,15 @@ public final class MCPHostServer: @unchecked Sendable {
     private let boundSocketURL: URL
     private let endpointDirectory: URL?
     private let context: any MCPToolCalling
+    /// Where a connection's session row is written at accept time.
+    ///
+    /// Separate from `context`'s recorder on purpose even though both come from the
+    /// same store: the two happen at different moments for different reasons. This one
+    /// answers "who connected", once, before any tool has been asked anything — and it
+    /// must, because `recordUsage` is a bare insert with no referential check, so a
+    /// session id handed to a tool before its row exists produces an orphan record
+    /// that passes every check and is invisible to every session-scoped read.
+    private let sessionStore: AgentSessionStore?
 
     private let lock = NSLock()
     /// The token this launch minted. Read by the handshake check and nowhere else:
@@ -96,10 +106,20 @@ public final class MCPHostServer: @unchecked Sendable {
     ///     the token would be real.
     ///   - context: the shared call context. Built once and shared by every connection —
     ///     see the note at the top of this file.
-    public init(socketURL: URL, endpointDirectory: URL?, context: any MCPToolCalling) {
+    ///   - sessionStore: the app's long-lived `AgentSessionStore`, which this host writes
+    ///     a session row into for each connection it admits. `nil` is the honest
+    ///     "cannot record sessions" case: connections still serve, and `report_usage`
+    ///     refuses with a reason rather than filing a record nothing can read.
+    public init(
+        socketURL: URL,
+        endpointDirectory: URL?,
+        context: any MCPToolCalling,
+        sessionStore: AgentSessionStore? = nil
+    ) {
         self.boundSocketURL = socketURL
         self.endpointDirectory = endpointDirectory
         self.context = context
+        self.sessionStore = sessionStore
     }
 
     public var socketURL: URL { boundSocketURL }
@@ -386,6 +406,16 @@ public final class MCPHostServer: @unchecked Sendable {
             return
         }
 
+        // **The session row is written here, at accept, before any tool call.** Not at
+        // first `report_usage`: `recordUsage` is a bare `context.insert` with no
+        // referential check, so a wiring that supplies the id before the row exists
+        // produces an orphan record — present, valid, counted by nothing, and invisible
+        // to every session-scoped read. One id, one row, one binding: `identifier` is
+        // minted once above and is the same value in both places below.
+        let session = recordSession(
+            id: identifier, pid: pid, connectedAt: connection.client.connectedAt
+        )
+
         let transport = UnixSocketTransport(
             socket: socket,
             // Whatever arrived past the handshake newline in the same read. A client
@@ -400,7 +430,20 @@ public final class MCPHostServer: @unchecked Sendable {
         // Wrapped, not replaced: the executor still comes from the caller's context, so
         // the shared provider and the shared sampler survive, while the decorator gets
         // to see that a call happened at all.
-        let recording = RecordingContext(base: context) { connection.recordCall() }
+        //
+        // **The session is bound here, on the per-connection decorator — never on the
+        // shared `context` above.** `HostMCPCallContext` is built once and handed to
+        // every connection this host will ever serve, so an id placed on it would
+        // stamp each connection's reports with the same one. Nothing about that
+        // failure looks like a failure: every id is a valid UUID, every row exists,
+        // every read succeeds — and every one of them names the wrong connection. It
+        // is invisible until two connections report, which is why it is one `let` here
+        // and never a field on anything shared.
+        let recording = RecordingContext(
+            base: context,
+            session: session,
+            onCall: { connection.recordCall() }
+        )
 
         do {
             // The relayed drain, named explicitly. This is one end of a relay whose other
@@ -436,6 +479,42 @@ public final class MCPHostServer: @unchecked Sendable {
 
     private func readerDidExit() {
         lock.withLock { liveReaders -= 1 }
+    }
+
+    /// Writes the session row for one connection, and answers the session the tool
+    /// path should attribute that connection's reports to.
+    ///
+    /// `nil` when there is no store, and `nil` when the write failed. Both are the
+    /// same answer on purpose: a `session` whose row is not in the file is exactly
+    /// the orphan `recordUsage` would happily create, so a failed accept-time write
+    /// must cost the connection its attribution rather than hand the id out anyway.
+    /// The refusal that follows names the absence, which is the truth.
+    ///
+    /// The row is written with `clientName` and `clientVersion` absent because this
+    /// host never reads the MCP `initialize` — the SDK consumes it, and nothing here
+    /// sees it. `nil` is honest; a name invented from the socket path would not be.
+    private func recordSession(
+        id: UUID, pid: pid_t, connectedAt: Date
+    ) -> MCPConnectionSession? {
+        let session = MCPConnectionSession(id: id, pid: pid, connectedAt: connectedAt)
+        guard let sessionStore else { return nil }
+        do {
+            try sessionStore.recordSession(
+                id: session.id, peerPID: session.pid,
+                clientName: nil, clientVersion: nil,
+                connectedAt: session.connectedAt
+            )
+            try sessionStore.flush()
+            return session
+        } catch {
+            // Logged rather than swallowed: a silent failure here reads as "this agent
+            // never reported", which is the one explanation that is wrong.
+            MCPDiagnostics.hostFailure(
+                "could not record an MCP session",
+                detail: "pid \(pid): \(error)"
+            )
+            return nil
+        }
     }
 
     // MARK: - The handshake

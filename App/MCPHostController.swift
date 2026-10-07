@@ -143,7 +143,12 @@ final class MCPHostController: ObservableObject {
         let started = MCPHostServer(
             socketURL: Self.socketURL(in: directory),
             endpointDirectory: directory,
-            context: makeContext()
+            context: makeContext(),
+            // The app's own store, opened once by `AppModel`. `nil` is a real answer —
+            // it refuses `report_usage` with a reason — and it is passed through rather
+            // than defaulted, so a store that failed to open cannot be papered over by
+            // the host inventing one.
+            sessionStore: AppModel.shared.agentSessionStore
         )
         do {
             try started.start()
@@ -282,7 +287,12 @@ final class MCPHostController: ObservableObject {
             loadSettings: { MCPSettings.load(directory: directory) },
             appRunning: { AppLiveness.isPortmasterRunning() },
             auditDirectory: directory,
-            settingsDirectory: directory
+            settingsDirectory: directory,
+            // The recorder only. **The session id is deliberately not here** — it would
+            // be shared by every connection this host ever serves, and each one's
+            // reports would then carry the same id. `MCPHostServer` binds one per
+            // connection, at accept time, and passes it down per call.
+            sessionRecorder: AppModel.shared.agentSessionStore.map(StoreSessionRecorder.init)
         )
     }
 
