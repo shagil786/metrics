@@ -94,7 +94,24 @@ targets:
         INFOPLIST_FILE: Support/Info.plist
         CODE_SIGN_ENTITLEMENTS: Support/Portmaster.entitlements
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
-        ENABLE_HARDENED_RUNTIME: "YES"
+        # Hardened runtime is REQUIRED for notarization — `--options runtime` is not
+        # something notarization will accept a build without. It is off here because
+        # it makes the app unlaunchable on any machine that does not have an
+        # Apple-issued Developer ID to sign with: the runtime enables library
+        # validation, which requires every loaded image to carry the same Team ID as
+        # the main executable, and a self-signed certificate has none.
+        #
+        # Measured on this repository's Release build: signed ad-hoc or with the
+        # self-signed "Sotto Dev" identity, a hardened bundle dies at dyld with
+        # "mapping process and mapped file have different Team IDs" because Sparkle
+        # sits in Contents/Frameworks. The identical bundle signed without the
+        # hardened runtime launches.
+        #
+        # `scripts/sign-and-notarize.sh` re-applies `--options runtime` when it finds
+        # an identity that has a Team ID, so a real Developer ID build is hardened as
+        # notarization requires. Enabling this here would harden a bundle that no
+        # available certificate can make launchable.
+        ENABLE_HARDENED_RUNTIME: "NO"
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "1.0"
       configs:

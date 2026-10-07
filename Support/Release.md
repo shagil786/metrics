@@ -19,7 +19,9 @@ Package an already exported app:
 ./scripts/package-dmg.sh /absolute/export/Portmaster.app /absolute/releases/Portmaster-1.0.dmg
 ```
 
-The script verifies the app signature, preserves bundle symlinks/permissions, includes the app and an Applications shortcut, refuses to overwrite an existing output, and verifies the image. It does **not** sign, notarize, install, or publish anything. A development image is labeled as such. For public distribution, sign the DMG with Developer ID, notarize it and staple the ticket using your existing Apple signing credentials.
+The script verifies the app signature, preserves bundle symlinks/permissions, includes the app and an Applications shortcut, refuses to overwrite an existing output, and verifies the image. It does **not** sign, notarize, install, or publish anything. A development image is labeled as such.
+
+Sign first, with `scripts/sign-and-notarize.sh`, then package. It applies one identity to every nested code object — the embedded `portmaster-mcp`, Sparkle's `Autoupdate`, `Updater.app`, and its XPC services — deepest first, so no binary inside the bundle is left with a signature that differs from the app's. `--ad-hoc` is available for local use and is not distributable. Notarization runs automatically when an Apple-issued `Developer ID Application` identity and stored `notarytool` credentials are both present; it has never been exercised in this repository, so treat that step as unverified.
 
 After notarization, run Sparkle's `generate_appcast` on your release archive directory using your signing key; host the generated appcast and archives at the configured HTTPS release location. Test an actual older signed/notarized build upgrading to a newer one before calling update delivery verified. Do not hand-write signatures or substitute an invented host.
 

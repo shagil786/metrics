@@ -44,6 +44,24 @@ lipo -archs ~/Library/Developer/Xcode/DerivedData/Portmaster-*/Build/Products/Re
 # expect: arm64 x86_64
 ```
 
+### Signing a release build
+
+The Release build is not signed by `xcodebuild`, and `scripts/package-dmg.sh` re-signs nothing — it only packages a bundle that is already signed. Signing is a separate step, and skipping it produces a build that fails on the first launch rather than at distribution time:
+
+```sh
+scripts/sign-and-notarize.sh --identity "Developer ID Application: …" \
+  ~/Library/Developer/Xcode/DerivedData/Portmaster-*/Build/Products/Release/Portmaster.app
+scripts/package-dmg.sh <that path> /absolute/output.dmg
+```
+
+Every nested code object is signed with the app's identity, deepest first: the embedded `portmaster-mcp`, Sparkle's `Autoupdate`, `Updater.app` and its XPC services, then the framework, then the app. A nested executable left with a different signature is the specific failure this exists to prevent — Gatekeeper checks each one separately, so the app would open while the Settings page's "Copy install command" names a binary that will not start.
+
+`--ad-hoc` signs for local use with no certificate. That build runs on your machine and anywhere Gatekeeper is overridden, and is not distributable.
+
+**The hardened runtime is off by default and re-applied by the script when it has a Team ID to apply it to.** `--options runtime` is required for notarization, but it also enables library validation, which requires every loaded image to share the main executable's Team ID. Neither an ad-hoc nor a self-signed certificate has one, so a hardened bundle signed with either dies at dyld before it draws a window — measured on this repository's own Release build, which could not launch at all until the flag was dropped. The script detects the missing Team ID and says so rather than emitting a bundle that looks signed and does not run.
+
+Notarization itself has **never been run** in this repository: there is no Apple-issued `Developer ID Application` certificate available, and `notarytool` needs stored credentials. Everything up to the notarization submit is exercised; everything after it is written from Apple's documented requirements and has not been observed. Treat a release as unverified at that step.
+
 Core tests (parser, attribution, sampling math, plus live-system smoke tests):
 
 ```sh
@@ -199,7 +217,7 @@ The line is written *after* the action for `allowed`/`failed`, so for anything t
 - **`get_temperatures_fans` separates "nothing observed yet" from "nothing readable".** The SMC pass runs on the sampler’s slow lane and lands a tick after it is kicked, so the first read on a cold sampler has no reading at all — and answering `available: false` for that would be a claim about the hardware that nothing observed. While no sensor reading has been observed the tool refuses with *“Temperature and fan readings are not known yet; no sensor reading has been observed.”* Retry a moment later. Once a pass has read the SMC the payload says which answer it carries in `availability`: `"available"` with the readings, or `"noSensors"` when a completed pass over a readable SMC produced no plausible reading (`available: false`, and no reading invented for a sensor that said none). `"noSensors"` is what this collector verified, not a claim about the hardware: it decodes `flt `/`sp78` temperature keys and plausible values only, so a Mac whose sensors answer in another type reads the same way. `available` stays as a convenience flag for callers that read only that one field, and `get_system_overview`’s `thermal` section carries the same two fields.
 - **Reads have a ~10 s budget.** The first read on a cold sampler waits for a full process sweep, port scan and `nettop` pass. If that budget expires the tool says *"No reading available yet; the sampler is still starting."* instead of returning zeros — retry a moment later.
 - **`stop_container` shells out to Docker.** It runs `docker stop -- <id>` with fixed argv (no shell), so Docker must be installed with the daemon up.
-- **The app's slice of this server is build-verified, not exercised by CI.** `scripts/mcp-e2e.sh` drives the real CLI against a real app build — socket, catalog, refusal, audit line, and the confirmation up to the point where a person must click. Run it unattended with `--no-manual`, which asserts everything up to that click and reports the click itself as `SKIP` rather than pretending it passed:
+- **The app's slice of this server is not exercised by CI.** `scripts/mcp-e2e.sh` drives the real CLI against a real app build — socket, catalog, refusal, audit line, and the confirmation. Run it unattended with `--no-manual`, which asserts everything up to that click and reports the click itself as `SKIP` rather than pretending it passed:
 
   ```sh
   scripts/mcp-e2e.sh --no-manual \
@@ -215,7 +233,7 @@ The line is written *after* the action for `allowed`/`failed`, so for anything t
 - Direct distribution build (App Sandbox **off**). That's what makes per-process metrics, project attribution, and stop actions possible; a sandboxed Mac App Store build would show "Unattributed" for other apps' processes and would have stop actions disabled.
 - Hardened runtime is on; the app is ad-hoc signed for local development. For wider distribution it needs Developer ID signing and notarization — and that is **not** configuration only: the signing step below has to reach inside the bundle.
 - **The bundled `portmaster-mcp` is signed ad-hoc, and that is not release-ready.** The app's post-build script signs the nested executable with `codesign -s -`, which is enough to run it from a locally built app and nothing more: a nested executable has to carry the app's own **Developer ID** signature for Gatekeeper on another Mac, and `scripts/package-dmg.sh` re-signs nothing. **A released build has to sign the bundle once, deepest first, before packaging** — `Contents/Resources/portmaster-mcp`, then the app. Until that exists, a notarized app would ship a CLI that Gatekeeper refuses, and the Settings page would name a path that does not work on a user's machine. Nothing here has been checked against a notarized copy.
-- [Local DMG packaging and signed-update setup](Support/Release.md): the installer includes an Applications shortcut. Sparkle checks are disabled until a real HTTPS feed and Ed25519 public key are configured. Developer ID signing/notarization and actual update delivery remain release work.
+- [Local DMG packaging and signed-update setup](Support/Release.md): the installer includes an Applications shortcut. Sparkle checks are disabled until a real HTTPS feed and Ed25519 public key are configured. Signing is handled by `scripts/sign-and-notarize.sh` (see [Signing a release build](#signing-a-release-build)); notarization and actual update delivery remain release work, because neither has an Apple-issued Developer ID certificate available here.
 - New installs see a welcome screen; legacy preferences skip it. Welcome can be reopened from Settings → Privacy. Notification permission is requested through an explicit Alerts action rather than at launch.
 - Launch-at-login uses `SMAppService` (macOS 13+); if approval is pending, Settings shows the exact status.
 

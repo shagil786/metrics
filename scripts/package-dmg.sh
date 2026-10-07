@@ -1,28 +1,18 @@
 #!/bin/bash
-# Packages an already-built app without modifying or re-signing it.
+# Packages an already-signed app without modifying its signature.
 #
-# THE NEXT STEP FOR A RELEASE IS HERE, AND IT IS NOT DONE. This script re-signs
-# nothing, so whatever signature the app arrived with is the signature it ships
-# with. For a Developer ID build that is not enough: the nested
-# `Contents/Resources/portmaster-mcp` is ad-hoc signed by
-# `scripts/embed-mcp-cli.sh`, and a nested executable must carry the *app's* Developer
-# ID signature or Gatekeeper on another Mac refuses to run it — even when the app
-# itself is properly signed and notarized. The Settings page then names a binary that
-# will not start, which is the exact defect the embedded CLI exists to remove.
+# SIGNING IS NOT DONE HERE. Run `scripts/sign-and-notarize.sh` first, against a
+# universal Release build, and this only turns the signed bundle into a DMG.
 #
-# So a release build must sign the bundle once, deepest first, before this runs:
+# Why the order matters: `codesign --verify --deep` below checks the app's seal, but a
+# re-signed bundle is what this script refuses to accept. The nested
+# `Contents/Resources/portmaster-mcp` and Sparkle.framework each need the app's own
+# signature, and `scripts/sign-and-notarize.sh` is what applies it.
 #
-#   codesign --force --options runtime --timestamp \
-#     --sign "Developer ID Application: …" \
-#     "$app/Contents/Resources/portmaster-mcp"
-#   codesign --force --options runtime --timestamp \
-#     --sign "Developer ID Application: …" "$app"
-#   codesign --verify --deep --strict "$app"
-#   # then notarize, then package.
-#
-# Nothing in this repository has been run against a notarized copy, so the sequence
-# above is written down rather than demonstrated. Treat it as release work, not as
-# something already handled.
+# Notarization is deliberately not attempted here. It belongs to the signing step,
+# because notarization is per code object and has to happen before the bundle is
+# compressed — notarizing a DMG, or a bundle whose contents were re-signed afterwards,
+# produces a ticket that describes bytes that no longer exist.
 set -euo pipefail
 if [[ $# -ne 2 ]]; then
     echo 'Usage: package-dmg.sh /absolute/Portmaster.app /absolute/output.dmg' >&2
