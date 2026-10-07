@@ -727,6 +727,66 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertEqual(input, 900)
     }
 
+    /// What trimming does to a session that carried figures from **two** provenances.
+    ///
+    /// The single-provenance test above shows the figure surviving, and that holds only
+    /// because one provenance contributed. Here the old record is the only one its
+    /// provenance ever sent, so trimming it is not discarding a superseded figure — it
+    /// deletes a *source*. The session stops being a conflict and becomes a priced cost,
+    /// and the reported aggregate moves to whichever source is left, with nothing in the
+    /// output saying a retention sweep just chose between them.
+    ///
+    /// Pinned because this is the case `prune`'s own doc comment cannot promise away, and
+    /// because a test that pins it is what stops someone reading "aggregation reads the
+    /// latest per provenance" and concluding the trim is inert. It is inert only when the
+    /// trimmed records were not the latest for their provenance.
+    func testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let twoSources = UUID()
+        try store.recordSession(
+            id: twoSources, peerPID: 1, clientName: "two-sources", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-3_600)
+        )
+        // The only self-reported record, and it is the old one. The parse is newer, so
+        // this session is "still reporting" and lands in the trim group.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: twoSources, recordedAt: cutoff.addingTimeInterval(-600), input: 100,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "model-a",
+            provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: twoSources, recordedAt: cutoff.addingTimeInterval(60), input: 900,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "model-b",
+            provenance: .parsedFromLog
+        ))
+        // Both priced, so the cost after the sweep is not missing for want of a price —
+        // the sweep is the only thing that could have changed it.
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
+        try store.setPrice(Decimal(string: "0.000002")!, modelID: "model-b")
+        try store.flush()
+
+        // Before: two sources, two models, no figure anyone can trust.
+        XCTAssertEqual(try store.usage(for: twoSources),
+                       .reported(input: 100, output: 0, provenance: .selfReported))
+        XCTAssertEqual(try store.cost(for: twoSources), .conflict(models: ["model-a", "model-b"]))
+
+        store.prune(olderThan: cutoff, keepingSessionIDs: [])
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        XCTAssertEqual(
+            try reopened.usage(for: twoSources),
+            .reported(input: 900, output: 0, provenance: .parsedFromLog),
+            "the self-reported source is gone, so the aggregate is the parse's now"
+        )
+        XCTAssertEqual(
+            try reopened.cost(for: twoSources), .priced(usd: Decimal(string: "0.0018")!,
+                                                        priceTableVersion: 2),
+            "a conflict silently becomes a priced figure for whichever model is left — "
+                + "model-b's price, which is the second entry written, and nothing else"
+        )
+    }
+
     // MARK: - Price text is parsed strictly
 
     /// Text that is not a number must be *absent*, not *nearly* a number.

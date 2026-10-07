@@ -338,8 +338,27 @@ public final class AgentSessionStore: @unchecked Sendable {
     ///   left claiming it has not reported when its records were deleted underneath it
     ///   (`awaitingFirstReport` would be a lie) and never left with records and no row.
     /// - **kept, records trimmed** — stale but still reporting. Records older than the
-    ///   cutoff go; the newest survives, and since aggregation reads only the latest per
-    ///   provenance, every figure this store reports is unchanged.
+    ///   cutoff go, and that leaves the session's figures alone **only while every
+    ///   provenance that contributed still has a record at or after the cutoff.** With
+    ///   one provenance that holds: aggregation reads the latest record per provenance,
+    ///   and a superseded one is never the one it reads.
+    ///
+    ///   Across two it does not, and this comment used to claim otherwise. A session
+    ///   whose only `selfReported` record is older than the cutoff loses its whole source
+    ///   when that record goes, so the aggregate moves to the other provenance, and a
+    ///   session that was `conflict` — two models, one per source — becomes a priced
+    ///   figure for whichever model is left. Nothing in the output says a retention
+    ///   sweep just chose between them. Deleting the *superseded* record of a provenance
+    ///   that still has a newer one is inert; deleting the only record of one is not, and
+    ///   the trim cannot tell the two apart without looking.
+    ///
+    ///   No adapter ships and nothing calls `TokenSourceRunner` in the app, so no
+    ///   two-provenance session exists to be trimmed today; that is a reason it has no
+    ///   test-driven need to be clever, not a reason to promise it cannot happen. What
+    ///   would make trimming provably figure-preserving is usage recorded per provenance
+    ///   over time instead of a replaceable latest figure, which is a phase-C data
+    ///   model. `testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice` pins what
+    ///   happens until then.
     /// - **kept whole** — the host is serving it. Nothing of it is touched, including a
     ///   record older than the cutoff: if it were deleted the session would read as
     ///   never having reported. The connection is what bounds that growth.
