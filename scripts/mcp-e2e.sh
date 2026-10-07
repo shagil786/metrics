@@ -525,10 +525,24 @@ for line in open(sys.argv[1]):
     # confirmation may wait — so the process would exit, the socket would close and the
     # answer would never arrive. This script is not allowed to hold the product to a
     # client behaviour it does not have; see task-10-report.md for the honest note.
+    #
+    # The arguments are built into a variable FIRST, then passed unquoted-in-quotes as
+    # one word. Writing the JSON inline as
+    # `"$(tools_call 4 set_preference "{\"key\":\"…\"}")"` does not do what it looks
+    # like: the escaped quotes end the *outer* argument, so printf receives the
+    # arguments as separate words and emits one malformed tools/call per piece —
+    # `arguments":"key":…` and `arguments":"value":…`. The SDK rejected both as parse
+    # errors and the real set_preference was never sent, so no confirmation was ever
+    # requested, so no audit line ever appeared. The two failures below ("no audit line
+    # appeared for the confirmed set_preference" and "the confirmed call answered on the
+    # socket") were this, not the confirmation machinery: nothing had been asked of it.
+    # Verified by dumping the session's own transcript — two `-32700` parse errors and
+    # an initialize, with no valid tools/call anywhere in it.
+    preference_args=$(printf '{"key":"temperatureUnit","value":"%s"}' "$unit")
     ( printf '%s\n' \
         "$(initialize_request)" \
         "$(initialized_notification)" \
-        "$(tools_call 4 set_preference "{\"key\":\"temperatureUnit\",\"value\":\"${unit}\"}")"
+        "$(tools_call 4 set_preference "$preference_args")"
       /bin/sleep "$confirm_timeout" ) \
         | "$cli_path" >"$out" 2>"$err" &
     session_pid=$!
