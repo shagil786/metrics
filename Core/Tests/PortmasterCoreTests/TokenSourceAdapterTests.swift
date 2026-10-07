@@ -40,8 +40,25 @@ struct FixtureTokenAdapter: TokenSourceAdapter {
     }
 }
 
-final class TokenSourceAdapterTests: XCTestCase {
+/// Adapter whose `parse` throws an error of its own, standing in for the naive
+/// adapters phase C will write. `FixtureTokenAdapter` cannot cover this: every exit
+/// it has is either `TokenSourceError` or unreachable, so a test using it would keep
+/// passing if the runner's catch-all were deleted outright.
+struct ThrowingTokenAdapter: TokenSourceAdapter {
+    let identifier = "throwing-agent"
+    var root: URL
 
+    func locateSessionLog(for session: AgentSessionSnapshot) -> URL? {
+        let url = root.appendingPathComponent("\(session.id.uuidString).json")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func parse(_ url: URL) throws -> RawAgentUsage {
+        throw NSError(domain: "fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+    }
+}
+
+final class TokenSourceAdapterTests: XCTestCase {
     private var root: URL!
 
     override func setUpWithError() throws {
@@ -111,9 +128,8 @@ final class TokenSourceAdapterTests: XCTestCase {
         try #"{"input": 10, "output": 5, "model": "m"}"#
             .write(to: url, atomically: true, encoding: .utf8)
 
-        let outcome = TokenSourceRunner(
-            adapter: FixtureTokenAdapter(root: root), sessionID: s.id
-        ).run()
+        let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
+            .run(session: s)
 
         guard case .reported(let record) = outcome else {
             return XCTFail("expected a record, got \(outcome)")
@@ -129,18 +145,61 @@ final class TokenSourceAdapterTests: XCTestCase {
             atomically: true, encoding: .utf8
         )
 
-        let outcome = TokenSourceRunner(
-            adapter: FixtureTokenAdapter(root: root), sessionID: s.id
-        ).run()
+        let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
+            .run(session: s)
 
         XCTAssertEqual(outcome, .notReported(reason: .unrecognizedFormat))
     }
 
     func testRunnerMapsMissingLogToNoSource() {
-        let outcome = TokenSourceRunner(
-            adapter: FixtureTokenAdapter(root: root), sessionID: session().id
-        ).run()
+        let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
+            .run(session: session())
 
         XCTAssertEqual(outcome, .notReported(reason: .noSource))
+    }
+
+    // MARK: - A record belongs to the session it was read for
+
+    /// The record must be stamped with the id of the session that was located, so
+    /// counts read from one session's log cannot be recorded against another's.
+    /// Under the earlier design — the runner holding its own `sessionID` beside the
+    /// session passed to `run` — this is the mismatch: the runner would stamp
+    /// whatever id it was constructed with, and nothing anywhere would object.
+    func testRecordIsStampedWithTheSessionItWasRunAgainst() throws {
+        let located = session()
+        let url = root.appendingPathComponent("\(located.id.uuidString).json")
+        try #"{"input": 7, "output": 3, "model": "m"}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        // An id belonging to no log here, which is what a stale runner would carry.
+        let unrelated = session()
+
+        let outcome = TokenSourceRunner(adapter: FixtureTokenAdapter(root: root))
+            .run(session: located)
+
+        guard case .reported(let record) = outcome else {
+            return XCTFail("expected a record, got \(outcome)")
+        }
+        XCTAssertEqual(record.sessionID, located.id)
+        XCTAssertNotEqual(record.sessionID, unrelated.id,
+                          "the record must follow the session, not a separate id")
+    }
+
+    // MARK: - A foreign error is still an absence
+
+    /// A real adapter parses JSON, plist or a line-oriented format and throws
+    /// `DecodingError` or an `NSError` constantly. The runner's contract is that no
+    /// caller has to interpret an error, so that error must arrive as a named
+    /// absence. Deleting or narrowing the catch-all must fail here.
+    func testRunnerMapsAForeignErrorToLogUnreadable() throws {
+        let s = session()
+        try #"{"input": 1, "output": 1, "model": "m"}"#
+            .write(to: root.appendingPathComponent("\(s.id.uuidString).json"),
+                   atomically: true, encoding: .utf8)
+
+        let outcome = TokenSourceRunner(adapter: ThrowingTokenAdapter(root: root))
+            .run(session: s)
+
+        XCTAssertEqual(outcome, .notReported(reason: .logUnreadable))
     }
 }

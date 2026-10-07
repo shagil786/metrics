@@ -60,16 +60,18 @@ public enum TokenSourceOutcome: Hashable, Sendable {
 /// absence, so no caller has to interpret an error to know what it does not know.
 public struct TokenSourceRunner: Sendable {
     private let adapter: any TokenSourceAdapter
-    private let sessionID: UUID
     private let now: @Sendable () -> Date
 
+    /// The session id is taken from the session passed to `run(session:)`, never
+    /// stored here: a second copy of an id that must equal the first is a copy that
+    /// can be stale, and the result of a stale one is a number counted against the
+    /// wrong session — the one failure here that is not an absence, and therefore
+    /// the one no downstream check would catch.
     public init(
         adapter: any TokenSourceAdapter,
-        sessionID: UUID,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.adapter = adapter
-        self.sessionID = sessionID
         self.now = now
     }
 
@@ -80,7 +82,7 @@ public struct TokenSourceRunner: Sendable {
         do {
             let raw = try adapter.parse(url)
             return .reported(TokenUsageRecord(
-                sessionID: sessionID,
+                sessionID: session.id,
                 recordedAt: now(),
                 input: raw.input,
                 output: raw.output,
@@ -98,14 +100,5 @@ public struct TokenSourceRunner: Sendable {
             // still must not become a number.
             return .notReported(reason: .logUnreadable)
         }
-    }
-
-    /// Convenience for the common case where the caller already has the session.
-    public func run() -> TokenSourceOutcome {
-        run(session: AgentSessionSnapshot(
-            id: sessionID, peerPID: 0, clientName: adapter.identifier,
-            clientVersion: nil, connectedAt: now(), endedAt: nil,
-            usage: .notReported(reason: .noSource), cost: .noUsage
-        ))
     }
 }
