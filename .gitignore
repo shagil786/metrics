@@ -14,3 +14,6 @@ Portmaster.xcodeproj/
 .swiftpm/
 .codebase-memory/
 .superpowers/
+
+# Isolated agent workspaces (superpowers SDD)
+.worktrees/
