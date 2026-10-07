@@ -8,7 +8,49 @@ Path: Architectural
 
 Make Portmaster queryable and controllable by AI assistants (Claude Code,
 Cursor, ChatGPT desktop, etc.) via the Model Context Protocol, matching the
-"your AI can ask Vitals" direction Vitals has announced but not shipped.
+"your AI can ask Vitals" direction Vitals announced.
+
+### Reference check: Vitals status as of 2026-10-08
+
+Re-checked against `vitalsmac.com/roadmap` and `vitalsmac.com/changelog`.
+
+**Vitals' MCP server is built but unshipped.** The public build is 1.3.5
+(2026-10-07) and its changelog has no MCP entry; the roadmap still lists the MCP
+server first under "Next". A tweet announcing it (2026-10-07) is a preview, not a
+release — so nothing here has shipped to compete with, and no parity claim about
+their MCP should be made from it.
+
+Three things from the preview are worth having anyway, because they are answers to
+questions our design already opened rather than new features:
+
+1. **A verdict, not a boolean.** Their safety question returns three states —
+   safe / ask first / leave alone — each with a reason. That is triage rather than
+   a boolean, and a boolean is the wrong shape for the question: "can I quit this?"
+   has an answer of *it depends, and here is why*. Our tools currently return
+   measurements and leave the judgement to the caller. This is a real gap, and it
+   is a *shape* gap: we would add a tool that classifies, not another number.
+2. **Read-only by default, confirmed for the act.** Their MCP "asks first" and
+   does not act on its own. A commenter proposes the same split we chose
+   independently: keep the check read-only, make the actual quit a separate tool
+   that needs approval. Our `.read` vs `.mutation` classification plus confirmation
+   already matches; worth remembering as validated rather than novel.
+3. **A CLI beside the MCP server**, so scripts and Terminal agents get the same
+   answers. Our `portmaster-mcp` is the stdio transport, not a user-facing CLI —
+   that gap is real and unchanged.
+
+Their roadmap item 3, "an Agents tab for Claude Code, Codex and the rest", is
+direct overlap with the session work landed on 2026-10-08. Two of its contents
+are things we do **not** have, and they are about the *machine*, not the tokens:
+
+- "everything it started, from the dev server to the tests" — attributing
+  processes to the session that spawned them.
+- "how much of your usage limit is left and when it resets" — provider quota and
+  reset tracking.
+- "Stop a session and everything it started in one click."
+
+Both are strictly bigger than token accounting, which is what we built. Our
+per-model pricing is ahead of nothing they have shipped; their scope is wider
+than ours on the machine side. Recorded so the next session does not rediscover it.
 
 ## Decisions (from brainstorming)
 
