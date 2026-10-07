@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-08-per-model-token-segments-design.md`
 
+**Every task ends green.** This was wrong in the first draft of this plan, which
+promised it and then instructed two red commits: the `TokenUsage` shape change, the
+fold, the repurposed conflict and per-segment pricing are one indivisible change, and
+the ~40 call sites can only be migrated once the shape is final. Tasks 1-3 were
+therefore merged into Task 1. A red intermediate makes `git bisect` unable to isolate
+a regression and makes any failure inside the following tasks ambiguous — was it my
+change, or the leftover breakage? Neither is worth the smaller diff.
+
 ## Global Constraints
 
 - **Unknown is never zero.** Every absence state stays distinct from a measured `0`. A total missing one model's cost is a wrong number and must never be printed.
@@ -22,23 +30,34 @@
 
 ---
 
-### Task 1: Segment type and the `(provenance, modelID)` fold
+### Task 1: Segments, the fold, conflict, per-segment pricing
 
-The one change that stops models being lost. Everything else in this plan depends on it.
+One task because it is one indivisible change. `TokenUsage` gains segments, the fold
+keys on `(provenance, modelID)`, `conflict` is repurposed, and `costLocked` prices per
+segment — and the ~40 call sites can only be migrated once the shape is final. Split
+across three commits it would leave two red ones.
 
 **Files:**
 - Modify: `Core/Sources/PortmasterCore/History/AgentUsage.swift`
+- Modify: `Core/Sources/PortmasterCore/History/AgentSessionStore.swift`
 - Test: `Core/Tests/PortmasterCoreTests/AgentUsageTests.swift`
+- Test: `Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift`
 
 **Interfaces:**
-- Consumes: `TokenUsageRecord` (existing, unchanged), `TokenProvenance` (existing, unchanged)
+- Consumes: `TokenUsageRecord`, `TokenProvenance`, `PriceComponent`, `PriceTable.price(_:)`
 - Produces:
-  - `public struct TokenUsageSegment: Hashable, Sendable` — fields `modelID: String`, `input: Int`, `output: Int`, `cacheRead: Int?`, `reasoning: Int?`, `provenance: TokenProvenance`; memberwise `public init`
+  - `public struct TokenUsageSegment: Hashable, Sendable` — `modelID: String`, `input: Int`, `output: Int`, `cacheRead: Int?`, `reasoning: Int?`, `provenance: TokenProvenance`; plus `comparableTotal: Int`
   - `TokenUsage.reported([TokenUsageSegment])` replaces `.reported(input:output:provenance:)`
-  - `TokenUsage.reported(input:output:modelID:provenance:) -> TokenUsage` — single-model convenience
+  - `TokenUsage.reported(input:output:modelID:provenance:) -> TokenUsage`
   - `TokenUsage.latestPerSegment(_ records: [TokenUsageRecord]) -> [TokenUsageRecord]` — replaces `latestPerProvenance`
+  - `public struct UsageDisagreement: Hashable, Sendable` — `modelID: String`, `totals: [TokenProvenance: Int]`
+  - `TokenUsage.hasMaterialDisagreement(_ segments: [TokenUsageSegment], tolerance: Decimal) -> [UsageDisagreement]` — replaces `hasModelConflict(_:)`
+  - `public struct CostLine: Hashable, Sendable` — `modelID: String`, `usd: Decimal`
+  - `SessionCost.priced(usd: Decimal, priceTableVersion: Int, lines: [CostLine])`
+  - `SessionCost.notPriced(models: [String])` — was `notPriced(modelID: String)`
+  - `SessionCost.conflict(disagreements: [UsageDisagreement])` — was `conflict(models: [String])`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing fold tests**
 
 Add to `AgentUsageTests.swift`:
 
@@ -114,176 +133,7 @@ Add to `AgentUsageTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cd Core && swift test --filter AgentUsageTests`
-Expected: FAIL — `TokenUsage` has no member `latestPerSegment`, and `.reported(input:output:modelID:provenance:)` does not exist.
-
-- [ ] **Step 3: Implement the segment type and fold**
-
-In `AgentUsage.swift`, add before `enum TokenUsage`:
-
-```swift
-/// One model's share of a session's usage, with the source that reported it.
-///
-/// **A list of these, not a single value, because one session can run two models.**
-/// The type that preceded it carried `(input, output, provenance)` with no model at
-/// all, so a fold keyed on provenance had to collapse an escalated session onto one
-/// model — and it collapsed silently, discarding the other's tokens with no trace.
-/// Keying on `(provenance, modelID)` makes two models two segments instead.
-public struct TokenUsageSegment: Hashable, Sendable {
-    public let modelID: String
-    public let input: Int
-    public let output: Int
-    /// Priced separately from input/output, and nil when the source omits them —
-    /// summing them into `input` produces a cost no provider invoice will reconcile.
-    public let cacheRead: Int?
-    public let reasoning: Int?
-    /// Part of the segment, not a property of the session: the same model reported by
-    /// two sources is two segments, which is what lets the two be compared.
-    public let provenance: TokenProvenance
-
-    public init(
-        modelID: String, input: Int, output: Int,
-        cacheRead: Int?, reasoning: Int?, provenance: TokenProvenance
-    ) {
-        self.modelID = modelID
-        self.input = input
-        self.output = output
-        self.cacheRead = cacheRead
-        self.reasoning = reasoning
-        self.provenance = provenance
-    }
-
-    /// The comparable size of this segment: input plus output.
-    ///
-    /// **Deliberately excludes `cacheRead` and `reasoning`.** Disagreement is about
-    /// whether two sources counted the same work, and cache reads are priced
-    /// differently enough that a source reporting them where another does not is a
-    /// pricing-shape difference, not a disagreement about the total.
-    public var comparableTotal: Int { input + output }
-}
-```
-
-Replace the `TokenUsage` enum's `reported` case and add the convenience constructor:
-
-```swift
-public enum TokenUsage: Hashable, Sendable {
-    case reported([TokenUsageSegment])
-    case notReported(reason: UsageUnavailableReason)
-
-    /// The common case: one model, one source. Keeps the many call sites that only
-    /// ever have a single model from spelling out a one-element array.
-    public static func reported(
-        input: Int, output: Int, modelID: String, provenance: TokenProvenance
-    ) -> TokenUsage {
-        .reported([TokenUsageSegment(
-            modelID: modelID, input: input, output: output,
-            cacheRead: nil, reasoning: nil, provenance: provenance
-        )])
-    }
-}
-```
-
-Replace `latestPerProvenance` with:
-
-```swift
-    /// The latest reading for each `(provenance, modelID)` pair.
-    ///
-    /// Keyed on both, not on provenance alone. Keying on provenance alone made an
-    /// escalated session's two models compete for one slot, and because the runner
-    /// stamps every segment of one observation with the same instant, the tie-break
-    /// below picked the earlier one and the later model was discarded.
-    ///
-    /// Ordered by provenance then model id so two runs over the same records produce
-    /// the same array — the fold's output reaches a UI list, and an unstable order
-    /// makes a diff of two reads look like a change when nothing moved.
-    static func latestPerSegment(_ records: [TokenUsageRecord]) -> [TokenUsageRecord] {
-        var latest: [TokenProvenance: [String: TokenUsageRecord]] = [:]
-        for record in records {
-            var byModel = latest[record.provenance] ?? [:]
-            // `>=` keeps the earlier element: two reports sharing a timestamp are one
-            // instant described twice, and array order is the only tie-break available
-            // without a sequence number to arbitrate.
-            if let existing = byModel[record.modelID],
-               existing.recordedAt >= record.recordedAt {
-                continue
-            }
-            byModel[record.modelID] = record
-            latest[record.provenance] = byModel
-        }
-        return latest
-            .sorted { $0.key.rawValue < $1.key.rawValue }
-            .flatMap { _, byModel in
-                byModel.sorted { $0.key < $1.key }.map(\.value)
-            }
-    }
-```
-
-Rewrite `aggregating`:
-
-```swift
-    public static func aggregating(_ records: [TokenUsageRecord]) -> TokenUsage {
-        // Empty in, empty out: no records means no segment won, which the guard
-        // reports as `awaitingFirstReport` rather than a zero.
-        let segments = latestPerSegment(records).map { record in
-            TokenUsageSegment(
-                modelID: record.modelID, input: record.input, output: record.output,
-                cacheRead: record.cacheRead, reasoning: record.reasoning,
-                provenance: record.provenance
-            )
-        }
-        guard !segments.isEmpty else {
-            return .notReported(reason: .awaitingFirstReport)
-        }
-        return .reported(segments)
-    }
-```
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `cd Core && swift test --filter AgentUsageTests`
-Expected: the new tests PASS. Existing tests in this file may fail to compile — `.reported(input:output:provenance:)` no longer has that shape. Migrate each to the convenience constructor, which takes the same arguments plus `modelID:`, and add the `modelID` the test was implicitly assuming.
-
-- [ ] **Step 5: Run the full Core suite**
-
-Run: `cd Core && swift test`
-Expected: FAIL in `AgentSessionStoreTests` and `AgentSessionWiringTests`, which assert the old aggregate shape. That is expected at this stage — Task 3 and Task 5 fix them. Confirm the failures are **only** aggregate-shape assertions, not new logic faults.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Tests/PortmasterCoreTests/AgentUsageTests.swift
-git commit -m "fix: key the usage fold on (provenance, model), not provenance alone
-
-TokenUsage carried (input, output, provenance) with no model, so a fold keyed on
-provenance had to collapse an escalated session onto one model. Because the runner
-stamps every segment of one observation with the same instant, the tie-break picked
-the earlier segment and the later model was discarded — measured at 67% of a real
-session's output tokens, silently.
-
-TokenUsage now holds [TokenUsageSegment], and latestPerSegment keys on
-(provenance, modelID). Two models are two segments.
-
-Output for the fold is ordered, because it reaches a UI list and an unstable order
-makes two reads of unchanged records look like a change."
-```
-
----
-
-### Task 2: Repurpose `conflict` to mean same-model disagreement
-
-**Files:**
-- Modify: `Core/Sources/PortmasterCore/History/AgentUsage.swift`
-- Test: `Core/Tests/PortmasterCoreTests/AgentUsageTests.swift`
-
-**Interfaces:**
-- Consumes: `TokenUsageSegment` (Task 1)
-- Produces:
-  - `public struct UsageDisagreement: Hashable, Sendable` — `modelID: String`, `totals: [TokenProvenance: Int]`
-  - `TokenUsage.hasMaterialDisagreement(_ segments: [TokenUsageSegment], tolerance: Decimal) -> [UsageDisagreement]` — replaces `hasModelConflict(_ records:)`
-
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 2: Write the failing disagreement tests**
 
 ```swift
     /// 20% apart is a broken reader, not rounding: the two must not be silently
@@ -342,126 +192,9 @@ makes two reads of unchanged records look like a change."
     }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 3: Write the failing pricing tests**
 
-Run: `cd Core && swift test --filter AgentUsageTests`
-Expected: FAIL — `hasMaterialDisagreement` and `UsageDisagreement` do not exist.
-
-- [ ] **Step 3: Implement**
-
-Add:
-
-```swift
-/// Two sources reporting the same model with totals too far apart to be the same
-/// work. The model may be priced perfectly well; what is missing is a reason to
-/// prefer one source's count, so the cost cannot be computed at all.
-public struct UsageDisagreement: Hashable, Sendable {
-    public let modelID: String
-    /// Newest reading per source, so the disagreement shows the two numbers the user
-    /// is being asked to choose between rather than merely asserting that they differ.
-    public let totals: [TokenProvenance: Int]
-
-    public init(modelID: String, totals: [TokenProvenance: Int]) {
-        self.modelID = modelID
-        self.totals = totals
-    }
-}
-```
-
-Replace `hasModelConflict` with:
-
-```swift
-    /// Models the two sources report with totals that differ beyond `tolerance`.
-    ///
-    /// **This is not the rule it used to be.** It asked whether sources disagreed about
-    /// *which model ran*, so that a mixed total was never priced at one rate. Segments
-    /// make that unrepresentable — two models are two segments, each priced at its own
-    /// rate — which leaves a different disagreement worth catching: the same model,
-    /// counted differently by two readers. A self-report of 1,000 tokens against a log
-    /// parse of 1,200 means one of the two is wrong, and silently preferring one is the
-    /// same failure as losing a model.
-    ///
-    /// **Relative to the larger of the two totals**, so a small reading against a large
-    /// one is not amplified, and a zero pair is skipped rather than divided.
-    ///
-    /// The tolerance is a judgement call with no data behind it yet. It exists because
-    /// two readers of one session differ trivially, and a strict rule would pin a
-    /// session in conflict over a single token. It is expected to be tuned against real
-    /// disagreement before it is trusted.
-    public static func hasMaterialDisagreement(
-        _ segments: [TokenUsageSegment],
-        tolerance: Decimal
-    ) -> [UsageDisagreement] {
-        var byModel: [String: [TokenProvenance: Int]] = [:]
-        for segment in segments {
-            byModel[segment.modelID, default: [:]][segment.provenance] = segment.comparableTotal
-        }
-
-        var found: [UsageDisagreement] = []
-        for (modelID, totals) in byModel.sorted(by: { $0.key < $1.key }) {
-            // One source cannot disagree with itself.
-            guard totals.count > 1 else { continue }
-            let values = totals.values.map(Decimal.init)
-            guard let largest = values.max(), largest > 0 else { continue }
-            let smallest = values.min() ?? 0
-            let relativeDifference = (largest - smallest) / largest
-            if relativeDifference > tolerance {
-                found.append(UsageDisagreement(modelID: modelID, totals: totals))
-            }
-        }
-        return found
-    }
-```
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `cd Core && swift test --filter AgentUsageTests`
-Expected: the four new tests PASS.
-
-- [ ] **Step 5: Delete the now-dead `hasModelConflict` tests**
-
-Remove every test in `AgentUsageTests.swift` that exercises `hasModelConflict`, and delete the function itself if `AgentSessionStore.costLocked` is the only remaining caller — Task 3 removes that call.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Tests/PortmasterCoreTests/AgentUsageTests.swift
-git commit -m "feat: conflict now means the same model counted two ways
-
-Conflict used to mean two sources disagreed about which model ran, so a mixed total
-was never priced at one rate. Segments make that unrepresentable, which leaves the
-disagreement worth catching: the same model, counted differently by two readers. A
-self-report of 1,000 against a log parse of 1,200 means one of them is wrong, and
-silently preferring one is the same failure as losing a model.
-
-Both totals are named, because the user is being asked to choose between them and
-asserting only that they differ gives them nothing to choose with.
-
-The threshold is relative to the larger total, so a small reading is not amplified,
-and a zero pair is skipped rather than divided. 1% is a judgement call with no data
-behind it and is expected to be tuned."
-```
-
----
-
-### Task 3: Price each segment at its own rate and sum
-
-**Files:**
-- Modify: `Core/Sources/PortmasterCore/History/AgentUsage.swift` (`SessionCost`)
-- Modify: `Core/Sources/PortmasterCore/History/AgentSessionStore.swift` (`costLocked`)
-- Test: `Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift`
-
-**Interfaces:**
-- Consumes: `TokenUsageSegment`, `UsageDisagreement` (Tasks 1–2), existing `PriceComponent`, `PriceTable.price(_:)`
-- Produces:
-  - `public struct CostLine: Hashable, Sendable` — `modelID: String`, `usd: Decimal`
-  - `SessionCost.priced(usd: Decimal, priceTableVersion: Int, lines: [CostLine])`
-  - `SessionCost.notPriced(models: [String])` — was `notPriced(modelID: String)`
-  - `SessionCost.conflict(disagreements: [UsageDisagreement])` — was `conflict(models: [String])`
-
-- [ ] **Step 1: Write the failing test**
-
-In `AgentSessionStoreTests.swift`:
+Add to `AgentSessionStoreTests.swift`:
 
 ```swift
     /// Two models at different rates must be priced at their own rates and summed.
@@ -554,14 +287,71 @@ In `AgentSessionStoreTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 4: Run the tests to verify they fail**
 
-Run: `cd Core && swift test --filter AgentSessionStoreTests`
-Expected: FAIL — `priced` takes two associated values, `notPriced` takes one, `conflict` takes a different shape.
+Run: `cd Core && swift test --filter "AgentUsageTests|AgentSessionStoreTests"`
+Expected: FAIL to compile — `TokenUsageSegment`, `latestPerSegment`, `hasMaterialDisagreement`, `UsageDisagreement` and `CostLine` do not exist, and `priced`/`notPriced`/`conflict` have their old shapes.
 
-- [ ] **Step 3: Change `SessionCost`**
+- [ ] **Step 5: Add the segment type**
+
+In `AgentUsage.swift`, before `enum TokenUsage`:
 
 ```swift
+/// One model's share of a session's usage, with the source that reported it.
+///
+/// **A list of these, not a single value, because one session can run two models.**
+/// The type that preceded it carried `(input, output, provenance)` with no model at
+/// all, so a fold keyed on provenance had to collapse an escalated session onto one
+/// model — and it collapsed silently, discarding the other's tokens with no trace.
+/// Keying on `(provenance, modelID)` makes two models two segments instead.
+public struct TokenUsageSegment: Hashable, Sendable {
+    public let modelID: String
+    public let input: Int
+    public let output: Int
+    /// Priced separately from input/output, and nil when the source omits them —
+    /// summing them into `input` produces a cost no provider invoice will reconcile.
+    public let cacheRead: Int?
+    public let reasoning: Int?
+    /// Part of the segment, not a property of the session: the same model reported by
+    /// two sources is two segments, which is what lets the two be compared.
+    public let provenance: TokenProvenance
+
+    public init(
+        modelID: String, input: Int, output: Int,
+        cacheRead: Int?, reasoning: Int?, provenance: TokenProvenance
+    ) {
+        self.modelID = modelID
+        self.input = input
+        self.output = output
+        self.cacheRead = cacheRead
+        self.reasoning = reasoning
+        self.provenance = provenance
+    }
+
+    /// The comparable size of this segment: input plus output.
+    ///
+    /// **Deliberately excludes `cacheRead` and `reasoning`.** Disagreement is about
+    /// whether two sources counted the same work, and cache reads are priced
+    /// differently enough that a source reporting them where another does not is a
+    /// pricing-shape difference, not a disagreement about the total.
+    public var comparableTotal: Int { input + output }
+}
+
+/// Two sources reporting the same model with totals too far apart to be the same
+/// work. The model may be priced perfectly well; what is missing is a reason to
+/// prefer one source's count, so the cost cannot be computed at all.
+public struct UsageDisagreement: Hashable, Sendable {
+    public let modelID: String
+    /// Newest reading per source, so the disagreement shows the two numbers the user
+    /// is being asked to choose between rather than merely asserting that they differ.
+    public let totals: [TokenProvenance: Int]
+
+    public init(modelID: String, totals: [TokenProvenance: Int]) {
+        self.modelID = modelID
+        self.totals = totals
+    }
+}
+
 /// One model's contribution to a session's cost. Present so a total can be shown as
 /// its parts rather than only its sum — an escalated session priced as one number
 /// hides that two rates were involved.
@@ -574,7 +364,135 @@ public struct CostLine: Hashable, Sendable {
         self.usd = usd
     }
 }
+```
 
+- [ ] **Step 6: Change `TokenUsage` and the fold**
+
+Replace the `reported` case and add the convenience constructor:
+
+```swift
+public enum TokenUsage: Hashable, Sendable {
+    case reported([TokenUsageSegment])
+    case notReported(reason: UsageUnavailableReason)
+
+    /// The common case: one model, one source. Keeps the many call sites that only
+    /// ever have a single model from spelling out a one-element array.
+    public static func reported(
+        input: Int, output: Int, modelID: String, provenance: TokenProvenance
+    ) -> TokenUsage {
+        .reported([TokenUsageSegment(
+            modelID: modelID, input: input, output: output,
+            cacheRead: nil, reasoning: nil, provenance: provenance
+        )])
+    }
+}
+```
+
+Replace `latestPerProvenance` with:
+
+```swift
+    /// The latest reading for each `(provenance, modelID)` pair.
+    ///
+    /// Keyed on both, not on provenance alone. Keying on provenance alone made an
+    /// escalated session's two models compete for one slot, and because the runner
+    /// stamps every segment of one observation with the same instant, the tie-break
+    /// below picked the earlier one and the later model was discarded.
+    ///
+    /// Ordered by provenance then model id so two runs over the same records produce
+    /// the same array — the fold's output reaches a UI list, and an unstable order
+    /// makes a diff of two reads look like a change when nothing moved.
+    static func latestPerSegment(_ records: [TokenUsageRecord]) -> [TokenUsageRecord] {
+        var latest: [TokenProvenance: [String: TokenUsageRecord]] = [:]
+        for record in records {
+            var byModel = latest[record.provenance] ?? [:]
+            // `>=` keeps the earlier element: two reports sharing a timestamp are one
+            // instant described twice, and array order is the only tie-break available
+            // without a sequence number to arbitrate.
+            if let existing = byModel[record.modelID],
+               existing.recordedAt >= record.recordedAt {
+                continue
+            }
+            byModel[record.modelID] = record
+            latest[record.provenance] = byModel
+        }
+        return latest
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .flatMap { _, byModel in
+                byModel.sorted { $0.key < $1.key }.map(\.value)
+            }
+    }
+```
+
+Rewrite `aggregating`:
+
+```swift
+    public static func aggregating(_ records: [TokenUsageRecord]) -> TokenUsage {
+        // Empty in, empty out: no records means no segment won, which the guard
+        // reports as `awaitingFirstReport` rather than a zero.
+        let segments = latestPerSegment(records).map { record in
+            TokenUsageSegment(
+                modelID: record.modelID, input: record.input, output: record.output,
+                cacheRead: record.cacheRead, reasoning: record.reasoning,
+                provenance: record.provenance
+            )
+        }
+        guard !segments.isEmpty else {
+            return .notReported(reason: .awaitingFirstReport)
+        }
+        return .reported(segments)
+    }
+```
+
+- [ ] **Step 7: Repurpose the conflict rule**
+
+Delete `hasModelConflict` and replace it with:
+
+```swift
+    /// Models the two sources report with totals that differ beyond `tolerance`.
+    ///
+    /// **This is not the rule it used to be.** It asked whether sources disagreed about
+    /// *which model ran*, so that a mixed total was never priced at one rate. Segments
+    /// make that unrepresentable — two models are two segments, each priced at its own
+    /// rate — which leaves a different disagreement worth catching: the same model,
+    /// counted differently by two readers. A self-report of 1,000 tokens against a log
+    /// parse of 1,200 means one of the two is wrong, and silently preferring one is the
+    /// same failure as losing a model.
+    ///
+    /// **Relative to the larger of the two totals**, so a small reading against a large
+    /// one is not amplified, and a zero pair is skipped rather than divided.
+    ///
+    /// The tolerance is a judgement call with no data behind it yet. It exists because
+    /// two readers of one session differ trivially, and a strict rule would pin a
+    /// session in conflict over a single token. It is expected to be tuned against real
+    /// disagreement before it is trusted.
+    public static func hasMaterialDisagreement(
+        _ segments: [TokenUsageSegment],
+        tolerance: Decimal
+    ) -> [UsageDisagreement] {
+        var byModel: [String: [TokenProvenance: Int]] = [:]
+        for segment in segments {
+            byModel[segment.modelID, default: [:]][segment.provenance] = segment.comparableTotal
+        }
+
+        var found: [UsageDisagreement] = []
+        for (modelID, totals) in byModel.sorted(by: { $0.key < $1.key }) {
+            // One source cannot disagree with itself.
+            guard totals.count > 1 else { continue }
+            let values = totals.values.map(Decimal.init)
+            guard let largest = values.max(), largest > 0 else { continue }
+            let smallest = values.min() ?? 0
+            let relativeDifference = (largest - smallest) / largest
+            if relativeDifference > tolerance {
+                found.append(UsageDisagreement(modelID: modelID, totals: totals))
+            }
+        }
+        return found
+    }
+```
+
+- [ ] **Step 8: Change `SessionCost`**
+
+```swift
 public enum SessionCost: Hashable, Sendable {
     case priced(usd: Decimal, priceTableVersion: Int, lines: [CostLine])
     /// At least one model has no entry in the price table, so the total is unknown.
@@ -599,7 +517,7 @@ public enum SessionCost: Hashable, Sendable {
 }
 ```
 
-- [ ] **Step 4: Rewrite `costLocked`**
+- [ ] **Step 9: Rewrite `costLocked`**
 
 Replace the whole body of `costLocked` in `AgentSessionStore.swift`:
 
@@ -681,47 +599,54 @@ Replace the whole body of `costLocked` in `AgentSessionStore.swift`:
     }
 ```
 
-- [ ] **Step 5: Run to verify the new tests pass**
+- [ ] **Step 10: Migrate every remaining call site**
 
-Run: `cd Core && swift test --filter AgentSessionStoreTests`
-Expected: the three new tests PASS. Remaining failures are old-shape assertions — continue to Step 6.
+Run: `cd Core && swift build 2>&1 | grep "error:"`
+Expected: errors at every use of the old shapes. Fix each:
 
-- [ ] **Step 6: Migrate the remaining old-shape assertions**
+- `.reported(input: X, output: Y, provenance: Z)` → `.reported(input: X, output: Y, modelID: "<the model the test was already assuming>", provenance: Z)`. When a test asserted a single-model aggregate it almost certainly had a `modelID` string nearby; use that rather than inventing one.
+- `TokenUsage.latestPerProvenance(records)[.selfReported]` → `TokenUsage.latestPerSegment(records).first { $0.provenance == .selfReported }`.
+- `TokenUsage.hasModelConflict(records)` → delete the assertion. Every such test pinned the old rule; translate only the ones that are genuinely about same-model disagreement, using the Step 3 fixtures.
+- `.notPriced(modelID: "m")` → `.notPriced(models: ["m"])`.
+- `.conflict(models: ["a", "b"])` → **delete unless the models are the same.** Two *different* models are two priced segments now, not a conflict; those tests were pinning the collapsing behaviour and translating them would preserve the bug.
 
-Run: `cd Core && swift test --filter AgentSessionStoreTests` and fix each failure by updating the expectation to the new shape:
+`AgentSessionWiringTests.swift` compiles without changes at this point: `TokenUsagePayload` and `SessionCostPayload` construct from `TokenUsage`/`SessionCost` but match on cases positionally, so re-run the suite and fix only what fails.
 
-- `.priced(usd: X, priceTableVersion: V)` → `.priced(usd: X, priceTableVersion: V, lines: [])` when the session has no spend, or with the computed `lines` when it does.
-- `.notPriced(modelID: "m")` → `.notPriced(models: ["m"])`
-- `.conflict(models: ["a", "b"])` → `.conflict(disagreements: [...])`. **Note:** several of these assert a *different models* case that is no longer a conflict at all — two models are now two segments. Delete those rather than translating them; they were pinning the old collapsing behaviour.
-
-- [ ] **Step 7: Run the full Core suite**
+- [ ] **Step 11: Run the full Core suite**
 
 Run: `cd Core && swift test`
-Expected: Core PASS. MCP tests still fail on wire payloads — Task 5 fixes them.
+Expected: Core PASS. If MCP tests fail, every failure must be a wire-payload shape mismatch that Task 3 fixes — anything else is a fault in this task.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Sources/PortmasterCore/History/AgentSessionStore.swift Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift
-git commit -m "feat: price each segment at its own model's rate and sum
+git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Sources/PortmasterCore/History/AgentSessionStore.swift Core/Tests/PortmasterCoreTests/AgentUsageTests.swift Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift
+git commit -m "fix: represent a session's usage as per-model segments
 
-Pricing a mixed total at one rate is the unsound figure segments exist to remove: an
-invoice has two lines and the total had one rate applied to both, so nothing
-reconciles. Each segment is now priced at its own model's rate and the results
-summed, with the per-model lines kept so a total can be shown as its parts.
+TokenUsage carried (input, output, provenance) with no model, so a fold keyed on
+provenance had to collapse an escalated session onto one model. Because the runner
+stamps every segment of one observation with the same instant, the tie-break picked
+the earlier segment and the later model was discarded — measured at 67% of a real
+session's output tokens, silently.
 
-One unpriced model suppresses the whole total and names every unpriced model, rather
-than printing a sum that omits spend. Pricing one of several does not make the total
-computable, so the absence has to name all of them.
+TokenUsage now holds [TokenUsageSegment] and the fold keys on (provenance,
+modelID), so two models are two segments. Each is priced at its own model's rate and
+the results summed; pricing a mixed total at one rate is the unsound figure this
+removes, since an invoice has two lines and the total had one rate on both.
 
-Several existing .conflict(models:) assertions were deleted rather than translated:
-they asserted that two different models conflict, which is no longer a conflict at
-all — they were pinning the old collapsing behaviour."
+Conflict now means the same model counted two ways, naming both totals. One unpriced
+model suppresses the whole total and names every unpriced model, rather than printing
+a sum that omits spend.
+
+Deleted rather than translated: every .conflict(models:) assertion about two
+*different* models, and every hasModelConflict test. They pinned the old collapsing
+behaviour, and translating them would have preserved the bug.
+
+One commit rather than three because the shape change, the fold, the conflict rule
+and the call-site migration are indivisible — split, two of the three commits are red."
 ```
 
----
-
-### Task 4: Prune deletes only superseded records
+### Task 2: Prune deletes only superseded records
 
 Makes trimming figure-preserving. Independent of the segment work — this is a
 separate defect, and this is its own fix.
@@ -731,7 +656,7 @@ separate defect, and this is its own fix.
 - Test: `Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift`
 
 **Interfaces:**
-- Consumes: nothing from Tasks 1–3; `prune(olderThan: Date, keepingSessionIDs: Set<UUID>)` keeps its signature
+- Consumes: nothing from Task 1; `prune(olderThan: Date, keepingSessionIDs: Set<UUID>)` keeps its signature
 - Produces: the same signature with corrected semantics. **No new public API.**
 
 - [ ] **Step 1: Write the failing test**
@@ -919,14 +844,14 @@ behaviour, and its inverse was written first."
 
 ---
 
-### Task 5: Wire payloads
+### Task 3: Wire payloads
 
 **Files:**
 - Modify: `Core/Sources/PortmasterMCP/WirePayloads.swift`
 - Test: `Core/Tests/PortmasterMCPTests/AgentSessionWiringTests.swift`
 
 **Interfaces:**
-- Consumes: `TokenUsageSegment`, `UsageDisagreement`, `CostLine` (Tasks 1–3)
+- Consumes: `TokenUsageSegment`, `UsageDisagreement`, `CostLine` (Task 1)
 - Produces: `TokenUsagePayload` with `segments: [SegmentPayload]?`, `SessionCostPayload` with `lines: [CostLinePayload]?` and `disagreements: [DisagreementPayload]?`
 
 - [ ] **Step 1: Write the failing test**
@@ -1129,13 +1054,13 @@ and a decimal string round-trips through any client unchanged."
 
 ---
 
-### Task 6: Sessions card
+### Task 4: Sessions card
 
 **Files:**
 - Modify: `App/OverviewView.swift` (`AgentSessionsCard` and `SessionLine`)
 
 **Interfaces:**
-- Consumes: the `TokenUsage` and `SessionCost` shapes from Tasks 1–3
+- Consumes: the `TokenUsage` and `SessionCost` shapes from Task 1
 - Produces: no new public API; UI only
 
 - [ ] **Step 1: Update the aggregate line to name every model**
@@ -1240,7 +1165,7 @@ A conflict prints both totals and which source reported each, rather than the wo
 
 ---
 
-### Task 7: Docs and end-to-end verification
+### Task 5: Docs and end-to-end verification
 
 **Files:**
 - Modify: `README.md`
@@ -1286,8 +1211,10 @@ inside its total, so it cannot be priced per model."
 
 ## Self-Review
 
-**Spec coverage.** Decisions 1–5 map to Tasks 1–4. Wire and UI map to Tasks 5–6.
-Doc corrections to Task 7. Every spec section has a task.
+**Spec coverage.** Spec decisions 1, 3, 4 and 5 (segments, per-segment pricing,
+repurposed conflict, migration) are all in Task 1. Decision 2, the prune fix, is
+Task 2. Wire and UI are Tasks 3–4. Doc corrections are Task 5. Every spec section
+has a task.
 
 **Type consistency.** `TokenUsageSegment(modelID:input:output:cacheRead:reasoning:provenance:)`
 is defined in Task 1 and used unchanged in Tasks 2, 3, 5. `latestPerSegment(_:)`
@@ -1295,10 +1222,10 @@ is Task 1 and used in Task 3. `UsageDisagreement(modelID:totals:)` is Task 2, us
 in Tasks 3 and 5. `CostLine(modelID:usd:)` is Task 3, used in Task 5. No name
 appears before it is defined.
 
-**Ordering.** Task 2's `hasMaterialDisagreement` takes segments, so Task 1 must
-land first. Task 3's `costLocked` consumes Tasks 1–2. Task 4 is independent and
-could be done in parallel, but it is sequenced here so the suite is green between
-tasks.
+**Ordering.** Task 1 is indivisible and lands first; the rest depend on its types.
+Task 2 is logically independent of Task 1 — the prune defect was never caused by the
+fold — so it could be done in parallel, but it is sequenced second so the suite is
+green between tasks.
 
 **Placeholder scan.** No TBD, no "similar to Task N", no unimplemented steps. Every
 code block is complete and compilable as written.
