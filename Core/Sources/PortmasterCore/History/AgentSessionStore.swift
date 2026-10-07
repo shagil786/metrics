@@ -83,13 +83,41 @@ public final class TokenUsageRecordRow {
 @Model
 public final class ModelPriceEntry {
     @Attribute(.unique) public var key: String
-    public var pricePerToken: Decimal
+    /// The price as exact decimal **text**, not as a `Decimal`, even though the money
+    /// itself is decimal. SQLite has no decimal storage class: a column declared
+    /// `DECIMAL` is stored as a binary float (`typeof` reports `real`), so the digits
+    /// are rounded in the file itself — `0.1234567890123456` comes back as
+    /// `0.123456789012346`. A float near 15 significant digits is enough for a price
+    /// like `0.0000015`, which is why that mistake survives an ordinary test, and not
+    /// enough for a figure that must reconcile with an invoice. SQLite stores TEXT as
+    /// TEXT, so these are the digits that come back.
+    ///
+    /// Nothing here should "simplify" this back to a `Decimal` property: the type
+    /// would be more honest-looking and the arithmetic exact, while silently moving
+    /// the rounding from memory into storage.
+    public var pricePerTokenText: String
     public var tableVersion: Int
 
     public init(key: String, pricePerToken: Decimal, tableVersion: Int) {
         self.key = key
-        self.pricePerToken = pricePerToken
+        self.pricePerTokenText = ModelPriceEntry.text(for: pricePerToken)
         self.tableVersion = tableVersion
+    }
+
+    /// The stored price, or nil when the text is not a number. Nil rather than zero: a
+    /// row that cannot be read is a price that is not known, and zero would turn an
+    /// unreadable row into a figure that looks computed.
+    public var pricePerToken: Decimal? {
+        // `en_US_POSIX` so the decimal separator is a period whatever the user's locale
+        // is — a price written under one locale must not stop parsing under another.
+        Decimal(string: pricePerTokenText, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// `NSDecimalNumber` rather than `Decimal.description`: the latter is a rendering
+    /// whose exact form is a Foundation detail, this one is the documented conversion
+    /// to plain decimal text.
+    static func text(for price: Decimal) -> String {
+        NSDecimalNumber(decimal: price).stringValue
     }
 }
 
@@ -189,7 +217,7 @@ public final class AgentSessionStore: @unchecked Sendable {
         if let existing = fetchPrice(key) {
             // Bumping on every write keeps "which prices produced this figure"
             // answerable without a separate history of the table.
-            existing.pricePerToken = price
+            existing.pricePerTokenText = ModelPriceEntry.text(for: price)
             existing.tableVersion = current + 1
             return
         }
@@ -263,18 +291,32 @@ public final class AgentSessionStore: @unchecked Sendable {
     private func usageRecordsLocked(for sessionID: UUID) -> [TokenUsageRecord] {
         let descriptor = FetchDescriptor<TokenUsageRecordRow>(
             predicate: #Predicate { $0.sessionID == sessionID },
-            sortBy: [SortDescriptor(\.recordedAt)]
+            sortBy: AgentSessionStore.recordOrder
         )
         return ((try? context.fetch(descriptor)) ?? []).map(\.value)
     }
 
+    /// Record order, shared by every read of usage so the two paths cannot disagree.
+    ///
+    /// `latestPerProvenance` breaks equal timestamps by array position, keeping the
+    /// earlier element, so the order of tied rows is load-bearing: it decides which of
+    /// two same-instant reports wins. SQLite makes no promise about the order of
+    /// `ORDER BY` ties, and the batched and per-session fetches have different plans
+    /// (`WHERE sessionID = X` against the full table), so tied rows can arrive in
+    /// different orders and the same session could cost two different amounts
+    /// depending on which API asked. `id` is unique and stable, so it decides ties the
+    /// same way in both queries — which tie wins is still arbitrary, but it cannot
+    /// change between reads.
+    static let recordOrder = [
+        SortDescriptor<TokenUsageRecordRow>(\.recordedAt),
+        SortDescriptor<TokenUsageRecordRow>(\.id),
+    ]
+
     /// Every session's records in one query. Grouping must not reorder a session's
-    /// own records: `latestPerProvenance` breaks equal timestamps by array position,
-    /// so the global sort by `recordedAt` is what keeps each slice equivalent to the
-    /// per-session fetch above.
+    /// own records, which is what sorting by `recordOrder` before appending is for.
     private func usageRecordsGroupedLocked() -> [UUID: [TokenUsageRecord]] {
         let descriptor = FetchDescriptor<TokenUsageRecordRow>(
-            sortBy: [SortDescriptor(\.recordedAt)]
+            sortBy: AgentSessionStore.recordOrder
         )
         var grouped: [UUID: [TokenUsageRecord]] = [:]
         for row in (try? context.fetch(descriptor)) ?? [] {
@@ -299,7 +341,12 @@ public final class AgentSessionStore: @unchecked Sendable {
         var byKey: [String: (price: Decimal, version: Int)] = [:]
         var version = 0
         for entry in all {
-            byKey[entry.key] = (entry.pricePerToken, entry.tableVersion)
+            // A row whose text will not parse is left out of the table entirely, so
+            // costing asks for a price, finds none, and says the model is unpriced —
+            // rather than pricing tokens against a figure nobody can read.
+            if let price = entry.pricePerToken {
+                byKey[entry.key] = (price, entry.tableVersion)
+            }
             version = max(version, entry.tableVersion)
         }
         return PriceTable(byKey: byKey, currentVersion: version)

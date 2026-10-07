@@ -364,6 +364,106 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertEqual(usd, Decimal(string: "0.0000015")!)
     }
 
+    /// Sixteen significant figures, which is the point of storing prices as text.
+    ///
+    /// A `Double` has ~15, so a price held as one cannot come back as the digits that
+    /// went in: stored in a `DECIMAL` column — which SQLite implements as a binary
+    /// float — `0.1234567890123456` returns as `0.123456789012346`, and this assertion
+    /// fails on the last digit. A short value like `0.0000015` cannot catch that,
+    /// because `Double`→`Decimal` reconstructs the shortest decimal that round-trips
+    /// and lands back on the original; that is exactly why the short reopen tests are
+    /// kept but are not the ones to trust.
+    func testSixteenDigitPriceSurvivesTheStoreExactly() throws {
+        let (store, url) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let written = Decimal(string: "0.1234567890123456")!
+        try store.setPrice(written, modelID: "m")
+        let sid = UUID()
+        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sid, recordedAt: Date(), input: 1, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        try store.flush()
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+            return XCTFail("expected a priced cost read back from disk")
+        }
+        XCTAssertEqual(usd, written, "the stored price is the price that went in, digit for digit")
+    }
+
+    /// A high-precision price multiplied by a real token count, so the digits have to
+    /// survive both the write and the arithmetic, not merely sit in a file.
+    func testSixteenDigitPriceMultipliesExactlyAfterAReopen() throws {
+        let (store, url) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let written = Decimal(string: "0.0000001234567890123456")!
+        try store.setPrice(written, modelID: "m")
+        let sid = UUID()
+        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sid, recordedAt: Date(), input: 777, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        try store.flush()
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+            return XCTFail("expected a priced cost read back from disk")
+        }
+        XCTAssertEqual(usd, written * Decimal(777))
+    }
+
+    // MARK: - Tied timestamps
+
+    /// Many reports of one instant. `latestPerProvenance` keeps the first of a tied set,
+    /// so the order of tied rows decides which figure wins — and the batched and
+    /// per-session reads are two queries with different plans, which SQLite makes no
+    /// promise to return tied rows in the same order for. Without a stable order the
+    /// same session costs two different amounts depending on which API asked: measured
+    /// at 39 disagreements in 40 tied sessions.
+    ///
+    /// *Which* tied record wins is arbitrary — the report order carries no sequence
+    /// number to arbitrate — so the assertion is not that a particular record wins. It
+    /// is that every path picks the same one, and keeps picking it.
+    func testTiedTimestampsCostTheSameWhicheverPathReadsThem() throws {
+        let (store, url) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let sid = UUID()
+        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
+        let instant = Date(timeIntervalSince1970: 5)
+        for n in 0..<8 {
+            try store.recordUsage(TokenUsageRecord(
+                id: UUID(), sessionID: sid, recordedAt: instant,
+                input: 1_000 + n, output: 0, cacheRead: nil, reasoning: nil,
+                modelID: "m", provenance: .selfReported
+            ))
+        }
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+
+        let viaCost = try store.cost(for: sid)
+        let viaUsage = try store.usage(for: sid)
+        let snapshot = try XCTUnwrap(try store.sessions().first)
+
+        XCTAssertEqual(snapshot.cost, viaCost, "one session, one cost")
+        XCTAssertEqual(snapshot.usage, viaUsage)
+        // Re-read after the batched fetch has run, so a stable answer also has to be
+        // stable across both paths having been taken.
+        XCTAssertEqual(try store.cost(for: sid), viaCost)
+        XCTAssertEqual(try store.sessions().first?.cost, viaCost)
+
+        // The winner is one of the tied reports — not a figure from nowhere, and not a
+        // sum of them.
+        guard case .reported(let input, _, _) = viaUsage else {
+            return XCTFail("expected a reported usage")
+        }
+        XCTAssertTrue((1_000..<1_008).contains(input), "one tied report wins: \(input)")
+    }
+
     // MARK: - Batched reads
 
     /// `sessions()` reads records and prices once for the whole list instead of once
