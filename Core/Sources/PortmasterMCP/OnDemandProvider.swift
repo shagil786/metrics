@@ -164,6 +164,11 @@ public struct OnDemandProvider: DataProvider {
 
     private let acquisition: SnapshotAcquisition
     private let history: LazyHistory
+    /// Opens the canonical session store on the first session question. Lazy for
+    /// the same reason history is: most tool calls never ask one, and opening a
+    /// database also creates its directory — a write to the user's Application
+    /// Support they did not ask for.
+    private let sessionReadingSource: LazyAgentSessions
     private let preferences: PreferencesStore
     private let now: @Sendable () -> Date
     private let appRunning: @Sendable () -> Bool
@@ -206,6 +211,9 @@ public struct OnDemandProvider: DataProvider {
         historyFactory: @escaping @Sendable () -> any HistoryReading = {
             OnDemandProvider.openDefaultHistory()
         },
+        sessionReadingFactory: @escaping @Sendable () -> any AgentSessionReadingSource = {
+            AgentSessionReadingFactory.openDefault()
+        },
         preferencesDefaults: UserDefaults? = nil,
         preferencesDomain: String = AppLiveness.bundleIdentifier,
         appRunning: @escaping @Sendable () -> Bool = { AppLiveness.isPortmasterRunning() },
@@ -225,6 +233,7 @@ public struct OnDemandProvider: DataProvider {
             source: snapshotSource, cacheTTL: cacheTTL, snapshotTimeout: snapshotTimeout, now: now
         )
         self.history = LazyHistory(historyFactory)
+        self.sessionReadingSource = LazyAgentSessions(sessionReadingFactory)
         self.preferences = PreferencesStore(
             defaults: preferencesDefaults ?? UserDefaults(suiteName: preferencesDomain) ?? .standard
         )
@@ -342,6 +351,27 @@ public struct OnDemandProvider: DataProvider {
             throw MCPToolError(message: thermalNotSampledMessage)
         }
         return thermal
+    }
+
+    // MARK: Agent sessions
+
+    /// Read-only, and that asymmetry is the point: the app is the store's only
+    /// writer, so reading here sees exactly what the app committed — the same
+    /// direction `StoreHistoryReading` already reads history in. Writing is refused
+    /// on this path for the opposite reason (the reporting process would be
+    /// `portmaster-mcp` itself, filing an agent's tokens against Portmaster), so a
+    /// reader here never becomes a second writer.
+    ///
+    /// `openSessionIDs` is empty because nothing on this path observes a socket:
+    /// there is no host, hence no connection set. Every session therefore reads as
+    /// closed, which is accurate rather than unknown — this process has no open
+    /// sessions — and a caller needing liveness must ask the app-hosted tool.
+    public func agentSessions(
+        limit: Int, openSessionIDs _: Set<UUID>
+    ) async throws -> (sessions: [AgentSessionSnapshot], storeAvailable: Bool, note: String?) {
+        let reading = sessionReadingSource.get()
+            .sessions(limit: limit, openSessionIDs: Set<UUID>())
+        return (reading.sessions, reading.storeAvailable, reading.note)
     }
 
     public func projects() async throws -> [ProjectSummary] {

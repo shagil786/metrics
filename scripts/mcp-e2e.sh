@@ -9,7 +9,7 @@
 #   Phase 1 — app closed. The CLI must find no host, fall back to its own sweep, refuse
 #             a mutation and leave a `denied` audit line.
 #   Phase 2 — app launched. The endpoint file and socket must exist with owner-only
-#             modes, `tools/list` over the socket must return 14 tools, and a
+#             modes, `tools/list` over the socket must return 15 tools, and a
 #             `set_preference` must reach a person and produce a decision on the record.
 #
 # ONE MANUAL STEP. Phase 2's last check needs a click. `confirmEach` means "ask a person",
@@ -338,7 +338,7 @@ for line in open(sys.argv[1]):
         print(len(message.get("result", {}).get("tools", [])))
         break
 ' "$out")
-check 'tools/list over the socket returns 14 tools' "$tool_count" '14'
+check 'tools/list over the socket returns 15 tools' "$tool_count" '15'
 
 # --- a relayed mutation that needs nobody -------------------------------------
 #

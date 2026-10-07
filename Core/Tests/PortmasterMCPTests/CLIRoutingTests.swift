@@ -115,7 +115,7 @@ final class CLIRoutingTests: XCTestCase {
             ToolExecutor.catalog.map(\.name).sorted(),
             "the app must answer with exactly the catalog the CLI would serve itself"
         )
-        XCTAssertEqual(relayed.count, 14, "the catalog is 14 tools")
+        XCTAssertEqual(relayed.count, 15, "the catalog is 15 tools")
     }
 
     /// The relay is a relay: the call arrives at the host's own call surface with the

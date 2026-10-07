@@ -434,3 +434,137 @@ struct ResourceHistoryPointPayload: Encodable {
         value = point.value
     }
 }
+
+// MARK: - Agent sessions
+
+/// One session's usage, with the absence kept distinct from a measured zero.
+///
+/// The counts are `nil` for every not-reported case, and `reason` names which one.
+/// A caller cannot read this as "zero tokens" — which would say a session was free
+/// when in fact nobody counted it. That distinction is the whole reason
+/// `TokenUsage` is a three-state value, and it would be lost the moment this
+/// payload collapsed to two integers.
+struct TokenUsagePayload: Encodable {
+    let reported: Bool
+    let inputTokens: Int?
+    let outputTokens: Int?
+    /// Which source produced the figure, or nil when there is none. A number whose
+    /// origin is unknown cannot be audited, so this is never omitted in favour of
+    /// a default.
+    let provenance: String?
+    /// Why no figure exists: `noSource`, `logUnreadable`, `unrecognizedFormat`,
+    /// `awaitingFirstReport`. Present only when `reported` is false.
+    let reason: String?
+
+    init(_ usage: TokenUsage) {
+        switch usage {
+        case .reported(let input, let output, let provenance):
+            self.reported = true
+            self.inputTokens = input
+            self.outputTokens = output
+            self.provenance = provenance.rawValue
+            self.reason = nil
+        case .notReported(let reason):
+            self.reported = false
+            self.inputTokens = nil
+            self.outputTokens = nil
+            self.provenance = nil
+            self.reason = reason.rawValue
+        }
+    }
+}
+
+/// A session's cost, with `notPriced` and `conflict` distinct from a priced zero.
+struct SessionCostPayload: Encodable {
+    let priced: Bool
+    let usd: String?
+    let priceTableVersion: Int?
+    /// `unpriced`, `conflict`, or `noUsage` when `priced` is false.
+    let reason: String?
+    /// The model id that has no price, or the model ids that disagreed. Populated
+    /// for `unpriced` and `conflict` alike, so a caller can act on either — which
+    /// is why `reason` distinguishes them rather than the field being absent.
+    let models: [String]?
+
+    init(_ cost: SessionCost) {
+        switch cost {
+        case .priced(let usd, let version):
+            self.priced = true
+            // A string, not a JSON number: binary floating point cannot carry money
+            // and a decimal string round-trips through any client unchanged.
+            self.usd = NSDecimalNumber(decimal: usd).stringValue
+            self.priceTableVersion = version
+            self.reason = nil
+            self.models = nil
+        case .notPriced(let modelID):
+            self.priced = false
+            self.usd = nil
+            self.priceTableVersion = nil
+            self.reason = "unpriced"
+            self.models = [modelID]
+        case .conflict(let models):
+            self.priced = false
+            self.usd = nil
+            self.priceTableVersion = nil
+            self.reason = "conflict"
+            self.models = models
+        case .noUsage:
+            self.priced = false
+            self.usd = nil
+            self.priceTableVersion = nil
+            self.reason = "noUsage"
+            self.models = nil
+        }
+    }
+}
+
+struct AgentSessionPayload: Encodable {
+    let id: String
+    /// Omitted when the kernel would not say. `LOCAL_PEERPID` is a `getsockopt`
+    /// that can simply fail, and 0 is a plausible-looking pid — every other
+    /// optional in this file is left out rather than zero-filled, and an AI client
+    /// reading this payload has no way to know 0 means "unknown". The same rule
+    /// `MCPSettingsCopy` follows when it renders a process as "not known".
+    let peerPID: Int32?
+    /// Always nil on the socket path today: the MCP SDK consumes the `initialize`
+    /// handshake, so nothing in the host sees a client name. Carried anyway so a
+    /// payload built elsewhere with one does not lose it.
+    let clientName: String?
+    let clientVersion: String?
+    let connectedAt: Date
+    /// Whether the host currently has this connection open, read from the host's
+    /// live connection set at call time (`MCPHostController.connectedSessionIDs`).
+    /// There is
+    /// no `endedAt` on the wire because nothing observes a socket closing, and a
+    /// payload that implied one would be inventing a fact.
+    let isOpen: Bool
+    let usage: TokenUsagePayload
+    let cost: SessionCostPayload
+
+    init(_ session: AgentSessionSnapshot, isOpen: Bool) {
+        self.id = session.id.uuidString
+        self.peerPID = session.peerPID > 0 ? session.peerPID : nil
+        self.clientName = session.clientName
+        self.clientVersion = session.clientVersion
+        self.connectedAt = session.connectedAt
+        self.isOpen = isOpen
+        self.usage = TokenUsagePayload(session.usage)
+        self.cost = SessionCostPayload(session.cost)
+    }
+}
+
+struct AgentSessionsPayload: Encodable {
+    let sessions: [AgentSessionPayload]
+    /// Whether the store could be opened at all. False means the list is not
+    /// "no sessions" but "nothing could be read", and a caller that collapses the
+    /// two would tell a user they have no agent history when the database simply
+    /// would not open.
+    let storeAvailable: Bool
+    let note: String?
+
+    init(sessions: [AgentSessionPayload], storeAvailable: Bool, note: String?) {
+        self.sessions = sessions
+        self.storeAvailable = storeAvailable
+        self.note = note
+    }
+}

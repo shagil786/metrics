@@ -177,6 +177,11 @@ public struct LiveDataProvider: DataProvider {
     private let snapshotSource: @Sendable () async throws -> ObservationSnapshot
     private let alertsSource: @Sendable () async -> AlertsSnapshot
     private let history: LazyHistory
+    /// Opens the app's long-lived session store. Injected rather than located from
+    /// here so `PortmasterMCP` never reaches into the app's own model: the app owns
+    /// that store's lifetime, and a provider opening a second one would make it a
+    /// second writer to a database the app also writes.
+    private let sessionReadingSource: (@Sendable () async -> (any AgentSessionReadingSource)?)?
     private let settingsSource: @Sendable () async -> SettingsSnapshot
     private let applyPreference: @Sendable (String, String) async throws -> Void
     private let stopApp: @Sendable (String, Bool) async throws -> StopReport
@@ -209,7 +214,8 @@ public struct LiveDataProvider: DataProvider {
         applyPreference: @escaping @Sendable (String, String) async throws -> Void,
         stopApp: @escaping @Sendable (String, Bool) async throws -> StopReport,
         stopContainerNamed: @escaping @Sendable (String) async throws -> StopReport,
-        stopProject: @escaping @Sendable (String) async throws -> StopReport
+        stopProject: @escaping @Sendable (String) async throws -> StopReport,
+        sessionReading: (@Sendable () async -> (any AgentSessionReadingSource)?)? = nil
     ) {
         self.snapshotSource = snapshot
         self.alertsSource = alerts
@@ -222,6 +228,7 @@ public struct LiveDataProvider: DataProvider {
         self.stopApp = stopApp
         self.stopContainerNamed = stopContainerNamed
         self.stopProject = stopProject
+        self.sessionReadingSource = sessionReading
     }
 
     // MARK: Snapshot reads
@@ -291,6 +298,24 @@ public struct LiveDataProvider: DataProvider {
     public func projects() async throws -> [ProjectSummary] {
         OnDemandProvider.projectSummaries(from: try await snapshot())
     }
+
+    // MARK: Agent sessions
+
+    /// The app is the only writer, so it holds the store open for its lifetime and
+    /// answers from that — no reopen per call, and no second writer appearing.
+    public func agentSessions(
+        limit: Int, openSessionIDs: Set<UUID>
+    ) async throws -> (sessions: [AgentSessionSnapshot], storeAvailable: Bool, note: String?) {
+        guard let reading = await sessionReadingSource?() else {
+            return (
+                [], false,
+                AgentSessionReadingFactory.unavailableMessage
+            )
+        }
+        let result = reading.sessions(limit: limit, openSessionIDs: openSessionIDs)
+        return (result.sessions, result.storeAvailable, result.note)
+    }
+
 
     // MARK: History reads
 

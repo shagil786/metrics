@@ -283,7 +283,7 @@ final class CLIIntegrationTests: XCTestCase {
         XCTAssertNil(listed["error"], "\(listed)")
         let tools = try XCTUnwrap(listed["result"] as? [String: Any])
         XCTAssertEqual(
-            ((tools["tools"] as? [[String: Any]]) ?? []).count, 14,
+            ((tools["tools"] as? [[String: Any]]) ?? []).count, 15,
             "the fallback must serve the same catalog the app would"
         )
 
@@ -341,7 +341,7 @@ final class CLIIntegrationTests: XCTestCase {
         )
         let tools = try XCTUnwrap(listed["result"] as? [String: Any], "\(listed)")
         XCTAssertEqual(
-            ((tools["tools"] as? [[String: Any]]) ?? []).count, 14,
+            ((tools["tools"] as? [[String: Any]]) ?? []).count, 15,
             "a relayed session must list the same catalog the app serves"
         )
 

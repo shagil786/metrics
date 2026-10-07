@@ -133,6 +133,20 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return projectSummaries
     }
 
+    /// Canned sessions plus a flag for whether the store could be opened, because
+    /// "no sessions" and "could not read" are different answers and a stub that
+    /// could only produce the first would let a payload claim a user had no agent
+    /// history when the database simply would not open.
+    var agentSessionResult:
+        (sessions: [AgentSessionSnapshot], storeAvailable: Bool, note: String?) = ([], true, nil)
+
+    func agentSessions(
+        limit: Int, openSessionIDs _: Set<UUID>
+    ) async throws -> (sessions: [AgentSessionSnapshot], storeAvailable: Bool, note: String?) {
+        try enter("agentSessions")
+        return agentSessionResult
+    }
+
     func historyRankings(
         window: HistoryWindow, resource: HistoryResource?
     ) async throws -> [AppHistoryTrend] {
@@ -207,16 +221,16 @@ final class ToolExecutorReadTests: XCTestCase {
 
     // MARK: Catalog
 
-    func testCatalogDeclaresFourteenToolsAndClassifiesEffects() {
+    func testCatalogDeclaresFifteenToolsAndClassifiesEffects() {
         let catalog = ToolExecutor.catalog
-        XCTAssertEqual(catalog.count, 14, "catalog must declare all 14 tools")
+        XCTAssertEqual(catalog.count, 15, "catalog must declare all 15 tools")
 
         let names = catalog.map(\.name)
-        XCTAssertEqual(Set(names).count, 14, "tool names must be unique")
+        XCTAssertEqual(Set(names).count, 15, "tool names must be unique")
 
         let expected: Set<String> = [
             "get_system_overview", "get_top_apps", "get_app_detail", "get_containers",
-            "get_projects", "get_history_rankings", "get_temperatures_fans",
+            "get_projects", "get_history_rankings", "get_temperatures_fans", "get_agent_sessions",
             "get_active_alerts", "get_settings", "report_usage",
             "quit_app", "stop_container", "stop_project", "set_preference"
         ]
@@ -227,7 +241,7 @@ final class ToolExecutorReadTests: XCTestCase {
             mutations,
             ["quit_app", "stop_container", "stop_project", "set_preference"]
         )
-        XCTAssertEqual(catalog.filter { $0.effect == .read }.count, 10)
+        XCTAssertEqual(catalog.filter { $0.effect == .read }.count, 11)
         for tool in catalog {
             XCTAssertFalse(tool.description.isEmpty, "\(tool.name) needs a description")
         }

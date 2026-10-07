@@ -70,6 +70,15 @@ public struct HostMCPCallContext: MCPToolCalling {
     /// one id — valid UUIDs, existing rows, successful reads, all of them naming the
     /// wrong connection. The id arrives per call instead; see `MCPConnectionSession`.
     private let sessionRecorder: any SessionRecording
+    /// The host's currently-open agent session ids, so `get_agent_sessions` can say
+    /// which rows are live.
+    ///
+    /// A closure rather than a stored set, for the same reason the recorder takes an
+    /// id per call: this context is shared across every connection, so anything it
+    /// held would be shared too. Reading the host's live set at call time keeps the
+    /// answer current, and a stale set would mark a just-closed session open — an
+    /// absence of evidence read as evidence.
+    private let liveSessionIDs: @Sendable () async -> Set<UUID>
 
     /// - Parameters:
     ///   - provider: the app's own data. `LiveDataProvider` in production.
@@ -95,7 +104,8 @@ public struct HostMCPCallContext: MCPToolCalling {
         appRunning: @escaping @Sendable () -> Bool = { AppLiveness.isPortmasterRunning() },
         auditDirectory: URL? = nil,
         settingsDirectory: URL? = nil,
-        sessionRecorder: (any SessionRecording)? = nil
+        sessionRecorder: (any SessionRecording)? = nil,
+        liveSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() }
     ) {
         self.provider = provider
         self.broker = broker
@@ -105,6 +115,7 @@ public struct HostMCPCallContext: MCPToolCalling {
         self.auditDirectory = auditDirectory
         self.settingsDirectory = settingsDirectory
         self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
+        self.liveSessionIDs = liveSessionIDs
     }
 
     /// The two-argument entry point, for a call that arrived with no connection behind
@@ -337,7 +348,8 @@ public struct HostMCPCallContext: MCPToolCalling {
             audit: AuditLog(directory: auditDirectory),
             settingsDirectory: settingsDirectory,
             sessionRecorder: sessionRecorder,
-            sessionID: session?.id
+            sessionID: session?.id,
+            openSessionIDs: { await liveSessionIDs() }
         )
     }
 

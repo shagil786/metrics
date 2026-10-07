@@ -25,7 +25,7 @@
 // Two more, added on review of the first version:
 //
 //  5. **The page must not claim anything that can go stale.** The read-tools sentence
-//     enumerated six tool names and was already wrong about a ten-tool catalog — three
+//     enumerated six tool names and was already wrong about the tool catalog's size — three
 //     tools unnamed, and memory/network/disk being *arguments* to `get_top_apps` rather
 //     than reads of their own. It now counts `ToolExecutor.catalog`, so a new read tool
 //     moves the number instead of making the sentence a lie.
@@ -79,7 +79,7 @@ public enum MCPSettingsCopy {
     ///
     /// **Counts the catalog rather than naming tools in the sentence.** The earlier
     /// version listed "CPU, memory, apps, containers, projects, history" and was already
-    /// wrong: the catalog has ten read tools, three of them unnamed in that list, and
+    /// wrong: the catalog has eleven read tools, three of them unnamed in that list, and
     /// memory/network/disk are *arguments* to `get_top_apps` rather than reads of their
     /// own. A sentence that enumerates tools goes stale the moment one is added and nobody
     /// notices, and this one is the string a person is most likely to hold against

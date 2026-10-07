@@ -58,6 +58,14 @@ public struct ToolExecutor: Sendable {
     /// (`~/.portmaster`); the parameter exists so a test can write somewhere
     /// disposable instead.
     private let settingsDirectory: URL?
+    /// The host's currently-open agent session ids.
+    ///
+    /// One source, used twice: handed to the provider so it can decide what it
+    /// knows, and read here to mark each payload's `isOpen`. Deliberately a single
+    /// stored value rather than something each path derives — a second derivation
+    /// is how a payload's liveness and the store's would come to disagree, which is
+    /// the shape of bug the session-identity work already hit once.
+    private let openSessionIDs: @Sendable () async -> Set<UUID>
     /// Where `report_usage` appends. Optional so the tool can exist in contexts with
     /// no store; `UnavailableSessionRecorder` then refuses with a reason rather than
     /// accepting a report that would be dropped.
@@ -75,7 +83,8 @@ public struct ToolExecutor: Sendable {
         audit: AuditLog,
         settingsDirectory: URL? = nil,
         sessionRecorder: (any SessionRecording)? = nil,
-        sessionID: UUID? = nil
+        sessionID: UUID? = nil,
+        openSessionIDs: @escaping @Sendable () async -> Set<UUID> = { Set<UUID>() }
     ) {
         self.provider = provider
         self.gate = gate
@@ -83,9 +92,10 @@ public struct ToolExecutor: Sendable {
         self.settingsDirectory = settingsDirectory
         self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
         self.sessionID = sessionID
+        self.openSessionIDs = openSessionIDs
     }
 
-    /// All 14 tools the MCP server exposes. Names wired into dispatch stay in
+    /// All 15 tools the MCP server exposes. Names wired into dispatch stay in
     /// step with this list, because `execute` refuses anything not declared here.
     public static let catalog: [ToolDefinition] = [
         // Reads
@@ -111,6 +121,17 @@ public struct ToolExecutor: Sendable {
             description: "One app's totals plus a per-process breakdown.",
             arguments: [
                 (name: "id", required: true, help: "App id from get_top_apps")
+            ],
+            effect: .read
+        ),
+        ToolDefinition(
+            name: "get_agent_sessions",
+            description: "AI agent sessions that have connected to this machine, newest "
+                + "first, with the tokens each one reported and what that cost. A session "
+                + "that reported nothing says so rather than reporting zero, and a model "
+                + "with no price says so rather than costing nothing.",
+            arguments: [
+                (name: "limit", required: false, help: "How many sessions to return (1-100, default 20)")
             ],
             effect: .read
         ),
@@ -333,6 +354,21 @@ public struct ToolExecutor: Sendable {
 
         case "get_app_detail":
             return AppRollupPayload(try await provider.appDetail(id: Self.id(arguments)))
+
+        case "get_agent_sessions":
+            let sessionsLimit = try Self.sessionLimit(arguments["limit"])
+            // Read once and used twice — for the provider's own answer and for each
+            // payload's `isOpen`. Two reads would be two moments, and a session
+            // closing between them would be priced by one and marked by the other.
+            let open = await openSessionIDs()
+            let (sessions, storeAvailable, note) = try await provider.agentSessions(
+                limit: sessionsLimit, openSessionIDs: open
+            )
+            return AgentSessionsPayload(
+                sessions: sessions.map { AgentSessionPayload($0, isOpen: open.contains($0.id)) },
+                storeAvailable: storeAvailable,
+                note: note
+            )
 
         case "get_containers":
             return ContainersPayload(try await provider.containers())
@@ -578,6 +614,19 @@ public struct ToolExecutor: Sendable {
     /// range is stated the same way however it was missed.
     private static func invalidLimit(_ raw: String) -> String {
         "Invalid limit: \(raw) (must be 1...\(maxTopApps))"
+    }
+
+    /// How many sessions to return. Bounded because the list is unbounded in
+    /// principle — nothing deletes a session but the user's own retention setting.
+    static func sessionLimit(_ raw: String?) throws -> Int {
+        guard let raw, !raw.trimmingCharacters(in: .whitespaces).isEmpty else { return 20 }
+        guard let value = Int(raw.trimmingCharacters(in: .whitespaces)) else {
+            throw MCPToolError(message: "limit must be a whole number.")
+        }
+        guard (1...100).contains(value) else {
+            throw MCPToolError(message: "limit must be between 1 and 100.")
+        }
+        return value
     }
 
     /// A token count. Negative is refused rather than clamped: a negative count is a

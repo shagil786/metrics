@@ -173,6 +173,21 @@ public protocol DataProvider: Sendable {
     func appDetail(id: String) async throws -> AppRollup
     func containers() async throws -> DockerSample
     func projects() async throws -> [ProjectSummary]
+    /// Agent sessions, newest first, with each one's usage and cost.
+    ///
+    /// `storeAvailable` is separate from an empty list on purpose. An empty
+    /// `sessions` array means "the store opened and holds no sessions"; a store
+    /// that would not open must say so, because "no agent history" and "could not
+    /// read the history" are different claims and a caller told the first would
+    /// report a user as never having used an agent.
+    ///
+    /// `openSessionIDs` is the host's live set. It exists because nothing observes
+    /// a socket closing, so there is no stored end time to read — liveness is the
+    /// only honest signal available. A provider with no live set (the CLI) passes
+    /// an empty set, which means "nothing is open *that this process knows of*".
+    func agentSessions(
+        limit: Int, openSessionIDs: Set<UUID>
+    ) async throws -> (sessions: [AgentSessionSnapshot], storeAvailable: Bool, note: String?)
     /// App CPU/memory totals over the window. The executor never fills `resource`
     /// here — it always passes nil and sends resource reads to
     /// `historyResources` — so do not write a non-nil branch for it.

@@ -46,7 +46,7 @@ final class MCPHostServerTests: XCTestCase {
             "tools/list must expose exactly the catalog, in the catalog's set"
         )
         XCTAssertEqual(
-            tools.tools.count, 14, "the catalog is 14 tools, and all of them must be listed"
+            tools.tools.count, 15, "the catalog is 15 tools, and all of them must be listed"
         )
 
         let called = try await session.client.callTool(name: "get_settings", arguments: [:])
@@ -177,7 +177,7 @@ final class MCPHostServerTests: XCTestCase {
         defer { session.cancel() }
         let tools = try await session.client.listTools()
         XCTAssertEqual(
-            tools.tools.count, 14,
+            tools.tools.count, 15,
             "the host must keep serving after rejecting a wrong token"
         )
     }

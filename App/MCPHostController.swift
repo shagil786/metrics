@@ -307,7 +307,26 @@ final class MCPHostController: ObservableObject {
             // be shared by every connection this host ever serves, and each one's
             // reports would then carry the same id. `MCPHostServer` binds one per
             // connection, at accept time, and passes it down per call.
-            sessionRecorder: AppModel.shared.agentSessionStore.map(StoreSessionRecorder.init)
+            sessionRecorder: AppModel.shared.agentSessionStore.map(StoreSessionRecorder.init),
+            // A closure for the same reason the recorder is not given an id: this
+            // context is shared across every connection, so a set held here would be
+            // a snapshot rather than the host's live state.
+            // `[weak self]`, and not incidentally: `makeContext` exists so the
+            // context does not close over the controller. A strong capture here
+            // rebuilds the cycle controller → host → context → closure →
+            // controller, which the comment above this function forbids in so many
+            // words. `present:` six lines up is weak for the same reason.
+            liveSessionIDs: { [weak self] in
+                // `self` is read into a local before the hop, not captured *inside*
+                // it: a `weak` reference is a mutable box, so using it directly in a
+                // nested concurrently-executing closure is a SendableClosureCaptures
+                // violation — a warning today, an error under the Swift 6 language
+                // mode this project is not yet on.
+                let controller = self
+                return await MainActor.run {
+                    controller?.connectedSessionIDs ?? Set<UUID>()
+                }
+            }
         )
     }
 
@@ -315,9 +334,9 @@ final class MCPHostController: ObservableObject {
     ///
     /// Every closure hands on to `live` and nothing else: the app is the sampler,
     /// the app is the writer, and the app's own coordinator is what signals a pid.
-    /// Bound once as a local rather than captured through `self`, so the eight
-    /// closures reference the state box rather than the controller — and so no closure
-    /// can reach back into the controller from a socket thread.
+    /// Bound once as a local rather than captured through `self`, so the closures
+    /// reference the state box rather than the controller — and so no closure can
+    /// reach back into the controller from a socket thread.
     private func makeProvider() -> LiveDataProvider {
         let live = self.live
         return LiveDataProvider(
@@ -329,7 +348,19 @@ final class MCPHostController: ObservableObject {
             applyPreference: { key, value in try await live.applyPreference(key: key, value: value) },
             stopApp: { id, force in try await live.stopApp(id: id, force: force) },
             stopContainerNamed: { id in try await live.stopContainer(id: id) },
-            stopProject: { id in try await live.stopProject(id: id) }
+            stopProject: { id in try await live.stopProject(id: id) },
+            // Read over the app's own long-lived store — the same one the recorder
+            // appends to. Read per call rather than captured, so a session recorded
+            // a moment ago is visible to the very next tool call.
+            // Read per call rather than captured, so a session recorded a moment ago
+            // is visible to the very next tool call. Hopped to the main actor because
+            // the store is owned there and this closure runs on a socket thread —
+            // the same hop the `present:` closure above makes.
+            sessionReading: {
+                await MainActor.run {
+                    AppModel.shared.agentSessionStore.map { StoreAgentSessionReading(store: $0) }
+                }
+            }
         )
     }
 
