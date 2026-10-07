@@ -13,10 +13,14 @@ import Foundation
 import PortmasterCore
 
 public protocol SessionRecording: Sendable {
-    /// Appends one self-reported usage observation. Returns a sentence the caller
-    /// can hand back to the agent, so a refusal and a success are both legible.
+    /// Appends one self-reported usage observation against a session the caller
+    /// already owns. Returns a sentence the caller can hand back to the agent, so a
+    /// refusal and a success are both legible.
+    ///
+    /// `sessionID` names an existing session; the recorder never creates one. See
+    /// `StoreSessionRecorder`.
     func record(
-        sessionID: UUID?, clientName: String?, clientVersion: String?,
+        sessionID: UUID,
         input: Int, output: Int, cacheRead: Int?, reasoning: Int?, modelID: String
     ) throws -> String
 }
@@ -24,6 +28,15 @@ public protocol SessionRecording: Sendable {
 /// Writes into the SwiftData store. Fails loudly rather than swallowing: a report
 /// that vanishes would leave the session reading `notReported` with no way to tell
 /// a lost write from an agent that never reported.
+///
+/// **Appends only; it never writes the session row.** The caller owns that row's
+/// identity — peer pid, client name, client version, connect time — and knows all
+/// four. `AgentSessionStore.recordSession` is an upsert that overwrites, so writing
+/// it from here with anything less than the real values would reset the pid to `0`
+/// and the client name to `nil` on the first report of a session the connection
+/// layer had already described correctly. `clientName` and `clientVersion` were
+/// removed from `record` for the same reason: they exist only to populate that row,
+/// and a recorder that no longer writes the row has no use for them.
 public struct StoreSessionRecorder: SessionRecording {
     private let store: AgentSessionStore
 
@@ -32,25 +45,11 @@ public struct StoreSessionRecorder: SessionRecording {
     }
 
     public func record(
-        sessionID: UUID?, clientName: String?, clientVersion: String?,
+        sessionID: UUID,
         input: Int, output: Int, cacheRead: Int?, reasoning: Int?, modelID: String
     ) throws -> String {
-        let id = sessionID ?? UUID()
-        // The session row is only written when a session id was supplied. A usage
-        // record for an id no session row names is unreachable through every
-        // session-scoped read, so an unattributed report is a caller that could
-        // name its own session and did not.
-        if let sessionID {
-            try store.recordSession(
-                id: sessionID,
-                peerPID: 0,
-                clientName: clientName,
-                clientVersion: clientVersion,
-                connectedAt: Date()
-            )
-        }
         try store.recordUsage(TokenUsageRecord(
-            sessionID: id,
+            sessionID: sessionID,
             recordedAt: Date(),
             input: input, output: output,
             cacheRead: cacheRead, reasoning: reasoning,
@@ -69,7 +68,7 @@ public struct UnavailableSessionRecorder: SessionRecording {
     public init() {}
 
     public func record(
-        sessionID: UUID?, clientName: String?, clientVersion: String?,
+        sessionID: UUID,
         input: Int, output: Int, cacheRead: Int?, reasoning: Int?, modelID: String
     ) throws -> String {
         throw MCPToolError(

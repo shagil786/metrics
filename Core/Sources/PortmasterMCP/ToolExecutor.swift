@@ -62,19 +62,27 @@ public struct ToolExecutor: Sendable {
     /// no store; `UnavailableSessionRecorder` then refuses with a reason rather than
     /// accepting a report that would be dropped.
     private let sessionRecorder: any SessionRecording
+    /// The connection a `report_usage` call is attributed to, or nil when this
+    /// executor was built without one. The recorder appends against an existing
+    /// session row and never creates one, so an unattributable report is refused
+    /// rather than filed under a fresh id — a usage record no session row names is
+    /// unreachable through every session-scoped read.
+    private let sessionID: UUID?
 
     public init(
         provider: DataProvider,
         gate: PermissionGate,
         audit: AuditLog,
         settingsDirectory: URL? = nil,
-        sessionRecorder: (any SessionRecording)? = nil
+        sessionRecorder: (any SessionRecording)? = nil,
+        sessionID: UUID? = nil
     ) {
         self.provider = provider
         self.gate = gate
         self.audit = audit
         self.settingsDirectory = settingsDirectory
         self.sessionRecorder = sessionRecorder ?? UnavailableSessionRecorder()
+        self.sessionID = sessionID
     }
 
     /// All 14 tools the MCP server exposes. Names wired into dispatch stay in
@@ -389,7 +397,7 @@ public struct ToolExecutor: Sendable {
             )
             let reasoning = try Self.optionalNonNegative(arguments["reasoning"], field: "reasoning")
             let note = try sessionRecorder.record(
-                sessionID: nil, clientName: nil, clientVersion: nil,
+                sessionID: try requireSessionID(),
                 input: input, output: output,
                 cacheRead: cacheRead, reasoning: reasoning, modelID: model
             )
@@ -585,12 +593,37 @@ public struct ToolExecutor: Sendable {
         return try nonNegative(raw, field: field)
     }
 
+    /// A required string that must carry something.
+    ///
+    /// `execute` already refuses a missing or blank required argument before
+    /// dispatch, and `model` is required — so through the tool this never throws.
+    /// Kept anyway for the same reason `set_preference` re-unwraps its own
+    /// arguments: dispatch validates what it was handed instead of trusting a
+    /// caller to have done it, so a second caller reaching `report_usage` cannot
+    /// record a usage row priced against an empty model id.
     static func nonBlank(_ raw: String?, field: String) throws -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespaces) ?? ""
         guard !trimmed.isEmpty else {
             throw MCPToolError(message: "\(field) is required.")
         }
         return trimmed
+    }
+
+    /// The session a report is filed under, or a refusal saying why there is none.
+    ///
+    /// Its own failure rather than a `nil` passed down: the recorder appends against
+    /// an existing session and never creates one, so a missing attribution cannot be
+    /// papered over with a fresh id — that record would be invisible to every
+    /// session-scoped read, and the session would read `notReported` with no way to
+    /// tell a lost report from one never made.
+    private func requireSessionID() throws -> UUID {
+        guard let sessionID else {
+            throw MCPToolError(
+                message: "Portmaster cannot tell which session this report belongs to, "
+                    + "so it was not recorded."
+            )
+        }
+        return sessionID
     }
 
     // MARK: Ranking
