@@ -49,12 +49,20 @@ public struct RawProcess: Sendable {
     /// (proc_pid_rusage). nil when the kernel did not report them.
     public let diskReadBytes: UInt64?
     public let diskWriteBytes: UInt64?
+    /// Cumulative billed energy counter (proc_pid_rusage `rusage_info_v6.ri_billed_energy`).
+    /// A counter, not a rate — the sampler differences two sweeps to get one.
+    ///
+    /// nil means the kernel reported nothing usable, which on most current Macs
+    /// means it does not bill energy per process at all. That is distinct from a
+    /// process having used none, so it is nil here rather than 0.
+    public let billedEnergyNanounits: UInt64?
 
     public init(
         pid: pid_t, parentPid: pid_t?, name: String, cpuTicks: UInt64,
         residentBytes: UInt64?, startedAt: Date?, isAppBundle: Bool,
         executablePath: String?, diskReadBytes: UInt64? = nil,
-        diskWriteBytes: UInt64? = nil
+        diskWriteBytes: UInt64? = nil,
+        billedEnergyNanounits: UInt64? = nil
     ) {
         self.pid = pid
         self.parentPid = parentPid
@@ -66,6 +74,7 @@ public struct RawProcess: Sendable {
         self.executablePath = executablePath
         self.diskReadBytes = diskReadBytes
         self.diskWriteBytes = diskWriteBytes
+        self.billedEnergyNanounits = billedEnergyNanounits
     }
 }
 

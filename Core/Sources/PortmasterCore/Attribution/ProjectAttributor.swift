@@ -116,6 +116,7 @@ public final class ProjectAttributor: @unchecked Sendable {
                 cpuTicks: raw.cpuTicks > 0 ? raw.cpuTicks : nil,
                 diskReadBytes: raw.diskReadBytes,
                 diskWriteBytes: raw.diskWriteBytes,
+                billedEnergyNanounits: raw.billedEnergyNanounits,
                 lifecycle: .continuing,
                 projectID: projectID,
                 executablePathHint: raw.executablePath

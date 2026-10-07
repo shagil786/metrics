@@ -8,6 +8,24 @@ public final class LibprocProcessCollector: ProcessCollector {
     private static let timebase: mach_timebase_info_data_t = {
         var value = mach_timebase_info_data_t(); mach_timebase_info(&value); return value
     }()
+
+    /// Whether the kernel advertises per-process energy accounting at all,
+    /// from `ri_energy_nj` on the caller's own pid.
+    ///
+    /// This is a necessary condition, not a sufficient one. Measured on an M4
+    /// Mac mini (macOS 26.6.2): `ri_energy_nj` was non-zero while
+    /// `ri_billed_energy` stayed bit-for-bit constant through four seconds of
+    /// idling and through two seconds of sustained CPU burn. The kernel
+    /// publishes the field and never advances it. Treating this flag as "energy
+    /// is being metered" would render that machine as a measured 0, so the flag
+    /// only gates whether the counter is worth storing — see
+    /// `EnergyRateMonitor` for the question that actually matters.
+    public static let kernelAdvertisesEnergyAccounting: Bool = {
+        var read: UInt64 = 0, written: UInt64 = 0, billed: UInt64 = 0, serviced: UInt64 = 0, nj: UInt64 = 0
+        let ok = pm_rusage_counters(getpid(), &read, &written, &billed, &serviced, &nj) == 0
+        return ok && nj > 0
+    }()
+
     public init() {}
 
     /// PROC_PIDTASKINFO reports Mach absolute-time units, not nanoseconds.
@@ -57,11 +75,34 @@ public final class LibprocProcessCollector: ProcessCollector {
                 numer: Self.timebase.numer, denom: Self.timebase.denom) ?? 0 : 0
             let resident: UInt64? = hasTask ? task.pti_resident_size : nil
 
-            // Cumulative disk I/O via proc_pid_rusage (supported libproc API,
-            // same permission profile as the calls above). nil when the pid
-            // exits mid-sweep — shown as unknown, never zero.
+            // Cumulative disk I/O and energy via proc_pid_rusage (supported
+            // libproc API, same permission profile as the calls above). nil
+            // when the pid exits mid-sweep — shown as unknown, never zero.
+            //
+            // One call for both: RUSAGE_INFO_CURRENT is rusage_info_v6 and
+            // carries the energy counters beside the disk ones, so a second
+            // call per process per sweep would buy nothing.
             var diskRead: UInt64 = 0, diskWrite: UInt64 = 0
-            let diskOK = pm_rusage_disk(pid, &diskRead, &diskWrite) == 0
+            var billedEnergy: UInt64 = 0, servicedEnergy: UInt64 = 0, energyNJ: UInt64 = 0
+            let countersOK = pm_rusage_counters(pid, &diskRead, &diskWrite,
+                                                 &billedEnergy, &servicedEnergy, &energyNJ) == 0
+            let diskOK = countersOK
+
+            // Energy counters ride along with the disk read above.
+            //
+            // Recorded whenever the kernel offers the field at all
+            // (`ri_energy_nj > 0`), NOT gated on the counter being non-zero.
+            // That flag says the kernel claims to bill energy; it does not
+            // promise the counter ever moves, and on at least one real machine
+            // (an M4 Mac mini, macOS 26) it does not: the counter is populated
+            // and frozen under a sustained CPU burn. Deciding "no accounting"
+            // from a static zero value would report that machine as having
+            // measured zero energy, which is a claim nobody can support.
+            //
+            // Whether these numbers mean anything is settled by whether any
+            // counter ever advances — see EnergyRateMonitor, which turns that
+            // observation into the machine-level answer the UI needs.
+            let energyCounter: UInt64? = (countersOK && energyNJ > 0) ? billedEnergy : nil
 
             var pathBuf = [CChar](repeating: 0, count: 4096)
             let pathLen = proc_pidpath(pid, &pathBuf, UInt32(pathBuf.count))
@@ -103,7 +144,8 @@ public final class LibprocProcessCollector: ProcessCollector {
                 isAppBundle: isApp,
                 executablePath: path,
                 diskReadBytes: diskOK ? diskRead : nil,
-                diskWriteBytes: diskOK ? diskWrite : nil
+                diskWriteBytes: diskOK ? diskWrite : nil,
+                billedEnergyNanounits: energyCounter
             ))
         }
 

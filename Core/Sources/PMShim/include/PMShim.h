@@ -26,20 +26,57 @@ static inline int pm_exec_path(pid_t pid, char *buf, uint32_t buflen) {
     return rc > 0 ? rc : 0;
 }
 
-/// Cumulative disk I/O byte counts for a process via proc_pid_rusage
+/// Cumulative disk I/O and energy counters for a process via proc_pid_rusage
 /// (RUSAGE_INFO_CURRENT, public libproc API; works for the caller's own
-/// processes without special permission). Returns 0 on success and fills
-/// both counters; nonzero on failure (short-lived pid, permission).
-static inline int pm_rusage_disk(pid_t pid,
-                                 unsigned long long *out_read_bytes,
-                                 unsigned long long *out_written_bytes) {
+/// processes without special permission). Returns 0 on success and fills every
+/// counter; nonzero on failure (short-lived pid, permission).
+///
+/// Energy is read here rather than in a second function because it is the same
+/// `rusage_info_current` struct this already copies out of: RUSAGE_INFO_CURRENT
+/// is RUSAGE_INFO_V6 (sys/resource.h), and v6 carries ri_billed_energy,
+/// ri_serviced_energy, ri_energy_nj and ri_penergy_nj alongside the disk
+/// counters. A separate call would repeat the same kernel round trip once per
+/// process per sweep for no new information.
+///
+/// Units are the kernel's own and are NOT documented by the SDK — the headers
+/// declare these as bare uint64_t with no comment, and no Apple documentation
+/// states them. They are counters, not instantaneous power: a rate needs two
+/// samples and a delta. Treat the derived value as "energy units per second"
+/// until a reading on real hardware confirms the scale; do not render it as
+/// watts on the strength of this comment.
+///
+/// ri_energy_nj is the kernel's statement of whether energy accounting exists
+/// for this process at all. When it is zero the machine does not bill energy
+/// per process, and every other field here is zero as a consequence — not as a
+/// measurement of a process that used no energy. Callers must distinguish the
+/// two; see ProcessEnergy.
+static inline int pm_rusage_counters(pid_t pid,
+                                     unsigned long long *out_read_bytes,
+                                     unsigned long long *out_written_bytes,
+                                     unsigned long long *out_billed_energy,
+                                     unsigned long long *out_serviced_energy,
+                                     unsigned long long *out_energy_nj) {
     rusage_info_current ri;
     if (proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, (rusage_info_t)&ri) != 0) {
         return -1;
     }
     *out_read_bytes = ri.ri_diskio_bytesread;
     *out_written_bytes = ri.ri_diskio_byteswritten;
+    *out_billed_energy = ri.ri_billed_energy;
+    *out_serviced_energy = ri.ri_serviced_energy;
+    *out_energy_nj = ri.ri_energy_nj;
     return 0;
+}
+
+/// Disk-only convenience wrapper. Kept because callers that do not track energy
+/// should not have to name four unused out-parameters; the underlying read is
+/// identical either way.
+static inline int pm_rusage_disk(pid_t pid,
+                                 unsigned long long *out_read_bytes,
+                                 unsigned long long *out_written_bytes) {
+    unsigned long long billed, serviced, nj;
+    return pm_rusage_counters(pid, out_read_bytes, out_written_bytes,
+                              &billed, &serviced, &nj);
 }
 
 /// argc + argv from sysctl(KERN_PROCARGS2) for another process.

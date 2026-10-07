@@ -47,6 +47,8 @@ public final class SamplingEngine: ObservableObject, @unchecked Sendable {
     private var priorTicks: [pid_t: UInt64] = [:]
     /// Cumulative per-pid disk counters from the previous sweep (proc_pid_rusage).
     private var priorDisk: [pid_t: (read: UInt64, write: UInt64)] = [:]
+    /// Cumulative per-pid billed-energy counter from the previous sweep.
+    private var priorEnergy: [pid_t: UInt64] = [:]
     private var priorSweepAt: Date?
     private var priorPorts: [ListeningPort] = []
     private var lastNettopAt: Date = .distantPast
@@ -491,6 +493,9 @@ static let portPollInterval: TimeInterval = 10
                     dict[row.pid] = (read, write)
                 }
             }
+            priorEnergy = rows.reduce(into: [:]) { dict, row in
+                if let energy = row.billedEnergyNanounits { dict[row.pid] = energy }
+            }
         }
         guard let prevAt = priorSweepAt else {
             priorSweepAt = sweepAt
@@ -514,6 +519,24 @@ static let portPollInterval: TimeInterval = 10
             )
             r.diskReadBytesPerSec = rates.read
             r.diskWriteBytesPerSec = rates.write
+
+            // Energy: same two-sweep derivation over a cumulative counter, with
+            // the machine's no-accounting case kept distinct from zero.
+            //
+            // Compare against the prior sample directly: a rising counter is the
+            // only evidence that this machine meters energy at all, and it is
+            // also what makes the rate below publishable. Latched once observed
+            // so an idle stretch does not retract the capability.
+            if let current = row.billedEnergyNanounits,
+               let was = priorEnergy[row.pid], current > was {
+                observesEnergyRates = true
+            }
+            r.energy = Self.energyState(
+                current: row.billedEnergyNanounits,
+                prior: priorEnergy[row.pid],
+                intervalSeconds: dt,
+                metersEnergy: observesEnergyRates
+            )
 
             // Network: rates from the latest nettop diff (refreshed on its own
             // slower cadence). nil until the first pass completes.
@@ -608,6 +631,54 @@ static let portPollInterval: TimeInterval = 10
         priorNettop = diff.current
         priorNettopAt = now
         netRates = diff.rates
+    }
+
+    /// Per-process energy for this sweep, from two cumulative counter samples.
+    ///
+    /// The three states are the point. `.notReported` is what a Mac whose kernel
+    /// does not bill per-process energy returns, and it must stay distinct from
+    /// `.available(0)`: one is "nobody is counting", the other is "counted, and
+    /// the answer was zero". A machine that cannot measure and a process that
+    /// drew no power are not the same claim, and a monitor that renders both as
+    /// "0 W" is asserting something it does not know.
+    ///
+    /// `.notSampledYet` covers both passes that cannot produce a rate: no prior
+    /// sample to difference against, and a counter that went backwards (the pid
+    /// restarted, so the counter restarted too). Both mean "no rate this pass",
+    /// and neither is a measurement.
+    /// Whether this machine has ever produced a per-process energy rate.
+    ///
+    /// `proc_pid_rusage` publishing `ri_billed_energy` does not mean the number
+    /// is live. An M4 Mac mini (macOS 26.6.2) reports a non-zero `ri_energy_nj`
+    /// — the kernel claims to bill energy — while `ri_billed_energy` never moves,
+    /// not across seconds of idling and not across a sustained CPU burn. Every
+    /// process would therefore read exactly 0 forever.
+    ///
+    /// So "meters energy" is not something the flag answers; it is something
+    /// observation answers. Until any counter has ever advanced, no process
+    /// energy figure can be published, and this stays false. Once a rate is
+    /// observed it stays true: a machine does not stop metering, and a later
+    /// static stretch is a process that was idle, not a lost capability.
+    public private(set) var observesEnergyRates = false
+
+    static func energyState(
+        current: UInt64?, prior: UInt64?, intervalSeconds: Double,
+        metersEnergy: Bool
+    ) -> ProcessEnergy {
+        // The kernel publishes no per-process energy field. Nothing is being
+        // counted, so there is nothing to report — emphatically not zero.
+        guard metersEnergy else { return .notReported }
+        // No counter for this pid: it exited mid-sweep, or the field is absent.
+        // Also not zero.
+        guard let current else { return .notReported }
+        // Counter present but no earlier sample to difference against, or the
+        // interval is unusable. The rate is unknown; a static counter makes
+        // this permanent on a machine that publishes a frozen field.
+        guard let prior, intervalSeconds > 0 else { return .notSampledYet }
+        // Counter reset — the process restarted between sweeps.
+        guard current >= prior else { return .notSampledYet }
+        let dt = max(0.001, intervalSeconds)
+        return .available(nanounitsPerSecond: Double(current - prior) / dt)
     }
 
     /// Per-sweep disk rates. Counters are cumulative since process start, so
