@@ -126,9 +126,18 @@ extension SessionRecording {
 /// and a recorder that no longer writes the row has no use for them.
 public struct StoreSessionRecorder: SessionRecording {
     private let store: AgentSessionStore
+    /// Called after a report lands, so a UI showing sessions updates without
+    /// polling the store. Optional and best-effort: a surface that cannot redraw
+    /// must not stop the report being recorded, so the failure is swallowed here
+    /// rather than thrown back into the tool call.
+    private let onUsageRecorded: (@Sendable () -> Void)?
 
-    public init(store: AgentSessionStore) {
+    public init(
+        store: AgentSessionStore,
+        onUsageRecorded: (@Sendable () -> Void)? = nil
+    ) {
         self.store = store
+        self.onUsageRecorded = onUsageRecorded
     }
 
     /// Available — and saying so with nothing is the point: a refusal here would be a
@@ -149,6 +158,7 @@ public struct StoreSessionRecorder: SessionRecording {
             provenance: .selfReported
         ))
         try store.flush()
+        onUsageRecorded?()
         return "Recorded \(input) input and \(output) output tokens for \(modelID)."
     }
 }

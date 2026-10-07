@@ -307,7 +307,14 @@ final class MCPHostController: ObservableObject {
             // be shared by every connection this host ever serves, and each one's
             // reports would then carry the same id. `MCPHostServer` binds one per
             // connection, at accept time, and passes it down per call.
-            sessionRecorder: AppModel.shared.agentSessionStore.map(StoreSessionRecorder.init),
+            sessionRecorder: AppModel.shared.agentSessionStore.map { store in
+                StoreSessionRecorder(store: store) {
+                    // Hopped to the main actor because the surfaces that redraw on a
+                    // new session are published there, and this closure is called from
+                    // a socket thread.
+                    Task { @MainActor in AppModel.shared.refreshAgentSessions() }
+                }
+            },
             // A closure for the same reason the recorder is not given an id: this
             // context is shared across every connection, so a set held here would be
             // a snapshot rather than the host's live state.

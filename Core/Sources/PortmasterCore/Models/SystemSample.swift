@@ -180,4 +180,74 @@ public enum Fmt {
         if m > 0 { return "\(m)m \(s)s" }
         return "\(s)s"
     }
+    /// A token count in whatever units keep it legible.
+    ///
+    /// Token counts span four orders of magnitude between a trivial session and a
+    /// heavy month, so a fixed rendering would print either `1400000` or `0`. Grouped
+    /// thousands up to a million, then K/M, because that is how the counts appear on
+    /// a provider's own page and comparing against it is the point.
+    public static func tokens(_ count: Int) -> String {
+        let thousand = 1_000
+        let million = 1_000_000
+        switch count {
+        case ..<thousand:
+            return "\(count)"
+        case ..<million:
+            return compact(Double(count) / Double(thousand)) + "K"
+        default:
+            return compact(Double(count) / Double(million)) + "M"
+        }
+    }
+
+    /// One decimal place, dropped when it is zero — so `1.2K` and `12K`, never `12.0K`.
+    private static func compact(_ value: Double) -> String {
+        let rounded = (value * 10).rounded() / 10
+        if rounded == rounded.rounded() {
+            return String(Int(rounded))
+        }
+        return String(format: "%.1f", rounded)
+    }
+
+    /// Money in dollars, sized to the figure rather than to a fixed scale.
+    ///
+    /// **A sub-dollar amount is rendered exactly, not rounded.** These figures can
+    /// be fractions of a cent — two prices of `0.0000015` sum to `0.0000075` — and
+    /// formatting that to a fixed number of decimals prints `0.000008`, which is a
+    /// different number from the one computed. A cost display that silently rounds
+    /// to a wrong figure is the exact failure this whole design exists to prevent,
+    /// so the sub-dollar branch prints the decimal as stored and lets grouping apply
+    /// only above a dollar, where it reads better and no longer risks changing the
+    /// value.
+    ///
+    /// Above a dollar the scale is fixed at two places, which is what an invoice
+    /// shows. Grouping is applied, and the locale is pinned rather than taken from
+    /// the system: left unpinned, a US figure prints as `1,23,450.00` under an
+    /// Indian locale — a correct rendering of a lakh, and an unreadable one here.
+    /// A figure meant to be compared against an invoice is formatted the same way
+    /// everywhere so the number is the only thing that varies.
+    ///
+    /// `Decimal` throughout, for the same reason the cost itself is: a binary float
+    /// cannot represent most decimal fractions exactly, so a total summed from them
+    /// would not reconcile with anything.
+    public static func usd(_ amount: Decimal) -> String {
+        guard amount > Decimal(0) else { return "$0.00" }
+
+        // Below a dollar: the stored decimal, verbatim. `Decimal`'s own description
+        // is the shortest string that round-trips, which is exactly what is wanted —
+        // the figure as computed, not a rounded neighbour of it.
+        guard amount >= Decimal(1) else {
+            return "$" + NSDecimalNumber(decimal: amount).stringValue
+        }
+
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.usesGroupingSeparator = true
+        let text = formatter.string(from: NSDecimalNumber(decimal: amount))
+            ?? NSDecimalNumber(decimal: amount).stringValue
+        return "$" + text
+    }
+
 }

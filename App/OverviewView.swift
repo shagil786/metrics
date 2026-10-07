@@ -271,6 +271,7 @@ struct OverviewView: View {
         case "hardware": hardwareCard
         case "sound": detailLink(.audio) { soundSummary }
         case "bluetooth": detailLink(.bluetooth) { bluetoothSummary }
+        case "sessions": agentSessionsCard
         case "thermal": ThermalContextView()
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(16).frame(height: 208).cardBackground(cornerRadius: 16)
@@ -350,6 +351,63 @@ struct OverviewView: View {
             footer: OverviewSparkline(values: gpuBuffer.values, tint: .pink, bars: showBarCharts, fixedMax: 100,
                                    placeholder: gpu == nil ? "GPU stats unavailable on this Mac" : "Sampling…")
         )
+    }
+
+    /// AI agent sessions, with the token figures and costs they actually reported.
+    ///
+    /// Absent entirely until a session exists: a card reading "no sessions" teaches
+    /// nothing and spends a slot that a machine reading should have. Present and
+    /// empty is a different thing, and the empty state that does matter — the store
+    /// would not open — is the one shown here.
+    private var agentSessionsCard: some View {
+        let sessions = model.agentSessions
+        let priced = sessions.compactMap { session -> Decimal? in
+            if case .priced(let usd, _) = session.cost { return usd }
+            return nil
+        }
+        let total = priced.reduce(Decimal(0), +)
+        let reported = sessions.filter { $0.usage.isReported }.count
+
+        return DashboardCard(
+            title: "Agent Sessions",
+            symbol: "sparkles",
+            tint: .purple,
+            context: "\(sessions.count) recorded",
+            numeral: sessions.isEmpty ? "—" : "\(reported)",
+            unit: sessions.isEmpty ? nil : "reported tokens",
+            subMetrics: [
+                ("Sessions", "\(sessions.count)"),
+                // The two states kept apart on purpose: money that exists, and money
+                // nobody could compute because a model has no price.
+                ("Costed", priced.isEmpty ? "—" : "$\(Fmt.usd(total))"),
+                ("Not priced", "\(sessions.count - priced.count)"),
+            ],
+            footer: sessionsFooter(sessions: sessions)
+        )
+    }
+
+    @ViewBuilder private func sessionsFooter(sessions: [AgentSessionSnapshot]) -> some View {
+        if sessions.isEmpty {
+            if model.agentSessionStore == nil {
+                // An unavailable store is not an empty list. Saying "no sessions"
+                // here would report that the user has never used an agent.
+                Text("The session store could not be opened")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+            } else {
+                Text("No agent has connected yet")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(sessions.prefix(3), id: \.id) { session in
+                    SessionLine(session: session)
+                }
+                if sessions.count > 3 {
+                    Text("and \(sessions.count - 3) more")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     @ViewBuilder private func hardwareSection(width: CGFloat) -> some View {
@@ -891,6 +949,56 @@ struct DonutChart: View {
                 }
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// One session, in one line.
+///
+/// The line is built around what is *missing* as much as what is there: a session
+/// that reported nothing and a session that cost nothing look identical in a
+/// number-only row, and they are opposite facts. So the reason travels with the
+/// figure rather than being dropped for want of space.
+private struct SessionLine: View {
+    let session: AgentSessionSnapshot
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(session.clientName ?? "agent")
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text(usage)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text(cost)
+                .font(.system(size: 10, design: .monospaced))
+        }
+    }
+
+    private var usage: String {
+        switch session.usage {
+        case .reported(let input, let output, _):
+            return "\(Fmt.tokens(input + output)) tok"
+        case .notReported(let reason):
+            // The four reasons in one short word each, so a row says which rather
+            // than showing a dash that reads as zero.
+            switch reason {
+            case .noSource: return "no source"
+            case .logUnreadable: return "log unreadable"
+            case .unrecognizedFormat: return "log format unknown"
+            case .awaitingFirstReport: return "not reported yet"
+            }
+        }
+    }
+
+    private var cost: String {
+        switch session.cost {
+        case .priced(let usd, _): return Fmt.usd(usd)
+        case .notPriced: return "not priced"
+        case .conflict: return "conflict"
+        case .noUsage: return "—"
         }
     }
 }

@@ -76,7 +76,7 @@ struct ArrangeButton: View {
 }
 
 enum LayoutCatalog {
-    static let overview: [(String, String)] = [("cpu","CPU"),("memory","Memory"),("gpu","GPU"),("disk","Disk"),("network","Network"),("power","Power"),("hardware","Hardware"),("thermal","Heat context"),("memoryType","Memory by type"),("memoryApps","Memory by app"),("powerApps","CPU by app"),("sound","Volume mixer"),("bluetooth","Bluetooth")]
+    static let overview: [(String, String)] = [("cpu","CPU"),("memory","Memory"),("gpu","GPU"),("disk","Disk"),("network","Network"),("power","Power"),("hardware","Hardware"),("thermal","Heat context"),("memoryType","Memory by type"),("memoryApps","Memory by app"),("powerApps","CPU by app"),("sessions","Agent sessions"),("sound","Volume mixer"),("bluetooth","Bluetooth")]
     static let panelTiles = [("cpu","CPU"),("memory","Memory"),("network","Network"),("disk","Disk"),("gpu","GPU"),("power","Power / Battery")]
     static let sections: [String: [(String, String)]] = [
         "cpu": standard, "memory": standard, "disk": standard, "network": standard,

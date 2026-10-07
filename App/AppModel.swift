@@ -42,6 +42,22 @@ final class AppModel: ObservableObject {
     @Published private(set) var pricedModels: [String: AgentSessionStore.ModelPrice] = [:]
     @Published private(set) var modelsMissingAPrice: [String] = []
 
+    /// Sessions for the Agent Sessions card.
+    ///
+    /// Refreshed on the card's slow lane rather than per tick: a session's cost
+    /// changes only when an agent reports, and re-reading the store several times a
+    /// second would spend work to redraw a number that is almost always identical.
+    @Published private(set) var agentSessions: [AgentSessionSnapshot] = []
+
+    /// Re-reads the sessions for the Overview card.
+    func refreshAgentSessions() {
+        guard let store = agentSessionStore else {
+            agentSessions = []
+            return
+        }
+        agentSessions = (try? store.sessions()) ?? []
+    }
+
     /// Re-reads both price lists from the store. Called when the Prices page appears
     /// and after every save, so what is on screen is what is on disk rather than a
     /// copy that can drift from it.
@@ -182,6 +198,12 @@ final class AppModel: ObservableObject {
     func surfaceAppeared() {
         surfaceCount += 1
         engine.setSurfaceVisible(true)
+        // Once when a surface appears, not per tick: a session's cost changes only
+        // when an agent reports, so re-reading the store on the sampling cadence
+        // would spend work redrawing a number that is almost always identical. The
+        // card is correct on arrival and correct when the window opens, and an agent
+        // that reports while the window is closed has its figure waiting there.
+        refreshAgentSessions()
     }
 
     func surfaceDisappeared() {
@@ -204,6 +226,7 @@ final class AppModel: ObservableObject {
             )
         }
         pruneHistory()
+        refreshAgentSessions()
     }
 
     // MARK: - History recording
