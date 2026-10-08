@@ -30,9 +30,22 @@
 // own session id. **The two share no key.** The only correlation is time: a log whose
 // activity overlaps the connection's lifetime is a candidate. That is a heuristic, and
 // a heuristic that picks when it is unsure produces a number that is confidently
-// wrong — so `candidateLogs` returns every plausible file and `TokenSourceRunner`
+// wrong — so `logCandidates` returns every log it can see and `AgentLogMatcher`
 // applies the uniqueness rule. Two agents running at once overlap one window, and
 // that is reported as an absence rather than resolved by a guess.
+//
+// HONEST LIMITS OF WHAT COMES BACK
+//
+// - **`.ambiguousMatch` will be common on a machine with several agents running**, and
+//   that is the rule working rather than a failure to be tuned away. Two logs
+//   overlapping one session means nothing ties either to it.
+// - **A log whose shape has changed stays `unrecognizedFormat`** — never a partial
+//   parse, which would be a plausible wrong number.
+// - **Wiring this in makes two previously unreachable limitations reachable**: the
+//   self-report/partial-log-parse overlap, which now *inflates* where it previously
+//   *blocked* a figure (pinned by a test named `…ThatFigureIsKnownWrong`), and the 1%
+//   disagreement tolerance, which has never been validated against real disagreement.
+//   Neither is fixed by parsing a log, and both are documented in the README.
 //
 // WHAT IS NOT TAKEN FROM THE LOG
 //
@@ -51,11 +64,15 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
     /// `~/.claude/projects`, or an override so tests can point at a fixture tree
     /// instead of the developer's own sessions.
     private let projectsRoot: URL
-    /// How far either side of the session a log may fall and still count as
-    /// overlapping. Generous, because a log's modification time is its *last* write
-    /// and a session's end is not observable — and a tight bound would simply miss
-    /// real matches. The cost of generosity is more candidates, which the uniqueness
-    /// rule turns into an absence rather than a guess.
+    /// How far off the clock a file's timestamp may be and still be believed.
+    ///
+    /// **This is not the session window.** Generosity there is `overlap`, and it is
+    /// `AgentLogMatcher`'s to apply, because a session is what it is measured against.
+    /// What this guards is the other direction: a file stamped beyond `now + overlap`
+    /// was not written by a session that has not connected yet, so it is dropped
+    /// rather than handed to the matcher to discard. One condition, same bound the
+    /// matcher uses, kept here so an adapter does not spend the machine's file list on
+    /// entries that cannot match.
     private let overlap: TimeInterval
 
     /// No stored `FileManager`: it is not `Sendable`, and this type is required to be.
@@ -72,37 +89,38 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
         self.overlap = overlap
     }
 
-    /// Every log whose last write falls inside the session's window.
+    /// Every log under the projects root, with its last write time. **No session is
+    /// consulted**: matching a session against this list is `AgentLogMatcher`'s job, and
+    /// doing it here would put one session's window into a method that sees none.
     ///
     /// Enumerated rather than indexed: the directory is one file per agent session on
-    /// the machine, so this is a directory read per question. `TokenSourceRunner`
-    /// caches the source, and the Overview card refreshes on a slow lane, so this is
-    /// not on a hot path — a maintained index would be more machinery than the
-    /// question earns.
-    public func candidateLogs(for session: AgentSessionSnapshot) -> [URL] {
-        let since = session.connectedAt.addingTimeInterval(-overlap)
-        // A session has no observable end, so the window runs from its connection to
-        // now plus the same overlap. Widening to "until now" rather than guessing an
-        // end is what keeps a long-lived connection matchable at all.
-        let until = Date().addingTimeInterval(overlap)
-
+    /// the machine. `AgentSourcePoller` asks once per pass on a 30-second lane, and the
+    /// directory read is a handful of stat calls — so a maintained index would be more
+    /// machinery than the question earns.
+    public func logCandidates() -> [LogCandidate] {
+        // A missing root is a machine that has never run the agent, which is an
+        // absence rather than a failure, so an unwalkable directory yields nothing
+        // instead of throwing.
         guard let walker = FileManager.default.enumerator(
             at: projectsRoot,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
-        var candidates: [URL] = []
+        let notAfter = Date().addingTimeInterval(overlap)
+        var candidates: [LogCandidate] = []
         for case let url as URL in walker where url.pathExtension == "jsonl" {
-            guard let modified = modificationDate(of: url),
-                  modified >= since, modified <= until
-            else { continue }
-            candidates.append(url)
+            // An unreadable timestamp leaves nothing to match on, so a file whose
+            // modification time cannot be read is not a candidate — guessing one would
+            // be a correlation invented rather than observed.
+            guard let modified = modificationDate(of: url), modified <= notAfter else {
+                continue
+            }
+            candidates.append(LogCandidate(url: url, modifiedAt: modified))
         }
-        // Sorted so a caller inspecting candidates sees a stable order. The runner
-        // refuses more than one, so this is for diagnostics and for the single-match
-        // case to be deterministic.
-        return candidates.sorted { $0.path < $1.path }
+        // Sorted by path so a caller inspecting candidates sees a stable order, and so
+        // the single-match case is deterministic on a machine holding more than one log.
+        return candidates.sorted { $0.url.path < $1.url.path }
     }
 
     /// Parses the summary lines into one entry per model.

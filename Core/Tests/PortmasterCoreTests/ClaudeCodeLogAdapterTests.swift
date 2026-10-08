@@ -140,38 +140,85 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         )
     }
 
+    /// Every log under the root, each with its real last-write time.
+    private func candidates(root: URL, adapter: ClaudeCodeLogAdapter? = nil) -> [LogCandidate] {
+        (adapter ?? ClaudeCodeLogAdapter(projectsRoot: root)).logCandidates()
+    }
+
+    /// The window the poller configures, so these tests exercise the same overlap
+    /// production uses rather than a number chosen for the fixture.
+    private let overlap: TimeInterval = 60 * 60
+
+    /// Enumeration, not matching: every log in the tree comes back whatever its age,
+    /// because this method is not given a session and deciding what overlaps one is
+    /// `AgentLogMatcher`'s job. Splitting it here is what lets one walk serve every
+    /// session in a pass.
+    func testLogCandidatesReturnsEveryLogInTheTreeWhateverItsAge() throws {
+        let root = try makeRoot()
+        let now = Date()
+        try writeLog(realSummary, in: root, name: "live", modified: now.addingTimeInterval(-30))
+        try writeLog(realSummary, in: root, name: "ancient", modified: now.addingTimeInterval(-90 * 24 * 3600))
+
+        let found = candidates(root: root)
+        XCTAssertEqual(found.map(\.url.lastPathComponent), ["ancient.jsonl", "live.jsonl"])
+        // The timestamp is the correlation, so it must be the file's real mtime.
+        let live = try XCTUnwrap(found.first { $0.url.lastPathComponent == "live.jsonl" })
+        let onDisk = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(
+                atPath: live.url.path
+            )[.modificationDate]) as? Date
+        )
+        XCTAssertEqual(live.modifiedAt.timeIntervalSince1970,
+                       onDisk.timeIntervalSince1970, accuracy: 1)
+    }
+
     func testALogModifiedDuringTheWindowIsACandidate() throws {
         let root = try makeRoot()
         let now = Date()
         try writeLog(realSummary, in: root, name: "match", modified: now.addingTimeInterval(-30))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let found = ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600)
-            .candidateLogs(for: snapshot(now: now, connectedAgo: 120))
-        XCTAssertEqual(found.count, 1)
+        let match = AgentLogMatcher.match(
+            candidates(root: root, adapter: adapter),
+            for: snapshot(now: now, connectedAgo: 120),
+            overlap: overlap
+        )
+        guard case .unique(let candidate) = match else {
+            return XCTFail("a log written inside the window is this session's, got \(match)")
+        }
+        XCTAssertEqual(candidate.url.lastPathComponent, "match.jsonl")
     }
 
     func testALogFarOutsideTheWindowIsNotACandidate() throws {
         let root = try makeRoot()
         let now = Date()
         try writeLog(realSummary, in: root, name: "stale", modified: now.addingTimeInterval(-90 * 24 * 3600))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let found = ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600)
-            .candidateLogs(for: snapshot(now: now, connectedAgo: 120))
-        XCTAssertTrue(found.isEmpty, "a three-month-old log is not this session's")
+        let match = AgentLogMatcher.match(
+            candidates(root: root, adapter: adapter),
+            for: snapshot(now: now, connectedAgo: 120),
+            overlap: overlap
+        )
+        XCTAssertEqual(match, .ambiguous(count: 0), "a three-month-old log is not this session's")
     }
 
     /// The case the uniqueness rule exists for: two agents running side by side both
-    /// overlap one window. Both must be returned so the runner can refuse — picking
+    /// overlap one window. Both must be returned so the matcher can refuse — picking
     /// one here is the whole bug the rule prevents.
-    func testTwoOverlappingLogsBothComeBackSoTheRunnerCanRefuse() throws {
+    func testTwoOverlappingLogsBothComeBackSoTheMatcherCanRefuse() throws {
         let root = try makeRoot()
         let now = Date()
         try writeLog(realSummary, in: root, name: "agent-a", modified: now.addingTimeInterval(-30))
         try writeLog(realSummary, in: root, name: "agent-b", modified: now.addingTimeInterval(-20))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let found = ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600)
-            .candidateLogs(for: snapshot(now: now, connectedAgo: 120))
-        XCTAssertEqual(found.count, 2)
+        let match = AgentLogMatcher.match(
+            candidates(root: root, adapter: adapter),
+            for: snapshot(now: now, connectedAgo: 120),
+            overlap: overlap
+        )
+        XCTAssertEqual(match, .ambiguous(count: 2))
     }
 
     func testNonJSONLFilesAreIgnored() throws {
@@ -181,17 +228,31 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         try realSummary.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: url.path)
 
-        let found = ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600)
-            .candidateLogs(for: snapshot(now: now, connectedAgo: 120))
-        XCTAssertTrue(found.isEmpty)
+        XCTAssertTrue(candidates(root: root).isEmpty)
     }
 
     func testMissingRootIsNoCandidatesNotACrash() {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("no-such-root-\(UUID().uuidString)")
-        let found = ClaudeCodeLogAdapter(projectsRoot: missing)
-            .candidateLogs(for: snapshot(now: Date(), connectedAgo: 10))
-        XCTAssertTrue(found.isEmpty)
+        XCTAssertTrue(ClaudeCodeLogAdapter(projectsRoot: missing).logCandidates().isEmpty)
+    }
+
+    /// A file stamped past the adapter's clock tolerance is dropped at enumeration rather
+    /// than handed to the matcher to discard.
+    ///
+    /// A machine whose clock is wrong, or a log restored from a backup, produces exactly
+    /// this — and the session window cannot reach it, because a session cannot have
+    /// connected in the future. It is the one bound that belongs in the enumeration: it
+    /// is the same limit `AgentLogMatcher` applies, and keeping it here means a pass
+    /// hands the matcher a list of files the matcher will not have to throw away.
+    func testAFileStampedBeyondTheClockToleranceIsNotACandidate() throws {
+        let root = try makeRoot()
+        let now = Date()
+        try writeLog(realSummary, in: root, name: "live", modified: now)
+        try writeLog(realSummary, in: root, name: "skewed", modified: now.addingTimeInterval(7200))
+
+        let found = ClaudeCodeLogAdapter(projectsRoot: root, overlap: 60).logCandidates()
+        XCTAssertEqual(found.map(\.url.lastPathComponent), ["live.jsonl"])
     }
 
     // MARK: - Runner: the uniqueness rule
@@ -203,9 +264,10 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         try writeLog(realSummary, in: root, name: "a", modified: now.addingTimeInterval(-30))
         try writeLog(realSummary, in: root, name: "b", modified: now.addingTimeInterval(-20))
         let session = snapshot(now: now, connectedAgo: 120)
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let outcome = TokenSourceRunner(adapter: ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600))
-            .run(session: session)
+        let outcome = TokenSourceRunner(adapter: adapter)
+            .run(session: session, candidates: adapter.logCandidates(), overlap: overlap)
         guard case .notReported(let reason) = outcome else {
             return XCTFail("two candidates must not produce a figure, got \(outcome)")
         }
@@ -219,9 +281,10 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         {"modelUsage":{"model-a":{"inputTokens":100,"outputTokens":50},"model-b":{"inputTokens":200,"outputTokens":75}}}
         """, in: root, name: "escalated", modified: now.addingTimeInterval(-30))
         let session = snapshot(now: now, connectedAgo: 120)
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let outcome = TokenSourceRunner(adapter: ClaudeCodeLogAdapter(projectsRoot: root, overlap: 3600))
-            .run(session: session)
+        let outcome = TokenSourceRunner(adapter: adapter)
+            .run(session: session, candidates: adapter.logCandidates(), overlap: overlap)
         guard case .reported(let records) = outcome else {
             return XCTFail("expected records, got \(outcome)")
         }
@@ -233,10 +296,16 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         XCTAssertTrue(records.allSatisfy { $0.provenance == .parsedFromLog })
     }
 
-    func testNoCandidatesIsNoSourceNotAmbiguous() {
-        let root = try? makeRoot()
-        let outcome = TokenSourceRunner(adapter: ClaudeCodeLogAdapter(projectsRoot: root!))
-            .run(session: snapshot(now: Date(), connectedAgo: 10))
+    func testNoCandidatesIsNoSourceNotAmbiguous() throws {
+        let root = try makeRoot()
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+
+        let outcome = TokenSourceRunner(adapter: adapter)
+            .run(
+                session: snapshot(now: Date(), connectedAgo: 10),
+                candidates: adapter.logCandidates(),
+                overlap: overlap
+            )
         guard case .notReported(let reason) = outcome else {
             return XCTFail("expected absence, got \(outcome)")
         }

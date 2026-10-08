@@ -4,10 +4,9 @@
 // file format must not be able to break another's, and a new adapter must be
 // addable without touching the record or the query surface.
 //
-// No adapter ships in this slice. The protocol and the outcome mapping are what
-// phase C needs, and the fixture in the tests is a fixture — nothing here has been
-// run against a real agent's log, and saying otherwise is the failure this whole
-// design exists to prevent.
+// `ClaudeCodeLogAdapter` is the first one that ships, and `AgentSourcePoller` is
+// what asks it. The fixture in the tests is still a fixture: an adapter there proves
+// the contract, not that any particular agent's file parses.
 
 import Foundation
 
@@ -48,15 +47,17 @@ public protocol TokenSourceAdapter: Sendable {
     /// Stable name for this source, used in diagnostics.
     var identifier: String { get }
 
-    /// Log files that *could* belong to this session. **Empty is normal**, not an
-    /// error: most sessions have no readable log, and that must read as "no source"
-    /// rather than as a failure.
+    /// Every log this source could describe, with its last write time.
     ///
-    /// A list rather than one chosen file, because choosing is not this method's
-    /// job. A session's id and an agent's log filename share no key, so the only
-    /// correlation is time, and *what counts as a unique match* is a policy every
-    /// adapter must apply identically. `TokenSourceRunner` applies it, once.
-    func candidateLogs(for session: AgentSessionSnapshot) -> [URL]
+    /// **Enumerated once per pass — never once per session.** The old shape asked per
+    /// session, so a machine with ten open sessions walked the agent's log directory
+    /// ten times to answer ten questions one directory read answers. A session id and
+    /// an agent's log filename share no key, so the only correlation is time, and
+    /// time is already in hand: matching one session against a list is arithmetic.
+    ///
+    /// Empty is normal, not an error — and it is the absence a caller should reach
+    /// without a walk at all, which is why a pass with no sessions never gets here.
+    func logCandidates() -> [LogCandidate]
 
     /// Parses a located log into one entry per model. Throws
     /// `TokenSourceError.unrecognizedFormat` rather than returning partial counts.
@@ -72,6 +73,9 @@ public enum TokenSourceOutcome: Hashable, Sendable {
 
 /// Runs one adapter against one session and maps every failure onto a named
 /// absence, so no caller has to interpret an error to know what it does not know.
+///
+/// The candidate list is passed in rather than asked for, because one enumeration
+/// per pass serves every session — see `logCandidates()`.
 public struct TokenSourceRunner: Sendable {
     private let adapter: any TokenSourceAdapter
     private let now: @Sendable () -> Date
@@ -89,27 +93,30 @@ public struct TokenSourceRunner: Sendable {
         self.now = now
     }
 
-    public func run(session: AgentSessionSnapshot) -> TokenSourceOutcome {
-        let candidates = adapter.candidateLogs(for: session)
-        guard !candidates.isEmpty else {
-            return .notReported(reason: .noSource)
+    public func run(
+        session: AgentSessionSnapshot,
+        candidates: [LogCandidate],
+        overlap: TimeInterval
+    ) -> TokenSourceOutcome {
+        // **Only a unique match is a match**, and `AgentLogMatcher` owns that rule so
+        // it can be tested without a filesystem. Zero and many are both not-a-match,
+        // but they are not the same absence: nothing to read is a machine that has not
+        // written a log, while two or more is a machine running more than one agent.
+        // Collapsing them would tell a user with nothing to count the same story as a
+        // user whose figure could not be attributed.
+        let url: URL
+        switch AgentLogMatcher.match(candidates, for: session, overlap: overlap) {
+        case .unique(let candidate):
+            url = candidate.url
+        case .ambiguous(let count):
+            return .notReported(reason: count == 0 ? .noSource : .ambiguousMatch)
         }
-        // **Only a unique match is a match.** A session id and an agent's log
-        // filename share no key, so the correlation is time — and two agents running
-        // side by side produce two logs overlapping one session's window. Taking the
-        // most recent would file each one's tokens against the other, which is a
-        // wrong number rather than an absence: the failure this whole design exists
-        // to prevent. Two candidates are a fact about the machine, not about this
-        // session, so it says so.
-        guard candidates.count == 1 else {
-            return .notReported(reason: .ambiguousMatch)
-        }
-        let url = candidates[0]
+
         do {
             let raw = try adapter.parse(url)
             // Every model gets its own record at the same instant: they are one
             // observation, and recording them at different times would let the
-            // latest-per-provenance fold see a disagreement that is not there.
+            // latest-per-segment fold see a disagreement that is not there.
             let at = now()
             return .reported(raw.map { entry in
                 TokenUsageRecord(
