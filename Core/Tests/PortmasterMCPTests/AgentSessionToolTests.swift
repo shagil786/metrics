@@ -148,17 +148,21 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertEqual(segment["provenance"] as? String, "selfReported")
     }
 
-    /// Two sources on the **same** model are two readings of one piece of work, and
-    /// the wire carries both rather than picking one.
+    /// **Two sources on the same model are one segment, not two.** The log reader
+    /// counted 1,005 against the agent's own 1,000 — half a percent apart, inside the
+    /// tolerance, so this session is *priced* and not a conflict. Both readings measure
+    /// the same piece of work, which is why:
     ///
-    /// The interim payload collapsed to a single pair of counts, so it had to choose a
-    /// provenance — and `preferredProvenance` chose self-reported, because billing both
-    /// would price 1,000 tokens of one model as 2,000. That choice is still made, but
-    /// it is made by whoever costs the session, and it is *visible*: the client can see
-    /// that model `m` was counted 1,000 by the agent and 1,005 by the log reader and
-    /// decide for itself. Silently keeping one is how a disagreement stops looking like
-    /// a disagreement.
-    func testBothReadingsOfOneModelReachTheWireWithTheirOwnProvenance() async throws {
+    /// - the segment carries the reading Portmaster believes (1,000, self-reported, the
+    ///   same preference costing makes), and
+    /// - the other reading rides on `alternateTotals`, keyed by its own provenance.
+    ///
+    /// A second segment would have been the wrong shape twice over: summing it would
+    /// report 2,005 tokens for a session billed on 1,000, and joining it to `cost.lines`
+    /// by model would give two rows for one model and no way to tell which one the cost
+    /// used. The alternative the payload rejected — silently keeping only one and saying
+    /// nothing — is what made an agreeing pair look like a decision nobody made.
+    func testASecondReaderOfOneModelIsAnAlternateRatherThanASecondSegment() async throws {
         let id = UUID()
         try store.recordSession(
             id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
@@ -172,27 +176,48 @@ final class AgentSessionToolTests: XCTestCase {
             sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 1_005, output: 0,
             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog
         ))
+        // Priced, so the session has a `lines` half to be joined against below — an
+        // unpriced model would have no line and the assertion would pass for free.
+        try store.setPrice(Decimal(1), modelID: "m")
+        try store.setPrice(Decimal(0), modelID: "m", component: .output)
         try store.flush()
 
         let json = try await wire()
-        let usage = try XCTUnwrap(
-            (try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first))["usage"] as? [String: Any]
-        )
+        let session = try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first)
+        let usage = try XCTUnwrap(session["usage"] as? [String: Any])
+        let segments = try XCTUnwrap(usage["segments"] as? [[String: Any]])
 
-        let readings = try XCTUnwrap(usage["segments"] as? [[String: Any]]).reduce(into: [:]) {
-            $0[$1["provenance"] as? String ?? "?"] = $1["inputTokens"] as? Int
-        }
-        XCTAssertEqual(readings, ["selfReported": 1_000, "parsedFromLog": 1_005],
-                       "both readings of one model must reach the client, each with its own origin")
+        XCTAssertEqual(segments.count, 1, "one model is one entry, however many readers it has")
+        let segment = try XCTUnwrap(segments.first)
+        XCTAssertEqual(segment["model"] as? String, "m")
+        XCTAssertEqual(segment["provenance"] as? String, "selfReported")
+        XCTAssertEqual(segment["inputTokens"] as? Int, 1_000)
+        // Keyed on (model, provenance): a reduction on provenance alone would call two
+        // *different* models the same fixture and pass while missing this bug entirely.
+        XCTAssertEqual(
+            segment["alternateTotals"] as? [String: Int],
+            ["parsedFromLog": 1_005],
+            "the other reader's total must be visible, attributed, and kept off the counts"
+        )
+        let summed = segments.reduce(0) { $0 + ($1["inputTokens"] as? Int ?? 0) }
+        XCTAssertEqual(summed, 1_000,
+                       "summing segments must be the session's tokens: 1,000, never 2,005")
+
+        // And the cost half was billed on the same number, not on the one the payload
+        // put in an alternate.
+        let cost = try XCTUnwrap(session["cost"] as? [String: Any])
+        let lines = try XCTUnwrap(cost["lines"] as? [[String: Any]])
+        XCTAssertEqual(lines.compactMap { $0["model"] as? String }, ["m"],
+                       "a client joining segments to lines by model must find exactly one row")
     }
 
-    /// **No session-wide provenance exists, because none could be true.** Two different
-    /// models, one self-reported and one parsed, so the session's figure spans both
-    /// sources and no single name describes it.
+    /// Two different models, one self-reported and one parsed, are two segments and two
+    /// rates — and still no session-wide provenance, because no single source name
+    /// describes a figure spanning both.
     ///
-    /// The interim payload emitted a summed count plus a `provenance` that had to be
-    /// nil for exactly this case, and nil was doing real work: the alternative was
-    /// naming whichever segment sorted first, and `"parsedFromLog"` sorts before
+    /// The interim payload emitted a summed count plus a `provenance` that had to be nil
+    /// for exactly this case, and nil was doing real work: the alternative was naming
+    /// whichever segment sorted first, and `"parsedFromLog"` sorts before
     /// `"selfReported"` — so a figure containing self-reported tokens would have been
     /// labelled as coming from a log that never saw them. A client auditing that number
     /// would have been told to trust the wrong reader.
@@ -227,10 +252,18 @@ final class AgentSessionToolTests: XCTestCase {
         // The counts still arrive — one per model, each naming the source that measured
         // it. A session that reported must never read as one that did not.
         XCTAssertEqual(usage["reported"] as? Bool, true)
-        let byModel = try XCTUnwrap(usage["segments"] as? [[String: Any]]).reduce(into: [:]) {
-            $0[$1["model"] as? String ?? "?"] = $1["provenance"] as? String
+        let segments = try XCTUnwrap(usage["segments"] as? [[String: Any]])
+        XCTAssertEqual(segments.count, 2)
+        let byModel = segments.reduce(into: [String: String]()) {
+            $0[$1["model"] as? String ?? "?"] = $1["provenance"] as? String ?? "?"
         }
         XCTAssertEqual(byModel, ["self-model": "selfReported", "parsed-model": "parsedFromLog"])
+        // Different models cannot be readings of each other, so neither has an alternate.
+        XCTAssertTrue(segments.allSatisfy { $0["alternateTotals"] == nil })
+        XCTAssertEqual(
+            segments.reduce(0) { $0 + ($1["inputTokens"] as? Int ?? 0) }, 1_600,
+            "two models, two segments, one session: the sum is the whole of it"
+        )
     }
 
     /// A priced session carries its figures and the price-table version that
@@ -357,6 +390,72 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertEqual(
             segments.compactMap { $0["model"] as? String }.sorted(), ["model-a", "model-b"]
         )
+    }
+
+    /// **The two halves must bill the same tokens.** A client shows `usage.segments`
+    /// beside `cost.lines` — one number for "how much work", one for "what it cost" — so
+    /// a figure where they count different work is a row whose two numbers cannot both
+    /// be right, and nothing about it looks wrong.
+    ///
+    /// Priced at exactly one dollar per input token, which turns each cost line into
+    /// that model's token count and lets the two halves be compared without doing any
+    /// arithmetic the reader has to trust. The fixture deliberately includes a model with
+    /// **two** readers: that is where the halves came apart before, because usage
+    /// emitted both readings as segments while the cost billed the preferred one.
+    func testUsageSegmentsAndCostLinesBillTheSameTokens() async throws {
+        let id = UUID()
+        try store.recordSession(
+            id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
+        )
+        // Two readers of one model, inside the tolerance, so it is priced — and only one
+        // of them may be billed.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date(), input: 1_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-a", provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 1_005, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-a", provenance: .parsedFromLog
+        ))
+        // A second model with a single reader, so the join has to hold for both kinds.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date(), input: 500, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-b", provenance: .parsedFromLog
+        ))
+        for model in ["model-a", "model-b"] {
+            try store.setPrice(Decimal(1), modelID: model)
+            try store.setPrice(Decimal(0), modelID: model, component: .output)
+        }
+        try store.flush()
+
+        let json = try await wire()
+        let session = try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first)
+        let segments = try XCTUnwrap(
+            (try XCTUnwrap(session["usage"] as? [String: Any]))["segments"] as? [[String: Any]]
+        )
+        let cost = try XCTUnwrap(session["cost"] as? [String: Any])
+        let lines = try XCTUnwrap(cost["lines"] as? [[String: Any]])
+
+        // Joinable one-to-one first: a model appearing on both sides twice, or only on
+        // one, is the shape that made the join impossible before.
+        let segmentModels = segments.compactMap { $0["model"] as? String }.sorted()
+        let lineModels = lines.compactMap { $0["model"] as? String }.sorted()
+        XCTAssertEqual(segmentModels, ["model-a", "model-b"])
+        XCTAssertEqual(lineModels, segmentModels, "both halves must name the same models")
+
+        // And then equal token for token, which a price of $1 per token makes literal.
+        let lineByModel = lines.reduce(into: [String: String]()) {
+            $0[$1["model"] as? String ?? "?"] = $1["usd"] as? String
+        }
+        for segment in segments {
+            let model = try XCTUnwrap(segment["model"] as? String)
+            XCTAssertEqual(
+                lineByModel[model], String(try XCTUnwrap(segment["inputTokens"] as? Int)),
+                "model \(model): the tokens counted must be the tokens billed"
+            )
+        }
+        XCTAssertEqual(cost["usd"] as? String, "1500",
+                       "1,000 believed of model-a plus 500 of model-b, not 2,005")
     }
 
     /// An unpriced model is not a free one.
@@ -498,11 +597,20 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertNotNil(json["note"] as? String)
     }
 
-    /// A source disagreement reaches the wire naming the model counted two ways **and
-    /// both of the numbers**. It is the case the README spends a paragraph on, so it
-    /// should not be the one with no assertion — and the model name alone is not enough:
-    /// the repair is picking a reader, which needs to know what each one said.
-    func testAConflictReachesTheWireNamingTheModelAndBothTotals() throws {
+    /// A source disagreement reaches both halves of the wire, and neither half picks a
+    /// reader. It is the case the README spends a paragraph on, so it should not be the
+    /// one with no assertion — and a model name alone is not enough, because the repair
+    /// is picking a reader, which needs to know what each one said.
+    ///
+    /// **The usage half is the assertion this task exists for.** Cost says `priced: false`
+    /// and refuses a figure; if usage then handed back one reading's count as if it were
+    /// the answer, the same payload would carry a confident token count beside a refusal
+    /// to cost it, and the client would have to know which to believe. So a contested
+    /// model keeps its segment — the model is real and still visible — with **null**
+    /// counts and null provenance, and both readings in `alternateTotals`. Null rather
+    /// than 0 because tokens *were* counted; null rather than one reader's number
+    /// because neither reading is believed.
+    func testAConflictNamesBothTotalsAndLeavesUsageWithoutACountItCanTrust() throws {
         let id = UUID()
         try store.recordSession(
             id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
@@ -528,13 +636,15 @@ final class AgentSessionToolTests: XCTestCase {
             storeAvailable: true,
             note: nil
         ))
-        let cost = try XCTUnwrap(
-            (try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first))["cost"] as? [String: Any]
-        )
+        let session = try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first)
+        let cost = try XCTUnwrap(session["cost"] as? [String: Any])
 
         XCTAssertEqual(cost["priced"] as? Bool, false)
         XCTAssertEqual(cost["reason"] as? String, "conflict")
-        XCTAssertEqual(cost["models"] as? [String], ["m"])
+        // `models` names the unpriced ones only; a contested model is named by
+        // `disagreements`, which carries its numbers too, and two lists of the same ids
+        // would be two answers to one question.
+        XCTAssertNil(cost["models"])
         XCTAssertNil(cost["usd"], "a conflict has no figure to report")
         XCTAssertNil(cost["lines"], "and no line behind one either")
 
@@ -548,6 +658,28 @@ final class AgentSessionToolTests: XCTestCase {
             entry["totals"] as? [String: Int],
             ["selfReported": 10, "parsedFromLog": 30],
             "a disagreement the client cannot act on is just an assertion that something is wrong"
+        )
+
+        // The usage half must not contradict the refusal above.
+        let usage = try XCTUnwrap(session["usage"] as? [String: Any])
+        XCTAssertEqual(usage["reported"] as? Bool, true,
+                       "tokens were counted — the session is not an unreported one")
+        let segments = try XCTUnwrap(usage["segments"] as? [[String: Any]])
+        XCTAssertEqual(segments.count, 1, "the model is still visible; it is its counts that are absent")
+        let segment = try XCTUnwrap(segments.first)
+        XCTAssertEqual(segment["model"] as? String, "m")
+        XCTAssertNil(segment["inputTokens"], "no reading of a contested model may be presented as the count")
+        XCTAssertNil(segment["outputTokens"])
+        XCTAssertNil(segment["provenance"] as? String,
+                     "naming either reader would pick a winner the cost refused to pick")
+        XCTAssertEqual(
+            segment["alternateTotals"] as? [String: Int],
+            ["selfReported": 10, "parsedFromLog": 30],
+            "both readings, which on a contested segment are the only numbers there are"
+        )
+        XCTAssertEqual(
+            segments.filter { $0["inputTokens"] != nil }.count, 0,
+            "a session whose cost is refused must offer no count a client could total"
         )
     }
 

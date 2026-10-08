@@ -437,27 +437,33 @@ struct ResourceHistoryPointPayload: Encodable {
 
 // MARK: - Agent sessions
 
-/// One session's usage as a list of per-model segments, with the absence kept
-/// distinct from a measured zero.
+/// One session's usage as one entry per model, with the absence kept distinct from a
+/// measured zero.
 ///
-/// `segments` is null for every not-reported case and `reason` names which one. A
-/// caller cannot read a null list as "zero tokens" — which would say a session was
-/// free when in fact nobody counted it. That distinction is the whole reason
-/// `TokenUsage` is a three-state value, and it would be lost the moment this
-/// payload collapsed to two integers.
+/// `segments` is **absent** for every not-reported case — `JSONEncoder` omits a nil
+/// optional rather than writing `null` — and `reason` names which one. A caller cannot
+/// read the missing list as "zero tokens", which would say a session was free when in
+/// fact nobody counted it. That distinction is the whole reason `TokenUsage` is a
+/// three-state value, and it would be lost the moment this payload collapsed to two
+/// integers.
 ///
-/// **There is no session-wide total and no session-wide provenance, and that is the
-/// point.** A session can run two models, so one pair of counts would have to discard
-/// one of them — and a single `provenance` naming the total would name it for figures
-/// no source produced: two models counted by two sources have no common origin, and
-/// the one that sorts first is not the one that saw all of it. Both numbers now ride
-/// on the segment they belong to, where each has exactly one true description. A client
-/// that wants a total adds up what it is willing to believe, and can see which segments
-/// it left out.
+/// **Summing `segments` is the session's token count.** One entry per model, holding the
+/// one reading Portmaster believes — the same choice `TokenUsage.preferredProvenance`
+/// makes when costing, and the same one the Overview card makes, because two sources
+/// measuring one piece of work are alternative readings of it and adding them counts the
+/// session twice. A second reader of a model is therefore **not** a second segment: it
+/// rides on that segment's `alternateTotals`, where it is visible and cannot be added.
+///
+/// **There is no session-wide total and no session-wide provenance.** A session can run
+/// two models, so one pair of counts would have to discard one of them — and a single
+/// `provenance` naming a total would name it for figures no source produced: two models
+/// counted by two sources have no common origin, and the one that sorts first is not the
+/// one that saw all of it. Each segment names the source of its own counts.
 struct TokenUsagePayload: Encodable {
     let reported: Bool
-    /// One entry per `(provenance, model)`. A list rather than two integers because a
-    /// session can run two models, and a single pair of totals would have to pick one.
+    /// One entry per model. Never empty for a reported session: a model whose readers
+    /// disagree past the costing tolerance is reported with **null** counts rather than
+    /// dropped, so the model is still visible and its absence still cannot read as zero.
     let segments: [SegmentPayload]?
     /// Why no figure exists: `noSource`, `logUnreadable`, `unrecognizedFormat`,
     /// `awaitingFirstReport`, `ambiguousMatch`. Present only when `reported` is false.
@@ -469,11 +475,26 @@ struct TokenUsagePayload: Encodable {
     /// `reported: true` with an empty list, which is the exact shape this payload
     /// exists not to produce: a client reads that as a session that reported and used
     /// nothing.
-    init(_ usage: TokenUsage) {
+    ///
+    /// `cost` is read for its `conflict` case alone. The costing pass has already decided
+    /// which models two readers could not agree on, so this asks it rather than
+    /// re-deriving: a second disagreement rule here would be one more place for the two
+    /// halves of this payload to answer differently.
+    init(_ usage: TokenUsage, cost: SessionCost) {
+        let contested: Set<String>
+        if case .conflict(let disagreements) = cost {
+            contested = Set(disagreements.map(\.modelID))
+        } else {
+            contested = []
+        }
         switch usage {
         case .reported(let segments):
             self.reported = true
-            self.segments = segments.map(SegmentPayload.init)
+            self.segments = TokenUsage.preferredProvenance(segments).map {
+                SegmentPayload(
+                    $0, sessionReadings: segments, isContested: contested.contains($0.modelID)
+                )
+            }
             self.reason = nil
         case .notReported(let reason):
             self.reported = false
@@ -483,27 +504,77 @@ struct TokenUsagePayload: Encodable {
     }
 }
 
-/// One model's share of a session, with the source that reported it.
+/// One model's share of a session, with the source Portmaster believes for it.
 ///
-/// `provenance` is non-optional and lives here rather than on the session, where it
-/// would have to describe a total that may span two sources: a number whose origin is
-/// unknown cannot be audited, and a number with *several* origins cannot be labelled
-/// with one of them.
+/// `provenance` is per-segment rather than on the session, where it would have to
+/// describe a figure that may span two sources: a number whose origin is unknown cannot
+/// be audited, and a number with *several* origins cannot be labelled with one of them.
+/// It is null for exactly one case — a model whose readers disagree past the costing
+/// tolerance — and null there means what it means everywhere else in this file: nobody
+/// can say.
 struct SegmentPayload: Encodable {
     let model: String
-    let inputTokens: Int
-    let outputTokens: Int
+    /// Null for a contested model, never 0: tokens were counted, but no reading of them
+    /// can be believed, and a 0 would claim the session spent nothing.
+    let inputTokens: Int?
+    let outputTokens: Int?
     let cacheReadTokens: Int?
     let reasoningTokens: Int?
-    let provenance: String
+    let provenance: String?
+    /// Other readers' totals for **this same model**, keyed by provenance. They measure
+    /// the same work as the counts above and must never be added to them — which is why
+    /// they hang off the segment rather than sitting beside it in a list a client could
+    /// append to the one it is summing. Absent when only one source reported the model;
+    /// on a contested segment, whose counts are null, they are the only numbers there are.
+    let alternateTotals: [String: Int]?
 
-    init(_ segment: TokenUsageSegment) {
+    /// `sessionReadings` is every segment the fold produced for this session, so the
+    /// alternates for one model are found there rather than inferred from the segment
+    /// that survived.
+    init(
+        _ segment: TokenUsageSegment,
+        sessionReadings: [TokenUsageSegment],
+        isContested: Bool
+    ) {
+        let sameModel = sessionReadings.filter { $0.modelID == segment.modelID }
         self.model = segment.modelID
-        self.inputTokens = segment.input
-        self.outputTokens = segment.output
-        self.cacheReadTokens = segment.cacheRead
-        self.reasoningTokens = segment.reasoning
-        self.provenance = segment.provenance.rawValue
+        if isContested {
+            // Both readings, because neither is the one the counts below came from —
+            // there is no such one. Omitting the surviving reading would be the same
+            // arbitrary choice the segment is refusing to make.
+            self.inputTokens = nil
+            self.outputTokens = nil
+            self.cacheReadTokens = nil
+            self.reasoningTokens = nil
+            self.provenance = nil
+            self.alternateTotals = Self.totals(sameModel)
+        } else {
+            self.inputTokens = segment.input
+            self.outputTokens = segment.output
+            self.cacheReadTokens = segment.cacheRead
+            self.reasoningTokens = segment.reasoning
+            self.provenance = segment.provenance.rawValue
+            // Every reading of this model *except* the one these counts came from: that
+            // one is already in them, and repeating it would invite the very double count
+            // this field exists to prevent.
+            self.alternateTotals = Self.totals(
+                sameModel.filter { $0.provenance != segment.provenance }
+            )
+        }
+    }
+
+    /// Keyed by the provenance's raw value because a Swift enum is not a
+    /// `CodingKey`-friendly JSON dictionary key, and a client reading this has no way to
+    /// resolve `selfReported` to itself.
+    ///
+    /// Each value is input plus output, deliberately excluding cache reads and reasoning:
+    /// that is the figure the disagreement rule compares, so it is the one an alternate
+    /// has to be measured in to be worth showing.
+    private static func totals(_ segments: [TokenUsageSegment]) -> [String: Int]? {
+        guard !segments.isEmpty else { return nil }
+        return segments.reduce(into: [String: Int]()) {
+            $0[$1.provenance.rawValue] = $1.comparableTotal
+        }
     }
 }
 
@@ -521,23 +592,22 @@ struct SessionCostPayload: Encodable {
     let priceTableVersion: Int?
     /// `unpriced`, `conflict`, or `noUsage` when `priced` is false.
     let reason: String?
-    /// The model id that has no price, or the model ids that disagreed. Populated
-    /// for `unpriced` and `conflict` alike, so a caller can act on either — which
-    /// is why `reason` distinguishes them rather than the field being absent.
+    /// The models that have no price, so a client can go and enter one. Populated for
+    /// `unpriced` only: the models that *disagreed* are named by `disagreements`, which
+    /// carries their numbers too, and a second list of the same ids would be a second
+    /// answer to one question.
     let models: [String]?
     /// The per-model split behind the total, so a client can show a total as its parts:
     /// an escalated session priced as one number hides that two rates were involved.
     let lines: [CostLinePayload]?
     /// The same models counted differently by two sources, with **both** totals, so a
     /// client can put the choice to the user rather than merely asserting a
-    /// disagreement. `models` above names which models; only this says what they were
-    /// counted as, which is the number a person has to choose between.
+    /// disagreement. These are the models this cost refused to bill, which is why `usage`
+    /// carries null counts for the same models rather than one reader's number as though
+    /// it had settled anything.
     let disagreements: [DisagreementPayload]?
 
     init(_ cost: SessionCost) {
-        // Every branch names every field, so a case that has nothing to say says so by
-        // writing nil where a reader is looking — rather than by inheriting a value set
-        // somewhere above.
         switch cost {
         case .priced(let usd, let version, let lines):
             self.priced = true
@@ -562,7 +632,7 @@ struct SessionCostPayload: Encodable {
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "conflict"
-            self.models = disagreements.map(\.modelID)
+            self.models = nil
             self.lines = nil
             self.disagreements = disagreements.map(DisagreementPayload.init)
         case .noUsage:
@@ -637,7 +707,7 @@ struct AgentSessionPayload: Encodable {
         self.clientVersion = session.clientVersion
         self.connectedAt = session.connectedAt
         self.isOpen = isOpen
-        self.usage = TokenUsagePayload(session.usage)
+        self.usage = TokenUsagePayload(session.usage, cost: session.cost)
         self.cost = SessionCostPayload(session.cost)
     }
 }
