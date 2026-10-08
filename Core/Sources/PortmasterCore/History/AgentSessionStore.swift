@@ -418,26 +418,27 @@ public final class AgentSessionStore: @unchecked Sendable {
     ///   (`awaitingFirstReport` would be a lie) and never left with records and no row.
     /// - **kept, records trimmed** — stale but still reporting. Records older than the
     ///   cutoff go, and that leaves the session's figures alone **only while every
-    ///   provenance that contributed still has a record at or after the cutoff.** With
-    ///   one provenance that holds: aggregation reads the latest record per provenance,
-    ///   and a superseded one is never the one it reads.
+    ///   segment that contributed still has a record at or after the cutoff.** With
+    ///   one provenance that holds: aggregation reads the latest record per segment, and
+    ///   a superseded one is never the one it reads.
     ///
     ///   Across two it does not, and this comment used to claim otherwise. A session
     ///   whose only `selfReported` record is older than the cutoff loses its whole source
-    ///   when that record goes, so the aggregate moves to the other provenance, and a
-    ///   session that was `conflict` — two models, one per source — becomes a priced
-    ///   figure for whichever model is left. Nothing in the output says a retention
-    ///   sweep just chose between them. Deleting the *superseded* record of a provenance
-    ///   that still has a newer one is inert; deleting the only record of one is not, and
-    ///   the trim cannot tell the two apart without looking.
+    ///   when that record goes, so the aggregate moves to the other provenance, and
+    ///   nothing in the output says a retention sweep just chose between them. Worse
+    ///   than resolving a disagreement it would now *change a priced figure*: deleting
+    ///   one side's reading of a model can leave a different model standing alone at a
+    ///   different total, which is a number the user never saw before and cannot
+    ///   account for. Deleting the *superseded* record of a provenance that still has a
+    ///   newer one is inert; deleting the only record of one is not, and the trim
+    ///   cannot tell the two apart without looking.
     ///
     ///   No adapter ships and nothing calls `TokenSourceRunner` in the app, so no
     ///   two-provenance session exists to be trimmed today; that is a reason it has no
     ///   test-driven need to be clever, not a reason to promise it cannot happen. What
-    ///   would make trimming provably figure-preserving is usage recorded per provenance
-    ///   over time instead of a replaceable latest figure, which is a phase-C data
-    ///   model. `testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice` pins what
-    ///   happens until then.
+    ///   would make trimming provably figure-preserving is deleting a record only when
+    ///   a newer one exists for its own `(provenance, model)` pair, so no source can
+    ///   disappear from an aggregate as a side effect of retention.
     /// - **kept whole** — the host is serving it. Nothing of it is touched, including a
     ///   record older than the cutoff: if it were deleted the session would read as
     ///   never having reported. The connection is what bounds that growth.
@@ -515,7 +516,7 @@ public final class AgentSessionStore: @unchecked Sendable {
 
     /// Record order, shared by every read of usage so the two paths cannot disagree.
     ///
-    /// `latestPerProvenance` breaks equal timestamps by array position, keeping the
+    /// `latestPerSegment` breaks equal timestamps by array position, keeping the
     /// earlier element, so the order of tied rows is load-bearing: it decides which of
     /// two same-instant reports wins. SQLite makes no promise about the order of
     /// `ORDER BY` ties, and the batched and per-session fetches have different plans
@@ -572,53 +573,91 @@ public final class AgentSessionStore: @unchecked Sendable {
     private func costLocked(records: [TokenUsageRecord], table: PriceTable) -> SessionCost {
         guard !records.isEmpty else { return .noUsage }
 
-        let latest = TokenUsage.latestPerProvenance(records)
-        // The conflict rule lives in `TokenUsage`, and costing asks it rather than
-        // re-deriving "do the sources disagree" from the raw records, so the list
-        // view and a single-session read cannot price the same session differently.
-        //
-        // What asking it does not solve: one source that escalated models mid-session
-        // prices its whole cumulative total at the newest model's rate. That figure is
-        // known-unsound rather than ambiguous — see `TokenUsage.hasModelConflict`.
-        //
-        // This is its own case, not `notPriced`. Both models named here may be
-        // priced already, so `notPriced` would assert a missing price that does not
-        // exist and send the user to enter one that nothing would ever read.
-        if TokenUsage.hasModelConflict(records) {
-            return .conflict(models: Set(latest.values.map(\.modelID)).sorted())
-        }
-        guard let record = latest[.selfReported] ?? latest[.parsedFromLog] else { return .noUsage }
-        let modelID = record.modelID
+        let segments = TokenUsage.segments(from: records)
+        guard !segments.isEmpty else { return .noUsage }
 
-        let components: [(PriceComponent, Int?)] = [
-            (.input, record.input), (.output, record.output),
-            (.cacheRead, record.cacheRead), (.reasoning, record.reasoning),
-        ]
-        // A component with no tokens needs no price: there is nothing to multiply,
-        // so demanding an entry would report a missing price where there is no
-        // spend. A component *with* tokens and no entry is a different fact — spend
-        // that cannot be priced — and it says so rather than quietly dropping those
-        // tokens, which would produce a total that cannot reconcile with an invoice.
-        let spent = components.filter { ($0.1 ?? 0) > 0 }
-        guard !spent.isEmpty else {
-            // Zero tokens cost zero under any table, so the figure is exact; it
-            // still names the prices it stands under rather than a version of 0,
-            // which would read as "priced from nothing".
-            return .priced(usd: 0, priceTableVersion: table.currentVersion)
+        // Two sources counting one model differently is asked here rather than
+        // re-derived below, so the list view and a single-session read cannot price the
+        // same session differently.
+        let disagreements = TokenUsage.hasMaterialDisagreement(
+            segments, tolerance: Decimal(string: "0.01")!
+        )
+        if !disagreements.isEmpty {
+            return .conflict(disagreements: disagreements)
         }
 
+        // Past that check the sources agree, so each model has exactly one reading to
+        // bill — and one model still has two segments, because agreeing readings are
+        // still keyed on their provenance. Pricing both is not a rounding difference:
+        // two 1,000-token readings of one session cost as 2,000 tokens, and no invoice
+        // carries that line. The self-report wins, as it did before segments existed.
+        let billable = TokenUsage.preferredProvenance(segments)
+
+        // Each segment is priced at *its own* model's rate and the results summed.
+        // Pricing a mixed total at one rate is the unsound figure segments exist to
+        // remove — it cannot be reconciled with an invoice, because the invoice has
+        // two lines and the total has one rate applied to both.
         var total = Decimal(0)
         var version = 0
-        for (component, count) in spent {
-            guard let count,
-                  let (price, entryVersion) = table.price("\(modelID)#\(component.keySuffix)")
-            else {
-                return .notPriced(modelID: modelID)
+        var lines: [CostLine] = []
+        var unpriced: [String] = []
+
+        for segment in billable {
+            let components: [(PriceComponent, Int?)] = [
+                (.input, segment.input), (.output, segment.output),
+                (.cacheRead, segment.cacheRead), (.reasoning, segment.reasoning),
+            ]
+            // A component with no tokens needs no price: there is nothing to multiply,
+            // so demanding an entry would report a missing price where there is no
+            // spend. A component *with* tokens and no entry is a different fact.
+            let spent = components.filter { ($0.1 ?? 0) > 0 }
+
+            var segmentTotal = Decimal(0)
+            var segmentPriced = true
+            for (component, count) in spent {
+                guard let count,
+                      let (price, entryVersion) = table.price("\(segment.modelID)#\(component.keySuffix)")
+                else {
+                    segmentPriced = false
+                    break
+                }
+                segmentTotal += price * Decimal(count)
+                version = max(version, entryVersion)
             }
-            total += price * Decimal(count)
-            version = max(version, entryVersion)
+            guard segmentPriced else {
+                unpriced.append(segment.modelID)
+                continue
+            }
+            total += segmentTotal
+            lines.append(CostLine(modelID: segment.modelID, usd: segmentTotal))
         }
-        return .priced(usd: total, priceTableVersion: version)
+
+        // **Never a partial total.** One segment with no price means the sum omits
+        // spend, and a cost missing a model's spend is a wrong number — the specific
+        // failure this type has always refused. Every unpriced model is named, because
+        // pricing one of several does not make the total computable.
+        guard unpriced.isEmpty else {
+            return .notPriced(models: Set(unpriced).sorted())
+        }
+        // The newest price this figure consumed, never a version it did not use.
+        // `version` is a maximum over the entries this computation actually read, so a
+        // figure built from `model-a` at table version 1 and `model-b` at version 2
+        // reports 2 — the newest price it stood under, not every price it rests on.
+        // That is what the field can honestly mean; it is not a claim that one version
+        // describes the whole table. A figure that consumed no entry at all — every
+        // token count zero, so the total is exact under any table — falls back to the
+        // table's current version, since a version of 0 would read as "priced from
+        // nothing".
+        return .priced(
+            usd: total,
+            priceTableVersion: max(version, table.currentVersion),
+            // One line per model, so model id is a total order here and the sort is
+            // stable rather than merely deterministic-ish. Before `preferredProvenance`
+            // two lines could carry the same model and this comparator was not a total
+            // order at all, so their relative order was whatever the fold happened to
+            // produce.
+            lines: lines.sorted { $0.modelID < $1.modelID }
+        )
     }
 
     /// A read-only view of the price table for one costing pass. Small enough to be a

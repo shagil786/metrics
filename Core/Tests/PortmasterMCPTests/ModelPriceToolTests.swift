@@ -64,7 +64,7 @@ final class ModelPriceToolTests: XCTestCase {
     /// Before a price, a session with real tokens reads *not priced* — not free.
     func testASessionIsNotPricedBeforeAPriceExists() throws {
         let id = try session(modelID: "m")
-        XCTAssertEqual(try store.cost(for: id), .notPriced(modelID: "m"))
+        XCTAssertEqual(try store.cost(for: id), .notPriced(models: ["m"]))
     }
 
     /// After one, the same session reads a figure. This is the whole feature: a
@@ -83,7 +83,7 @@ final class ModelPriceToolTests: XCTestCase {
         XCTAssertFalse(outcome.isError, outcome.text)
 
         let after = try store.cost(for: id)
-        guard case .priced(let usd, let version) = after else {
+        guard case .priced(let usd, let version, _) = after else {
             return XCTFail("expected a priced cost, got \(after)")
         }
         XCTAssertEqual(usd, Decimal(string: "0.002")!)

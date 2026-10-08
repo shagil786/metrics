@@ -458,11 +458,24 @@ struct TokenUsagePayload: Encodable {
 
     init(_ usage: TokenUsage) {
         switch usage {
-        case .reported(let input, let output, let provenance):
+        case .reported(let segments):
+            // Interim shape, and both halves of the interim are worth stating. This
+            // payload still carries one pair of counts, so the per-model split in
+            // `TokenUsage` does not reach a client: a session that ran two models
+            // reads here as one total, with no breakdown.
+            //
+            // What it *does* carry is one provenance's segments rather than a sum of
+            // both. Two sources describing one session are alternative measurements of
+            // the same work, so summing them double-counts it — and the chosen one is
+            // named below rather than dropped, because the whole point of carrying
+            // `provenance` at all is that a figure whose origin is unknown cannot be
+            // audited. Emitting nil here would say "no source reported this" about a
+            // number two sources reported.
+            let chosen = TokenUsage.preferredProvenance(segments)
             self.reported = true
-            self.inputTokens = input
-            self.outputTokens = output
-            self.provenance = provenance.rawValue
+            self.inputTokens = chosen.reduce(0) { $0 + $1.input }
+            self.outputTokens = chosen.reduce(0) { $0 + $1.output }
+            self.provenance = chosen.first?.provenance.rawValue
             self.reason = nil
         case .notReported(let reason):
             self.reported = false
@@ -488,7 +501,7 @@ struct SessionCostPayload: Encodable {
 
     init(_ cost: SessionCost) {
         switch cost {
-        case .priced(let usd, let version):
+        case .priced(let usd, let version, _):
             self.priced = true
             // A string, not a JSON number: binary floating point cannot carry money
             // and a decimal string round-trips through any client unchanged.
@@ -496,18 +509,18 @@ struct SessionCostPayload: Encodable {
             self.priceTableVersion = version
             self.reason = nil
             self.models = nil
-        case .notPriced(let modelID):
+        case .notPriced(let models):
             self.priced = false
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "unpriced"
-            self.models = [modelID]
-        case .conflict(let models):
+            self.models = models
+        case .conflict(let disagreements):
             self.priced = false
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "conflict"
-            self.models = models
+            self.models = disagreements.map(\.modelID)
         case .noUsage:
             self.priced = false
             self.usd = nil

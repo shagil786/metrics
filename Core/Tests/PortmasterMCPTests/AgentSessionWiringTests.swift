@@ -54,12 +54,15 @@ final class AgentSessionWiringTests: XCTestCase {
         XCTAssertEqual(sessions.count, 1, "one connection, one session")
         let session = try XCTUnwrap(sessions.first)
         XCTAssertEqual(
-            session.usage, .reported(input: 1200, output: 340, provenance: .selfReported),
+            session.usage,
+            .reported(input: 1200, output: 340, modelID: "test-model-1",
+                      provenance: .selfReported),
             "the report must be readable through the session it arrived on"
         )
         XCTAssertEqual(
             try fixture.reopened().usage(for: session.id),
-            .reported(input: 1200, output: 340, provenance: .selfReported),
+            .reported(input: 1200, output: 340, modelID: "test-model-1",
+                      provenance: .selfReported),
             "and through the id, which is the read every cost figure is built from"
         )
     }
@@ -162,7 +165,9 @@ final class AgentSessionWiringTests: XCTestCase {
         // as one session carrying 1000/100 — every record written, no error raised,
         // and a cost figure that describes neither agent.
         for session in sessions {
-            guard case .reported(let input, let output, _) = session.usage else {
+            guard case .reported(let segments) = session.usage,
+                  let input = segments.first?.input,
+                  let output = segments.first?.output else {
                 return XCTFail("every session must carry a report: \(session.usage)")
             }
             XCTAssertTrue(
@@ -350,7 +355,8 @@ final class AgentSessionWiringTests: XCTestCase {
             "the relayed connection must have a session row of its own"
         )
         XCTAssertEqual(
-            session.usage, .reported(input: 77, output: 7, provenance: .selfReported)
+            session.usage,
+            .reported(input: 77, output: 7, modelID: "m1", provenance: .selfReported)
         )
     }
 

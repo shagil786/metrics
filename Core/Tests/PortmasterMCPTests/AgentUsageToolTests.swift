@@ -327,7 +327,7 @@ final class AgentUsageToolTests: XCTestCase {
         )
         // And the report did land, under that session.
         XCTAssertEqual(try reopened.usage(for: sessionID), .reported(
-            input: 1000, output: 250, provenance: .selfReported
+            input: 1000, output: 250, modelID: "m1", provenance: .selfReported
         ))
     }
 

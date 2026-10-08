@@ -112,11 +112,13 @@ final class AgentSessionStoreTests: XCTestCase {
             ))
         }
 
-        guard case .reported(let input, let output, _) = try store.usage(for: sid) else {
-            return XCTFail("expected reported usage")
+        guard case .reported(let segments) = try store.usage(for: sid),
+              let only = segments.first else {
+            return XCTFail("expected one reported segment")
         }
-        XCTAssertEqual(input, 400)
-        XCTAssertEqual(output, 200)
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(only.input, 400)
+        XCTAssertEqual(only.output, 200)
     }
 
     func testSessionWithNoUsageReadsNotReported() throws {
@@ -142,7 +144,7 @@ final class AgentSessionStoreTests: XCTestCase {
             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
         ))
 
-        guard case .priced(let usd, _) = try store.cost(for: sid) else {
+        guard case .priced(let usd, _, _) = try store.cost(for: sid) else {
             return XCTFail("expected a priced cost")
         }
         // 1000 * 0.0000015 + 500 * 0.000006 = 0.0015 + 0.003 = 0.0045 exactly.
@@ -161,8 +163,8 @@ final class AgentSessionStoreTests: XCTestCase {
         ))
 
         let cost = try store.cost(for: sid)
-        XCTAssertEqual(cost, .notPriced(modelID: "never-priced"))
-        XCTAssertNotEqual(cost, .priced(usd: Decimal(0), priceTableVersion: 1))
+        XCTAssertEqual(cost, .notPriced(models: ["never-priced"]))
+        XCTAssertNotEqual(cost, .priced(usd: Decimal(0), priceTableVersion: 1, lines: []))
     }
 
     func testSessionWithNoUsageHasNoCostRatherThanZero() throws {
@@ -186,14 +188,14 @@ final class AgentSessionStoreTests: XCTestCase {
             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
         ))
 
-        guard case .priced(let before, let versionBefore) = try store.cost(for: sid) else {
+        guard case .priced(let before, let versionBefore, _) = try store.cost(for: sid) else {
             return XCTFail("expected priced")
         }
         XCTAssertEqual(before, Decimal(string: "0.001")!)
         XCTAssertEqual(versionBefore, 1)
 
         try store.setPrice(Decimal(string: "0.000002")!, modelID: "m")
-        guard case .priced(let after, let versionAfter) = try store.cost(for: sid) else {
+        guard case .priced(let after, let versionAfter, _) = try store.cost(for: sid) else {
             return XCTFail("expected priced after change")
         }
         XCTAssertEqual(after, Decimal(string: "0.002")!)
@@ -203,10 +205,14 @@ final class AgentSessionStoreTests: XCTestCase {
     // MARK: - Cost wiring to TokenUsage's conflict rule
 
     /// One agent escalating models mid-session costs rather than blocking. This pins the
-    /// current behaviour, not its soundness: reports are cumulative, so the whole
-    /// total is priced at the newest model's rate and the figure cannot be reconciled
-    /// with an invoice. See `TokenUsage.hasModelConflict` and the README's honesty
-    /// section — a per-model usage segment is a data-model change for a later phase.
+    /// current behaviour, not its soundness: a self-report is one cumulative total, so
+    /// the newest reading still carries the old model's tokens inside it and the whole
+    /// total is priced at the newest model's rate — a figure no invoice carries. The
+    /// fold cannot separate that, because the old model's tokens are inside the total
+    /// with nothing marking where they stop, so this stays a **documented limitation**
+    /// rather than a per-model split, and asserting it is what stops it being forgotten.
+    /// A `parsedFromLog` escalation is the opposite case, because those figures are
+    /// disjoint: see `testTwoModelsArePricedAtTheirOwnRatesAndSummed`.
     func testCostSurvivesOneSourceSwitchingModelsMidSession() throws {
         let store = try makeStore()
 
@@ -221,99 +227,186 @@ final class AgentSessionStoreTests: XCTestCase {
         }
         try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-b")
 
-        guard case .priced(let usd, let version) = try store.cost(for: sid) else {
+        // One segment, not two. The two self-reports are prefixes of a single
+        // cumulative total, so treating them as two models would price 1,000 tokens
+        // twice — a different unsound figure from the one this limitation admits to.
+        guard case .reported(let segments) = try store.usage(for: sid) else {
+            return XCTFail("expected a reported usage")
+        }
+        XCTAssertEqual(segments.map(\.modelID), ["model-b"])
+
+        guard case .priced(let usd, let version, let lines) = try store.cost(for: sid) else {
             return XCTFail("a single source switching models is not two sources disagreeing")
         }
         XCTAssertEqual(usd, Decimal(string: "0.001")!)
         XCTAssertEqual(version, 1)
+        XCTAssertEqual(lines.map(\.modelID), ["model-b"])
     }
 
-    /// The other direction, protecting the fix from over-correcting: two sources that
-    /// disagree are still a conflict, and the cost stays unpriced with both models named.
-    func testCostIsBlockedWhenSourcesDisagreeAboutTheModel() throws {
-        let store = try makeStore()
-
-        let sid = UUID()
-        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
+    /// Two models at different rates must be priced at their own rates and summed.
+    /// Pricing a mixed total at one rate is the known-unsound case segments exist to
+    /// remove, so this is the assertion the whole type change is for. Both readings come
+    /// from a log parse, whose per-model figures are disjoint — the self-report path is
+    /// the one that cannot be split, and `testCostSurvivesOneSourceSwitchingModelsMidSession`
+    /// says why.
+    func testTwoModelsArePricedAtTheirOwnRatesAndSummed() throws {
+        let (store, _) = try makeStoreOnDisk()
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "escalated", clientVersion: nil,
+            connectedAt: Date()
+        )
+        let at = Date()
         try store.recordUsage(TokenUsageRecord(
-            sessionID: sid, recordedAt: Date(timeIntervalSince1970: 1),
-            input: 1_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-a", provenance: .selfReported
+            sessionID: session, recordedAt: at, input: 100, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-a", provenance: .parsedFromLog
         ))
         try store.recordUsage(TokenUsageRecord(
-            sessionID: sid, recordedAt: Date(timeIntervalSince1970: 2),
-            input: 2_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-b", provenance: .parsedFromLog
+            sessionID: session, recordedAt: at, input: 900, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-b", provenance: .parsedFromLog
         ))
-        // Prices for both, so a blocked cost cannot be mistaken for a missing one.
         try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
-        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-b")
+        try store.setPrice(Decimal(string: "0.000002")!, modelID: "model-b")
+        try store.flush()
 
-        XCTAssertEqual(try store.cost(for: sid), .conflict(models: ["model-a", "model-b"]))
+        guard case .priced(let usd, _, let lines) = try store.cost(for: session) else {
+            return XCTFail("expected a priced total")
+        }
+        XCTAssertEqual(usd, Decimal(string: "0.0019")!)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines.first(where: { $0.modelID == "model-a" })?.usd,
+                       Decimal(string: "0.0001")!)
+        XCTAssertEqual(lines.first(where: { $0.modelID == "model-b" })?.usd,
+                       Decimal(string: "0.0018")!)
     }
 
-    /// A conflict is its own state, not `notPriced`. Both models here are priced, so
+    /// One priced and one unpriced model must report the absence, naming the model,
+    /// and never a total missing that model's cost — a partial cost is a wrong number.
+    func testOneUnpricedModelSuppressesTheWholeTotal() throws {
+        let (store, _) = try makeStoreOnDisk()
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "partial", clientVersion: nil,
+            connectedAt: Date()
+        )
+        let at = Date()
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 100, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "priced", provenance: .parsedFromLog
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 900, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "unpriced", provenance: .parsedFromLog
+        ))
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "priced")
+        try store.flush()
+
+        guard case .notPriced(let models) = try store.cost(for: session) else {
+            return XCTFail("expected notPriced, got \(try store.cost(for: session))")
+        }
+        XCTAssertEqual(models, ["unpriced"])
+    }
+
+    /// Two sources counting one model the same way describe one piece of work twice, and
+    /// only one of them may be billed. This is the case agreement is silent about:
+    /// `hasMaterialDisagreement` returns nothing below the tolerance, so nothing blocks
+    /// the cost — but the two readings are still two segments, because they are keyed on
+    /// their provenance. Priced together, a 1,000-token session whose agent also had a
+    /// log parse costs as 2,000 and reports two lines for one model's work.
+    func testAgreeingProvenancesOnOneModelArePricedOnceNotSummed() throws {
+        let store = try makeStore()
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "agreed", clientVersion: nil,
+            connectedAt: Date()
+        )
+        let at = Date()
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 1_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        // Half a percent apart: inside the 1% tolerance, so this is noise rather than a
+        // broken reader, and the cost is produced rather than blocked.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at.addingTimeInterval(1), input: 1_005, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog
+        ))
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        try store.flush()
+
+        // Agreement is not one source: both readings survive the fold, because the
+        // disagreement rule compares them rather than discarding one.
+        guard case .reported(let segments) = try store.usage(for: session) else {
+            return XCTFail("expected both provenances to survive the fold")
+        }
+        XCTAssertEqual(segments.count, 2)
+
+        guard case .priced(let usd, _, let lines) = try store.cost(for: session) else {
+            return XCTFail("agreeing sources are not a conflict: \(try store.cost(for: session))")
+        }
+        XCTAssertEqual(lines.count, 1, "one model's work is one line")
+        XCTAssertEqual(lines.first?.modelID, "m")
+        // 1000 * 0.000001, the self-report — not 1000 + 1005 of the same tokens.
+        XCTAssertEqual(usd, Decimal(string: "0.001")!)
+        XCTAssertNotEqual(usd, Decimal(string: "0.002005")!, "two readings of one session are not added")
+    }
+
+    func testSameModelDisagreementSuppressesTheCostAndNamesBothTotals() throws {
+        let store = try makeStore()
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "disagree", clientVersion: nil,
+            connectedAt: Date()
+        )
+        let at = Date()
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 1000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 1200, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog
+        ))
+        // Priced, so the block cannot be mistaken for a missing price: "enter a price"
+        // would do nothing here, and the repair is choosing a source.
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        try store.flush()
+
+        guard case .conflict(let disagreements) = try store.cost(for: session),
+              let only = disagreements.first else {
+            return XCTFail("expected a conflict")
+        }
+        XCTAssertEqual(only.modelID, "m")
+        XCTAssertEqual(only.totals[.selfReported], 1000)
+        XCTAssertEqual(only.totals[.parsedFromLog], 1200)
+    }
+
+    /// A conflict is its own state, not `notPriced`. The model is priced here, so
     /// reporting a missing price would point the user at the price table — the one
     /// recovery that cannot possibly work, because the block is the disagreement.
     func testConflictIsNotReportedAsAMissingPrice() throws {
         let store = try makeStore()
-
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
         try store.recordUsage(TokenUsageRecord(
             sessionID: sid, recordedAt: Date(timeIntervalSince1970: 1),
             input: 1_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-a", provenance: .selfReported
+            modelID: "m", provenance: .selfReported
         ))
         try store.recordUsage(TokenUsageRecord(
             sessionID: sid, recordedAt: Date(timeIntervalSince1970: 2),
             input: 2_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-b", provenance: .parsedFromLog
+            modelID: "m", provenance: .parsedFromLog
         ))
-        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
-        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-b")
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
 
         let cost = try store.cost(for: sid)
         XCTAssertNil(cost.usd, "a blocked cost is absence of a figure, never a figure")
-        XCTAssertNotEqual(cost, .notPriced(modelID: "model-a"))
-        XCTAssertNotEqual(cost, .notPriced(modelID: "model-b"))
-        XCTAssertNotEqual(cost, .priced(usd: Decimal(0), priceTableVersion: 1))
-        guard case .conflict(let models) = cost else {
-            return XCTFail("expected a conflict naming both models")
+        XCTAssertNotEqual(cost, .notPriced(models: ["m"]))
+        XCTAssertNotEqual(cost, .priced(usd: Decimal(0), priceTableVersion: 1, lines: []))
+        guard case .conflict = cost else {
+            return XCTFail("expected a conflict naming the model counted two ways")
         }
-        XCTAssertEqual(Set(models), ["model-a", "model-b"])
-    }
-
-    /// The residual case scoping `hasModelConflict` to one figure per source has to
-    /// keep: self-reporting escalates `model-a → model-b` at t=5 while a log adapter,
-    /// still reading `model-a`, reports at t=3. Each source is internally consistent,
-    /// and they disagree — which is what a conflict is. Ruled a conflict, so the cost
-    /// stays blocked rather than being priced against whichever source wins.
-    func testCostIsBlockedWhenAnEscalatingSourceIsOutrunByALaggingOne() throws {
-        let store = try makeStore()
-
-        let sid = UUID()
-        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
-        try store.recordUsage(TokenUsageRecord(
-            sessionID: sid, recordedAt: Date(timeIntervalSince1970: 1),
-            input: 1_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-a", provenance: .selfReported
-        ))
-        try store.recordUsage(TokenUsageRecord(
-            sessionID: sid, recordedAt: Date(timeIntervalSince1970: 3),
-            input: 1_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-a", provenance: .parsedFromLog
-        ))
-        try store.recordUsage(TokenUsageRecord(
-            sessionID: sid, recordedAt: Date(timeIntervalSince1970: 5),
-            input: 4_000, output: 0, cacheRead: nil, reasoning: nil,
-            modelID: "model-b", provenance: .selfReported
-        ))
-        // Both models priced, so a price is never the reason the cost is missing.
-        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
-        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-b")
-
-        XCTAssertEqual(try store.cost(for: sid), .conflict(models: ["model-a", "model-b"]))
     }
 
     // MARK: - Decimal at rest
@@ -339,7 +432,7 @@ final class AgentSessionStoreTests: XCTestCase {
         try store.flush()
 
         let reopened = try AgentSessionStore(storeURL: url)
-        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+        guard case .priced(let usd, _, _) = try reopened.cost(for: sid) else {
             return XCTFail("expected a priced cost read back from disk")
         }
         XCTAssertEqual(usd, Decimal(string: "0.0045")!)
@@ -363,7 +456,7 @@ final class AgentSessionStoreTests: XCTestCase {
             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
         ))
 
-        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+        guard case .priced(let usd, _, _) = try reopened.cost(for: sid) else {
             return XCTFail("expected a priced cost")
         }
         XCTAssertEqual(usd, Decimal(string: "0.0000015")!)
@@ -392,7 +485,7 @@ final class AgentSessionStoreTests: XCTestCase {
         try store.flush()
 
         let reopened = try AgentSessionStore(storeURL: url)
-        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+        guard case .priced(let usd, _, _) = try reopened.cost(for: sid) else {
             return XCTFail("expected a priced cost read back from disk")
         }
         XCTAssertEqual(usd, written, "the stored price is the price that went in, digit for digit")
@@ -414,7 +507,7 @@ final class AgentSessionStoreTests: XCTestCase {
         try store.flush()
 
         let reopened = try AgentSessionStore(storeURL: url)
-        guard case .priced(let usd, _) = try reopened.cost(for: sid) else {
+        guard case .priced(let usd, _, _) = try reopened.cost(for: sid) else {
             return XCTFail("expected a priced cost read back from disk")
         }
         XCTAssertEqual(usd, written * Decimal(777))
@@ -422,7 +515,7 @@ final class AgentSessionStoreTests: XCTestCase {
 
     // MARK: - Tied timestamps
 
-    /// Many reports of one instant. `latestPerProvenance` keeps the first of a tied set,
+    /// Many reports of one instant. `latestPerSegment` keeps the first of a tied set,
     /// so the order of tied rows decides which figure wins — and the batched and
     /// per-session reads are two queries with different plans, which SQLite makes no
     /// promise to return tied rows in the same order for. Without a stable order the
@@ -460,7 +553,7 @@ final class AgentSessionStoreTests: XCTestCase {
 
         // The winner is one of the tied reports — not a figure from nowhere, and not a
         // sum of them.
-        guard case .reported(let input, _, _) = viaUsage else {
+        guard case .reported(let segments) = viaUsage, let input = segments.first?.input else {
             return XCTFail("expected a reported usage")
         }
         XCTAssertTrue((1_000..<1_008).contains(input), "one tied report wins: \(input)")
@@ -514,7 +607,7 @@ final class AgentSessionStoreTests: XCTestCase {
         }
         // The cache-read component is included, so agreement cannot come from both
         // paths dropping it.
-        guard case .priced(let cached, _) = try store.cost(for: cached) else {
+        guard case .priced(let cached, _, _) = try store.cost(for: cached) else {
             return XCTFail("expected the cached session to price")
         }
         XCTAssertEqual(cached, Decimal(string: "0.002")!)
@@ -563,7 +656,11 @@ final class AgentSessionStoreTests: XCTestCase {
             sessionID: sid2, recordedAt: Date(), input: 1_000, output: 0,
             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
         ))
-        XCTAssertEqual(try reopened.cost(for: sid2), .priced(usd: Decimal(string: "0.001")!, priceTableVersion: 1))
+        XCTAssertEqual(
+            try reopened.cost(for: sid2),
+            .priced(usd: Decimal(string: "0.001")!, priceTableVersion: 1,
+                    lines: [CostLine(modelID: "m", usd: Decimal(string: "0.001")!)])
+        )
     }
 
     /// The basic sweep: a session that connected long ago and has said nothing since
@@ -604,7 +701,8 @@ final class AgentSessionStoreTests: XCTestCase {
             try reopened.usage(for: stale), .notReported(reason: .awaitingFirstReport),
             "a pruned session's records must go with it, not survive as orphans"
         )
-        guard case .reported(let input, _, _) = try reopened.usage(for: recent) else {
+        guard case .reported(let segments) = try reopened.usage(for: recent),
+              let input = segments.first?.input else {
             return XCTFail("the recent session must keep its usage")
         }
         XCTAssertEqual(input, 500)
@@ -647,7 +745,8 @@ final class AgentSessionStoreTests: XCTestCase {
             "a connection that is still serving keeps its session row through every sweep"
         )
         XCTAssertEqual(
-            try reopened.usage(for: live), .reported(input: 900, output: 0, provenance: .selfReported),
+            try reopened.usage(for: live),
+            .reported(input: 900, output: 0, modelID: "m", provenance: .selfReported),
             "and the report it made after the sweep is readable, not an orphan"
         )
     }
@@ -680,14 +779,14 @@ final class AgentSessionStoreTests: XCTestCase {
         let reopened = try AgentSessionStore(storeURL: url)
         XCTAssertEqual(
             try reopened.usage(for: live),
-            .reported(input: 42, output: 0, provenance: .selfReported),
+            .reported(input: 42, output: 0, modelID: "m", provenance: .selfReported),
             "deleting this record would make the session read as one that never reported"
         )
     }
 
     /// A stale session that is still reporting is kept, and its older records are
     /// trimmed — which changes nothing this store reports, because aggregation reads
-    /// only the latest record per provenance.
+    /// only the latest record per segment.
     ///
     /// The trimming is what keeps a chatty session from growing without bound, and the
     /// figure being identical before and after is what makes it safe: a sum would
@@ -721,69 +820,75 @@ final class AgentSessionStoreTests: XCTestCase {
             try reopened.usage(for: active), before,
             "trimming records older than the cutoff cannot move a latest-record figure"
         )
-        guard case .reported(let input, _, _) = try reopened.usage(for: active) else {
+        guard case .reported(let segments) = try reopened.usage(for: active),
+              let input = segments.first?.input else {
             return XCTFail("an actively reporting session must keep reporting")
         }
         XCTAssertEqual(input, 900)
     }
 
-    /// What trimming does to a session that carried figures from **two** provenances.
+    /// The inverse of the test this replaces, and the property `prune` still owes.
     ///
-    /// The single-provenance test above shows the figure surviving, and that holds only
-    /// because one provenance contributed. Here the old record is the only one its
-    /// provenance ever sent, so trimming it is not discarding a superseded figure — it
-    /// deletes a *source*. The session stops being a conflict and becomes a priced cost,
-    /// and the reported aggregate moves to whichever source is left, with nothing in the
-    /// output saying a retention sweep just chose between them.
+    /// The deleted `testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice` pinned
+    /// a sweep turning a stated disagreement into a confident figure for whichever model
+    /// survived. Segments retire that particular shape — two models in two sources are
+    /// two segments and both are priced — but the hazard did not go with it: the trim
+    /// still deletes by session and timestamp, so it can still remove the *only* record
+    /// of one provenance and leave a different, still-priced figure behind. Nothing in
+    /// the output says retention chose it.
     ///
-    /// Pinned because this is the case `prune`'s own doc comment cannot promise away, and
-    /// because a test that pins it is what stops someone reading "aggregation reads the
-    /// latest per provenance" and concluding the trim is inert. It is inert only when the
-    /// trimmed records were not the latest for their provenance.
-    func testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice() throws {
+    /// The figures are the design's, so the replacement is not a matter of judgement:
+    /// `0.0001 + 0.0018` = `0.0019` before the sweep, `0.0019` after it.
+    ///
+    /// **RED, and deliberately so.** A record may only go once a newer one exists for its
+    /// own `(provenance, model)` pair; until that rule lands, the sole self-report below
+    /// is exactly the record the trim takes, and the sweep moves the figure. Written
+    /// first so the fix has something to satisfy, per the design's testing section.
+    func testPruneDoesNotChangeAFigureForATwoSourceSession() throws {
         let (store, url) = try makeStoreOnDisk()
         let cutoff = Date(timeIntervalSince1970: 1_000)
-        let twoSources = UUID()
+        let session = UUID()
         try store.recordSession(
-            id: twoSources, peerPID: 1, clientName: "two-sources", clientVersion: nil,
+            id: session, peerPID: 1, clientName: "two-sources", clientVersion: nil,
             connectedAt: cutoff.addingTimeInterval(-3_600)
         )
         // The only self-reported record, and it is the old one. The parse is newer, so
         // this session is "still reporting" and lands in the trim group.
         try store.recordUsage(TokenUsageRecord(
-            sessionID: twoSources, recordedAt: cutoff.addingTimeInterval(-600), input: 100,
+            sessionID: session, recordedAt: cutoff.addingTimeInterval(-600), input: 100,
             output: 0, cacheRead: nil, reasoning: nil, modelID: "model-a",
             provenance: .selfReported
         ))
         try store.recordUsage(TokenUsageRecord(
-            sessionID: twoSources, recordedAt: cutoff.addingTimeInterval(60), input: 900,
+            sessionID: session, recordedAt: cutoff.addingTimeInterval(60), input: 900,
             output: 0, cacheRead: nil, reasoning: nil, modelID: "model-b",
             provenance: .parsedFromLog
         ))
-        // Both priced, so the cost after the sweep is not missing for want of a price —
-        // the sweep is the only thing that could have changed it.
+        // Both priced, so nothing after the sweep can be missing for want of a price and
+        // the sweep is the only thing that could have changed the figure.
         try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
         try store.setPrice(Decimal(string: "0.000002")!, modelID: "model-b")
         try store.flush()
 
-        // Before: two sources, two models, no figure anyone can trust.
-        XCTAssertEqual(try store.usage(for: twoSources),
-                       .reported(input: 100, output: 0, provenance: .selfReported))
-        XCTAssertEqual(try store.cost(for: twoSources), .conflict(models: ["model-a", "model-b"]))
+        // 0.0001 + 0.0018. Two models in two sources is two segments, and both are
+        // priced, so there is no disagreement for a sweep to resolve.
+        guard case .priced(let usdBefore, _, let linesBefore) = try store.cost(for: session) else {
+            return XCTFail("two priced segments are not a conflict: \(try store.cost(for: session))")
+        }
+        XCTAssertEqual(usdBefore, Decimal(string: "0.0019")!)
+        XCTAssertEqual(linesBefore.map(\.modelID), ["model-a", "model-b"])
+        let usageBefore = try store.usage(for: session)
 
         store.prune(olderThan: cutoff, keepingSessionIDs: [])
 
         let reopened = try AgentSessionStore(storeURL: url)
         XCTAssertEqual(
-            try reopened.usage(for: twoSources),
-            .reported(input: 900, output: 0, provenance: .parsedFromLog),
-            "the self-reported source is gone, so the aggregate is the parse's now"
+            try reopened.usage(for: session), usageBefore,
+            "a sweep changed the usage: the sole self-report is not a superseded record"
         )
         XCTAssertEqual(
-            try reopened.cost(for: twoSources), .priced(usd: Decimal(string: "0.0018")!,
-                                                        priceTableVersion: 2),
-            "a conflict silently becomes a priced figure for whichever model is left — "
-                + "model-b's price, which is the second entry written, and nothing else"
+            try reopened.cost(for: session).usd, Decimal(string: "0.0019")!,
+            "0.0001 + 0.0018 before the sweep, and the same after it"
         )
     }
 

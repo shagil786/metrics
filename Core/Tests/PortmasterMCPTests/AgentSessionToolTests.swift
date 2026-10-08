@@ -144,6 +144,36 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertEqual(usage["provenance"] as? String, "selfReported")
     }
 
+    /// A two-source session still names the source its figure came from. The wire shape
+    /// carries one pair of counts, so it has to pick a provenance — and it must pick a
+    /// real one rather than reporting nil, which would tell a caller nobody reported
+    /// this session when in fact two sources did. Summing both instead would be the
+    /// other wrong answer: the same tokens counted twice.
+    func testTwoProvenanceFigureStillNamesItsSource() async throws {
+        let id = UUID()
+        try store.recordSession(
+            id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date(), input: 1_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        // Half a percent apart, so the two agree and the cost is not blocked.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 1_005, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog
+        ))
+        try store.flush()
+
+        let json = try await wire()
+        let usage = try XCTUnwrap(
+            (try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first))["usage"] as? [String: Any]
+        )
+
+        XCTAssertEqual(usage["provenance"] as? String, "selfReported")
+        XCTAssertEqual(usage["inputTokens"] as? Int, 1_000, "one reading of the session, not two")
+    }
+
     /// A priced session carries its figures and the price-table version that
     /// produced them, so a number can be traced back to the prices behind it.
     func testPricedSessionCarriesItsVersion() async throws {
@@ -159,9 +189,11 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertEqual(cost["priced"] as? Bool, true)
         // A string, not a JSON number: a client must not round a money figure.
         XCTAssertNotNil(cost["usd"] as? String)
-        // One entry per component, each versioned by its own write: the input price
-        // was written once, so it is version 1.
-        XCTAssertEqual(cost["priceTableVersion"] as? Int, 1)
+        // The table version this figure was computed against, which is the table's
+        // newest rather than the input price's: the fixture also wrote an output price
+        // after the input one, taking the table to version 2. The field names the table
+        // a figure was re-costed under, not every price it happens to have used.
+        XCTAssertEqual(cost["priceTableVersion"] as? Int, 2)
     }
 
     /// An unpriced model is not a free one.
@@ -299,26 +331,25 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertNotNil(json["note"] as? String)
     }
 
-    /// A source disagreement reaches the wire naming both models. It is the case the
-    /// README spends a paragraph on, so it should not be the one with no assertion.
-    func testAConflictReachesTheWireNamingBothModels() throws {
+    /// A source disagreement reaches the wire naming the model counted two ways. It is
+    /// the case the README spends a paragraph on, so it should not be the one with no
+    /// assertion.
+    func testAConflictReachesTheWireNamingTheModel() throws {
         let id = UUID()
         try store.recordSession(
             id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
         )
-        // Two provenances, two models: one self-reported, one parsed from a log.
-        // A conflict is exactly that, and both models are priced, so it cannot be
-        // mistaken for a missing price.
-        for model in ["model-a", "model-b"] {
-            try store.setPrice(Decimal(1), modelID: model)
-        }
+        // One model, two sources, totals far enough apart to be a broken reader rather
+        // than noise. The model is priced, so the block cannot be mistaken for a
+        // missing price.
+        try store.setPrice(Decimal(1), modelID: "m")
         try store.recordUsage(TokenUsageRecord(
             sessionID: id, recordedAt: Date(), input: 10, output: 0,
-            cacheRead: nil, reasoning: nil, modelID: "model-a", provenance: .selfReported
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
         ))
         try store.recordUsage(TokenUsageRecord(
-            sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 20, output: 0,
-            cacheRead: nil, reasoning: nil, modelID: "model-b", provenance: .parsedFromLog
+            sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 30, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog
         ))
         try store.flush()
 
@@ -335,7 +366,7 @@ final class AgentSessionToolTests: XCTestCase {
 
         XCTAssertEqual(cost["priced"] as? Bool, false)
         XCTAssertEqual(cost["reason"] as? String, "conflict")
-        XCTAssertEqual(cost["models"] as? [String], ["model-a", "model-b"])
+        XCTAssertEqual(cost["models"] as? [String], ["m"])
         XCTAssertNil(cost["usd"], "a conflict has no figure to report")
     }
 

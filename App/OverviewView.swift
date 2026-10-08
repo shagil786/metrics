@@ -362,7 +362,7 @@ struct OverviewView: View {
     private var agentSessionsCard: some View {
         let sessions = model.agentSessions
         let priced = sessions.compactMap { session -> Decimal? in
-            if case .priced(let usd, _) = session.cost { return usd }
+            if case .priced(let usd, _, _) = session.cost { return usd }
             return nil
         }
         let total = priced.reduce(Decimal(0), +)
@@ -979,8 +979,22 @@ private struct SessionLine: View {
 
     private var usage: String {
         switch session.usage {
-        case .reported(let input, let output, _):
-            return "\(Fmt.tokens(input + output)) tok"
+        case .reported(let segments):
+            // One source's reading per model: two sources describing one session are
+            // alternative measurements of the same work, so showing both would report
+            // the tokens twice — and disagree with the cost on the right of the row,
+            // which bills one of them.
+            let counted = TokenUsage.preferredProvenance(segments)
+            let tokens = counted.reduce(0) { $0 + $1.input + $1.output }
+            let models = Set(counted.map(\.modelID))
+            // One model prints as it always did. Several print with their split, because
+            // a single number cannot say two rates were involved.
+            guard models.count > 1 else { return "\(Fmt.tokens(tokens)) tok" }
+            let split = counted
+                .sorted { $0.modelID < $1.modelID }
+                .map { "\($0.modelID) \(Fmt.tokens($0.input + $0.output))" }
+                .joined(separator: " · ")
+            return "\(Fmt.tokens(tokens)) tok (\(split))"
         case .notReported(let reason):
             // Every reason in one short phrase each, so a row says which rather
             // than showing a dash that reads as zero.
@@ -999,10 +1013,30 @@ private struct SessionLine: View {
 
     private var cost: String {
         switch session.cost {
-        case .priced(let usd, _): return Fmt.usd(usd)
-        case .notPriced: return "not priced"
-        case .conflict: return "conflict"
-        case .noUsage: return "—"
+        case .priced(let usd, _, let lines):
+            guard lines.count > 1 else { return Fmt.usd(usd) }
+            let split = lines
+                .map { "\($0.modelID) \(Fmt.usd($0.usd))" }
+                .joined(separator: " · ")
+            return "\(Fmt.usd(usd)) (\(split))"
+        case .notPriced(let models):
+            // Name the models: entering one price does not make the total computable
+            // while another is still unpriced.
+            return models.count == 1 ? "not priced: \(models[0])" : "not priced: \(models.count) models"
+        case .conflict(let disagreements):
+            // A word with nothing to act on is the wrong thing to show. The repair here
+            // is choosing a source, so the two totals it is choosing between go on the
+            // row along with which source reported each.
+            guard let only = disagreements.first else { return "sources differ" }
+            let parts = only.totals
+                .sorted { $0.key.rawValue < $1.key.rawValue }
+                .map { "\($0.key.rawValue) \(Fmt.tokens($0.value))" }
+                .joined(separator: " / ")
+            return "sources differ (\(parts))"
+        case .noUsage:
+            // Not a dash: a dash reads as free, and a session nobody counted is not a
+            // session that cost nothing.
+            return "no usage"
         }
     }
 }
