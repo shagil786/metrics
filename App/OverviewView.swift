@@ -366,24 +366,41 @@ struct OverviewView: View {
             return nil
         }
         let total = priced.reduce(Decimal(0), +)
-        let reported = sessions.filter { $0.usage.isReported }.count
+        let tokens = SessionTokens(sessions: sessions)
 
         return DashboardCard(
             title: "Agent Sessions",
             symbol: "sparkles",
             tint: .purple,
-            context: "\(sessions.count) recorded",
-            numeral: sessions.isEmpty ? "—" : "\(reported)",
-            unit: sessions.isEmpty ? nil : "reported tokens",
+            context: sessionsContext(sessions: sessions, tokens: tokens),
+            // Tokens, not a count of sessions that reported them: a session tally under
+            // a "tokens" label is a number that reads as a measurement of something
+            // other than itself. And nothing countable here is a dash with no unit,
+            // because a dash labelled in tokens reads as a session that used none.
+            numeral: tokens.hasCountableFigure ? Fmt.tokens(tokens.total) : "—",
+            unit: tokens.hasCountableFigure ? "tokens" : nil,
             subMetrics: [
                 ("Sessions", "\(sessions.count)"),
                 // The two states kept apart on purpose: money that exists, and money
                 // nobody could compute because a model has no price.
-                ("Costed", priced.isEmpty ? "—" : "$\(Fmt.usd(total))"),
+                ("Costed", priced.isEmpty ? "—" : Fmt.usd(total)),
                 ("Not priced", "\(sessions.count - priced.count)"),
             ],
             footer: sessionsFooter(sessions: sessions)
         )
+    }
+
+    /// The card's own aggregate line. It names how many models the total covers,
+    /// because a bare sum is what made an escalated session look like a single-model
+    /// one, and it names the models nobody can count rather than leaving them out of
+    /// the sum — a total that quietly drops a model is the same claim by subtraction.
+    private func sessionsContext(sessions: [AgentSessionSnapshot], tokens: SessionTokens) -> String {
+        var parts = ["\(sessions.count) recorded"]
+        if tokens.modelCount > 1 { parts.append("\(tokens.modelCount) models") }
+        if !tokens.contested.isEmpty {
+            parts.append("\(tokens.contested.count) contested")
+        }
+        return parts.joined(separator: " · ")
     }
 
     @ViewBuilder private func sessionsFooter(sessions: [AgentSessionSnapshot]) -> some View {
@@ -953,6 +970,65 @@ struct DonutChart: View {
     }
 }
 
+/// The token figures the sessions card is allowed to print, for one session or for
+/// the card as a whole.
+///
+/// Resolved the way the MCP wire resolves them, because the two answer one question:
+/// `preferredProvenance` first, so summing what remains cannot report a session twice
+/// when two sources measured it, and then **no figure at all** for a model whose two
+/// readers disagree past the costing tolerance. The wire hands such a model a segment
+/// with null counts; printing one reader's number here would be a third answer to a
+/// question already answered twice, and printing a dash would claim the session spent
+/// nothing when what is missing is a reason to believe either reading.
+private struct SessionTokens {
+    /// One segment per model whose count is believed. Empty when nothing is countable,
+    /// which is not the same as a measured zero — that arrives as a segment reading 0.
+    private(set) var counted: [TokenUsageSegment] = []
+    /// Models two sources counted too differently to choose between: present, unnumbered.
+    private(set) var contested: Set<String> = []
+
+    init(sessions: [AgentSessionSnapshot]) {
+        for session in sessions {
+            guard case .reported = session.usage else { continue }
+            let part = SessionTokens(usage: session.usage, cost: session.cost)
+            counted += part.counted
+            contested.formUnion(part.contested)
+        }
+    }
+
+    init(usage: TokenUsage, cost: SessionCost) {
+        guard case .reported(let segments) = usage else { return }
+        // Read from the cost rather than re-derived: the costing pass has already
+        // applied the tolerance, and a second disagreement rule here would be one more
+        // place for the card and the wire to answer differently.
+        if case .conflict(let disagreements) = cost {
+            contested = Set(disagreements.map(\.modelID))
+        }
+        counted = TokenUsage.preferredProvenance(segments)
+            .filter { !contested.contains($0.modelID) }
+    }
+
+    /// Whether any model's count survives to be printed. **A contested model is not
+    /// one of them**: it has a reading and no reason to believe it, so a session whose
+    /// models are all contested has no figure to print and must not print a zero.
+    var hasCountableFigure: Bool { !counted.isEmpty }
+
+    var total: Int { counted.reduce(0) { $0 + $1.input + $1.output } }
+
+    var modelCount: Int { Set(counted.map(\.modelID)).count }
+
+    /// One clause per model, sorted so the row does not reorder between reads. A
+    /// contested model joins the split without a number rather than being dropped: a
+    /// split listing a model and no figure reads as a model that used nothing.
+    var split: String {
+        let counted = self.counted
+            .sorted { $0.modelID < $1.modelID }
+            .map { "\($0.modelID) \(Fmt.tokens($0.input + $0.output))" }
+        return (counted + contested.sorted().map { "\($0) contested" })
+            .joined(separator: " · ")
+    }
+}
+
 /// One session, in one line.
 ///
 /// The line is built around what is *missing* as much as what is there: a session
@@ -979,22 +1055,29 @@ private struct SessionLine: View {
 
     private var usage: String {
         switch session.usage {
-        case .reported(let segments):
+        case .reported:
             // One source's reading per model: two sources describing one session are
             // alternative measurements of the same work, so showing both would report
             // the tokens twice — and disagree with the cost on the right of the row,
             // which bills one of them.
-            let counted = TokenUsage.preferredProvenance(segments)
-            let tokens = counted.reduce(0) { $0 + $1.input + $1.output }
-            let models = Set(counted.map(\.modelID))
+            let tokens = SessionTokens(usage: session.usage, cost: session.cost)
+            guard tokens.hasCountableFigure else {
+                // Nothing survived to print. Contested models are named, because the
+                // repair is a user choosing a source; a fold that yielded no segment at
+                // all is the shape the three-state type exists to rule out, and "0 tok"
+                // is the one answer that must not be given either way.
+                guard !tokens.contested.isEmpty else { return "no count" }
+                return tokens.contested.count == 1
+                    ? "1 model contested"
+                    : "\(tokens.contested.count) models contested"
+            }
             // One model prints as it always did. Several print with their split, because
-            // a single number cannot say two rates were involved.
-            guard models.count > 1 else { return "\(Fmt.tokens(tokens)) tok" }
-            let split = counted
-                .sorted { $0.modelID < $1.modelID }
-                .map { "\($0.modelID) \(Fmt.tokens($0.input + $0.output))" }
-                .joined(separator: " · ")
-            return "\(Fmt.tokens(tokens)) tok (\(split))"
+            // a single number cannot say two rates were involved — or that one of them
+            // has no count at all.
+            guard tokens.modelCount + tokens.contested.count > 1 else {
+                return "\(Fmt.tokens(tokens.total)) tok"
+            }
+            return "\(Fmt.tokens(tokens.total)) tok (\(tokens.split))"
         case .notReported(let reason):
             // Every reason in one short phrase each, so a row says which rather
             // than showing a dash that reads as zero.
