@@ -36,6 +36,27 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
     {"hasUnknownModelCost":false,"modelUsage":{"claude-fable-5":{"inputTokens":0,"outputTokens":16739,"thinkingTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.8369500000000002}},"sessionId":"b8f0237e-ec68-4623-9504-daf0ef4a18fc","startTime":"2026-09-30T12:00:00.000Z","totalAPIDuration":1234,"totalCostUSD":0.8369500000000002,"totalDuration":99999,"totalLinesAdded":10,"totalLinesRemoved":2}
     """
 
+    /// The shape a real log's timestamps have: `"timestamp":"…"` at a fixed offset,
+    /// interleaved with lines that carry none — 354 of this machine's 423 lines do.
+    ///
+    /// The first and last stamps are the ones this file actually contains, taken from it,
+    /// because the whole interval rule rests on reading a span out of a real file rather
+    /// than a span invented for a test.
+    private let timestampedLog = """
+    {"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-03T22:31:52.452Z","sessionId":"b8f0237e-ec68-4623-9504-daf0ef4a18fc","content":"add skill"}
+    {"type":"queue-operation","operation":"dequeue","timestamp":"2026-10-03T22:31:52.457Z","sessionId":"b8f0237e-ec68-4623-9504-daf0ef4a18fc"}
+    {"type":"mode","mode":"normal","sessionId":"b8f0237e-ec68-4623-9504-daf0ef4a18fc"}
+    {"modelUsage":{"claude-fable-5":{"inputTokens":0,"outputTokens":16739,"thinkingTokens":0}}}
+    {"type":"assistant","uuid":"3bdf1e0d-0f7a-4b18-a657-7b2aaca8fca6","timestamp":"2026-10-03T22:58:30.007Z"}
+    {"type":"last-prompt","lastPrompt":"Try again","leafUuid":"3bdf1e0d-0f7a-4b18-a657-7b2aaca8fca6"}
+    """
+
+    /// `2026-10-03T22:31:52.452Z` and `2026-10-03T22:58:30.007Z`, as `Date`s. Written
+    /// out rather than parsed by the code under test, so a bug in the parser cannot make
+    /// the assertion agree with itself.
+    private static let conversationStart = Date(timeIntervalSince1970: 1_791_066_712.452)
+    private static let conversationEnd = Date(timeIntervalSince1970: 1_791_068_310.007)
+
     // MARK: - Parsing
 
     func testParsesTheRealSummaryLine() throws {
@@ -151,12 +172,16 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
     /// production uses rather than a number chosen for the fixture.
     private let overlap: TimeInterval = 60 * 60
 
+    /// A connection made at an absolute instant, for placing one inside a conversation
+    /// whose own times are absolute too.
+    private func connected(_ at: Date) -> (id: UUID, connectedAt: Date) {
+        (id: UUID(), connectedAt: at)
+    }
+
     /// `logCandidates()` enumerates, and age is not its question: it is handed no
     /// session, so it has nothing to measure a file's age against. Every log in the tree
     /// comes back, and dropping the old ones is `AgentLogMatcher`'s job — which is the
-    /// job that has the session to drop them against. This is the semantic the
-    /// one-to-one rule rests on, so it is stated as a fact about the adapter rather than
-    /// as the residue of an older filter.
+    /// job that has the connection it would be dropped against.
     func testLogCandidatesReturnsEveryLogInTheTreeAtAnyAge() throws {
         let root = try makeRoot()
         let now = Date()
@@ -165,15 +190,165 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
 
         let found = ClaudeCodeLogAdapter(projectsRoot: root).logCandidates()
         XCTAssertEqual(found.map(\.url.lastPathComponent), ["ancient.jsonl", "live.jsonl"])
-        // The timestamp is the correlation, so it must be the file's real mtime.
+        // Both ends of the interval must be the file's real mtime, since neither log
+        // carries a line timestamp — see the fallback test for why that is labelled.
         let live = try XCTUnwrap(found.first { $0.url.lastPathComponent == "live.jsonl" })
         let onDisk = try XCTUnwrap(
             (try FileManager.default.attributesOfItem(
                 atPath: live.url.path
             )[.modificationDate]) as? Date
         )
-        XCTAssertEqual(live.modifiedAt.timeIntervalSince1970,
+        XCTAssertEqual(try XCTUnwrap(live.interval).start.timeIntervalSince1970,
                        onDisk.timeIntervalSince1970, accuracy: 1)
+    }
+
+    // MARK: - Where the interval comes from
+
+    /// **The interval is read out of the log's own lines, not off the filesystem.**
+    ///
+    /// The file is written with a modification time three months away from its contents
+    /// on purpose, so the assertion cannot be satisfied by the fallback. This is the whole
+    /// ruling: `mtime` says when the file was last touched, which places nothing inside a
+    /// conversation, and only the log's own timestamps can say a connection fell during
+    /// it.
+    func testTheIntervalIsReadFromTheLogsOwnLineTimestamps() throws {
+        let root = try makeRoot()
+        let written = Date().addingTimeInterval(-90 * 24 * 3600)
+        try writeLog(timestampedLog, in: root, name: "conversation", modified: written)
+
+        let found = try XCTUnwrap(
+            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first
+        )
+        let interval = try XCTUnwrap(found.interval)
+
+        XCTAssertEqual(interval.evidence, .lineTimestamps)
+        XCTAssertEqual(
+            interval.start.timeIntervalSince1970,
+            Self.conversationStart.timeIntervalSince1970, accuracy: 0.002
+        )
+        XCTAssertEqual(
+            interval.end.timeIntervalSince1970,
+            Self.conversationEnd.timeIntervalSince1970, accuracy: 0.002
+        )
+        // And not the mtime the file was deliberately given.
+        XCTAssertNotEqual(
+            interval.start.timeIntervalSince1970,
+            written.timeIntervalSince1970, accuracy: 60
+        )
+    }
+
+    /// **Min and max, not first line and last line.** This file has six timestamp pairs
+    /// written out of order, so a scanner taking the first line's stamp as the start would
+    /// be reporting an interval the log does not claim. Every line is read and the true
+    /// extremes taken, which is why this is not a head-only read.
+    func testOutOfOrderLinesDoNotShrinkTheInterval() throws {
+        let root = try makeRoot()
+        try writeLog("""
+        {"type":"assistant","timestamp":"2026-10-03T22:40:00.000Z"}
+        {"type":"mode","mode":"normal"}
+        {"type":"assistant","timestamp":"2026-10-03T22:31:52.452Z"}
+        {"type":"assistant","timestamp":"2026-10-03T22:58:30.007Z"}
+        {"type":"assistant","timestamp":"2026-10-03T22:35:00.000Z"}
+        """, in: root, name: "jumbled")
+
+        let interval = try XCTUnwrap(
+            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+        )
+
+        XCTAssertEqual(
+            interval.start.timeIntervalSince1970,
+            Self.conversationStart.timeIntervalSince1970, accuracy: 0.002,
+            "22:31 is on the third line, not the first"
+        )
+        XCTAssertEqual(
+            interval.end.timeIntervalSince1970,
+            Self.conversationEnd.timeIntervalSince1970, accuracy: 0.002
+        )
+    }
+
+    /// **A log with no line timestamps falls back to its file metadata, and says so.**
+    ///
+    /// The real observed summary line is exactly this shape — a `modelUsage` line with no
+    /// `timestamp` — so the fallback is not hypothetical. It is a *point* where a span is
+    /// wanted, and `evidence` is the only thing stopping a caller reading it as the
+    /// interval it is not. A weaker claim wearing a stronger claim's name is how a
+    /// plausible wrong number ships.
+    func testALogWithNoLineTimestampsFallsBackToFileMetadataAndSaysSo() throws {
+        let root = try makeRoot()
+        let modified = Date().addingTimeInterval(-45 * 60)
+        try writeLog(realSummary, in: root, name: "no-stamps", modified: modified)
+
+        let interval = try XCTUnwrap(
+            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+        )
+
+        XCTAssertEqual(interval.evidence, .fileModification)
+        // Both ends are the one timestamp there is, so the "span" has no width — which is
+        // the fact a caller needs and cannot infer from the numbers alone.
+        XCTAssertEqual(interval.start.timeIntervalSince1970, interval.end.timeIntervalSince1970)
+        XCTAssertEqual(interval.start.timeIntervalSince1970, modified.timeIntervalSince1970, accuracy: 1)
+    }
+
+    /// A timestamp that is not a timestamp must not become one. Quoted prose inside a
+    /// message body can contain the marker; the shape check is what keeps that from
+    /// inventing a conversation.
+    func testAMarkerInProseIsNotReadAsATimestamp() throws {
+        let root = try makeRoot()
+        let modified = Date().addingTimeInterval(-45 * 60)
+        try writeLog("""
+        {"type":"user","message":{"role":"user","content":"why is \"timestamp\":\"nonsense\" in my log"}}
+        {"modelUsage":{"claude-fable-5":{"inputTokens":0,"outputTokens":16739}}}
+        """, in: root, name: "prose", modified: modified)
+
+        let interval = try XCTUnwrap(
+            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+        )
+
+        XCTAssertEqual(interval.evidence, .fileModification, "prose is not a timestamp")
+        XCTAssertEqual(interval.start.timeIntervalSince1970, modified.timeIntervalSince1970, accuracy: 1)
+    }
+
+    // MARK: - A connection, against a real interval
+
+    /// The end-to-end shape of the ruling: a connection made **during** a conversation is
+    /// that conversation's, even though the file's modification time is three months away
+    /// from it — which is what a copied log, a restored backup, or a test fixture all look
+    /// like, and what made matching on `mtime` the wrong question.
+    func testAConnectionDuringTheConversationMatches() throws {
+        let root = try makeRoot()
+        try writeLog(timestampedLog, in: root, name: "conversation",
+                     modified: Date().addingTimeInterval(-90 * 24 * 3600))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+
+        // A connection at 22:40, inside 22:31:52 – 22:58:30.
+        let during = connected(Self.conversationStart.addingTimeInterval(500))
+
+        guard case .unique(let candidate) = run(
+            adapter: adapter, sessions: [during], now: Date()
+        )[during.id] else {
+            return XCTFail("a connection made during the conversation is that conversation's")
+        }
+        XCTAssertEqual(candidate.url.lastPathComponent, "conversation.jsonl")
+    }
+
+    /// **The fix, end to end.** A connection from before the conversation is not inside
+    /// it. Under the rule this replaces, this session matched: the file's last write was
+    /// inside a window that ran to *now*, and every past session's window reached forward
+    /// to today.
+    func testAConnectionFromBeforeTheConversationDoesNotMatch() throws {
+        let root = try makeRoot()
+        try writeLog(timestampedLog, in: root, name: "conversation",
+                     modified: Date().addingTimeInterval(-30))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+
+        // The conversation ended in October; the connection is from today, days after.
+        let today = session(now: Date(), connectedAgo: 0)
+
+        XCTAssertEqual(
+            run(adapter: adapter, sessions: [today], now: Date())[today.id],
+            .ambiguous(count: 0),
+            "a connection after the conversation is not inside it"
+        )
     }
 
     func testALogModifiedDuringTheWindowIsACandidate() throws {

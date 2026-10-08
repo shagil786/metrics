@@ -8,9 +8,9 @@ import Foundation
 
 /// Every `.json` file under a directory, with each one's last write time.
 ///
-/// Shared by the fixtures here and in `AgentSourcePollerTests`, and the shape of what
-/// `ClaudeCodeLogAdapter` does, because the correlation is the same problem in both
-/// cases: a file's timestamp is the only thing tying it to a session.
+/// Shared by the fixtures here and in `AgentSourcePollerTests`, and the same shape
+/// `ClaudeCodeLogAdapter` falls back to: these files carry no timestamps of their own, so
+/// their interval comes from file metadata and says so.
 func fixtureLogCandidates(in root: URL) -> [LogCandidate] {
     let contents = (try? FileManager.default.contentsOfDirectory(
         at: root, includingPropertiesForKeys: [.contentModificationDateKey]
@@ -21,7 +21,12 @@ func fixtureLogCandidates(in root: URL) -> [LogCandidate] {
             guard let modified = (try? FileManager.default
                 .attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
             else { return nil }
-            return LogCandidate(url: url, modifiedAt: modified)
+            // A point interval, labelled: the fixture files have no timestamps to read,
+            // so this is the fallback shape rather than a conversation's real span.
+            return LogCandidate(
+                url: url,
+                interval: LogInterval(start: modified, end: modified, evidence: .fileModification)
+            )
         }
         .sorted { $0.url.path < $1.url.path }
 }
@@ -150,8 +155,10 @@ final class TokenSourceAdapterTests: XCTestCase {
         let onDisk = try XCTUnwrap(
             (try FileManager.default.attributesOfItem(atPath: written.path)[.modificationDate]) as? Date
         )
-        XCTAssertEqual(candidate.modifiedAt.timeIntervalSince1970,
+        let interval = try XCTUnwrap(candidate.interval)
+        XCTAssertEqual(interval.start.timeIntervalSince1970,
                        onDisk.timeIntervalSince1970, accuracy: 1)
+        XCTAssertEqual(interval.evidence, .fileModification)
     }
 
     // MARK: - Parsing

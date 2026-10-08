@@ -10,67 +10,93 @@
 //
 // A Portmaster session is an MCP connection UUID. An agent's log is named for that
 // agent's own session. **The two share no key.** The only thing that ties them is
-// time, so "which log is this session's" is really "which log was being written while
-// this session was open" — a heuristic, and one that is more often wrong than right.
+// time, and the question is which times.
 //
-// THE RULE IS ONE-TO-ONE, AND IT RUNS OVER THE WHOLE PASS
+// THE QUESTION IS "WAS THIS CONNECTION DURING THAT CONVERSATION", NOT "IS THE FILE
+// FRESH"
 //
-// **A file that more than one session could claim belongs to none of them.** Not "to
-// one of them", not "to the most recent of them": to none.
+// The first version asked whether the log's **last write** fell inside the session's
+// window. That window has to run to *now*, because a session's end is not observable
+// and a connection open for hours must stay matchable — and a window that runs to now
+// contains today's log for *every* session ever recorded. So a user who had connected
+// five times had five historical sessions all claiming the one live file, and the
+// one-to-one rule below correctly called that contention: nobody matched. The feature
+// was near-inert after a user's second connection, on the machine it was built for.
 //
-// The earlier version of this asked per session and got the mirror of its own rule
-// wrong. "Two logs overlapping one session means nothing ties either to it" was
-// enforced, and nothing enforced the reverse — that one log overlapping five sessions
-// means nothing ties it to any of them. With a session window that runs to *now*, one
-// continuously-written Claude Code conversation and five MCP connections made during it
-// all contain the same file, so all five matched it: **the same 16,739 tokens recorded
-// against five sessions and priced five times.** That is the failure this design exists
-// to prevent, in the only direction a downstream check cannot catch — the fold keys on
-// `(sessionID, provenance, model)`, so each session got its own plausible segment and
-// nothing anywhere could tell the copies from distinct work.
+// The rule is now the interval, not the point:
 //
-// So the question is not "how many files could this session have?" but "how many
-// sessions could claim this file?", and the second question cannot be answered one
-// session at a time. Hence a whole-pass function: pure, no I/O, and testable with an
-// empty list of files.
+// > **Does the conversation's interval contain the moment this session connected?**
 //
-// CONSEQUENCES, stated rather than discovered
+// A conversation occupies a real span — Claude Code writes a `timestamp` on 354 of this
+// machine's 423 lines, from `22:31:52.452Z` to `22:58:30.007Z`. A session connected at
+// 22:40 is inside that. A session from last week is not, and not because a rule excluded
+// it: last week is not inside the conversation. Five historical sessions stop contending,
+// because only one of them connected *during* the conversation.
 //
-// - **Two sessions contending for one log both read `ambiguousMatch`.** Correct, and
-//   strictly better than one of them winning — a figure is exactly what must not be
-//   produced here.
-// - **One session with one candidate and another with none: the first still wins.** The
-//   rule is about *contention*, not exclusivity. A session nobody else can see into is
-//   not ambiguous, and treating it as one would refuse a genuine match because an
-//   unrelated session happened to be in the store.
-// - **On a machine with several recorded sessions and one live log, nobody matches.** The
-//   windows are nested — every session's runs to *now* — so any file the newest session
-//   can see, every older session can see too, and the file is contested for all of
-//   them. This is a real cost, not a rounding error: `AgentSessionStore` retains every
-//   session it has ever recorded, so a machine whose MCP client has connected twice
-//   stops producing parsed figures and reports honest absences instead. That is the
-//   ruling working, and it is the honest answer to a question the store cannot yet ask
-//   — but it means the parsed path is near-inert until retention is enabled. Fixed
-//   here in the direction that cannot invent a number; fixing it in the useful
-//   direction needs per-session token windows in the log format, which it does not have.
+// **This is the ambiguity rule one level deeper.** "Time overlaps" was never a strong
+// enough claim to build a money figure on — it was not strong enough to say a log was
+// *this session's*, and it turns out it is not strong enough to say a log is *newer
+// than* a session either.
 //
-// `.ambiguous` is therefore expected to be common, and it is behaviour rather than a
-// defect to be tuned away. A machine with one agent connection and one log gets figures.
+// And the one-to-one rule stays, because interval containment does not make contention
+// impossible: two MCP connections opened during one conversation both sit inside it and
+// genuinely contend. That is the ambiguity rule doing the remaining work.
+//
+// WHAT IS STILL NOT CLAIMED
+//
+// Even a perfect interval says only that the connection happened *during* the
+// conversation. It does not say the conversation's tokens were spent during the
+// connection — see `ClaudeCodeLogAdapter`'s honest limits, where that is named as the
+// largest one and still is.
 
 import Foundation
 
-/// One log file a source could describe, with the time it was last written.
+/// Where a conversation's interval came from.
 ///
-/// The modification date travels with the url because it is the whole of the
-/// correlation: a session id is an MCP connection UUID and a log is named for the
-/// agent's own session, and neither one knows anything about the other.
+/// Carried on the candidate because the two are not the same kind of evidence, and a
+/// caller that cannot tell them apart will trust the weaker one as though it were the
+/// stronger. `fileModification` is one filesystem timestamp standing in for a whole
+/// span; `lineTimestamps` is the log's own account of itself.
+public enum LogIntervalEvidence: Hashable, Sendable {
+    /// Earliest and latest of the log's own per-line timestamps.
+    case lineTimestamps
+    /// No line carried a timestamp, so the file's single modification time is used for
+    /// both ends — a *point* where a span is wanted. It answers "was this file touched
+    /// near the connection", which is the older and weaker question, and it is labelled
+    /// so nobody reads it as the interval it is not.
+    case fileModification
+}
+
+/// A conversation's span in time.
+public struct LogInterval: Hashable, Sendable {
+    public let start: Date
+    public let end: Date
+    public let evidence: LogIntervalEvidence
+
+    public init(start: Date, end: Date, evidence: LogIntervalEvidence) {
+        self.start = start
+        self.end = end
+        self.evidence = evidence
+    }
+}
+
+/// One log file a source could describe, and when it was being written.
 public struct LogCandidate: Hashable, Sendable {
     public let url: URL
-    public let modifiedAt: Date
 
-    public init(url: URL, modifiedAt: Date) {
+    /// **Nil when nothing could place this file in time** — no line carried a timestamp
+    /// *and* the filesystem would not say when it was written.
+    ///
+    /// Such a file is still returned, so that "there is a log here that cannot be placed"
+    /// is visible to a diagnostic rather than looking like "no log". It matches nobody,
+    /// because a claim it cannot support is the one thing this module never makes. The
+    /// cost is that it reaches the session as `noSource`, which says no source could be
+    /// *attributed* — the closest honest word in a set that has no separate one.
+    public let interval: LogInterval?
+
+    public init(url: URL, interval: LogInterval?) {
         self.url = url
-        self.modifiedAt = modifiedAt
+        self.interval = interval
     }
 }
 
@@ -84,16 +110,15 @@ public struct LogCandidate: Hashable, Sendable {
 /// file but not this session's alone" and "several files" are three facts, and an
 /// optional could carry any of them without saying which.
 public enum LogMatch: Hashable, Sendable {
-    /// Exactly one file overlaps the session, and no other session can claim it. The
-    /// only shape that becomes a number.
+    /// Exactly one conversation spans this connection, and no other session's connection
+    /// falls inside it. The only shape that becomes a number.
     case unique(LogCandidate)
-    /// Not attributable to this session. `count` is how many files its own window
-    /// holds, which is what makes the three refusals tellable apart:
+    /// Not attributable to this session. `count` is how many files could describe it:
     ///
-    /// - `0` — nothing to read; the machine has no log in this session's window.
-    /// - `1` — one file, and one or more other sessions could claim it too. This is the
-    ///   contention case, and it is why `count: 1` is not a match.
-    /// - `2` or more — more than one file and nothing to choose between them.
+    /// - `0` — no conversation spans this connection's moment.
+    /// - `1` — one does, and one or more other connections fall inside it too. This is
+    ///   the contention case, and it is why `count: 1` is not a match.
+    /// - `2` or more — several do, and nothing to choose between them.
     case ambiguous(count: Int)
 }
 
@@ -102,16 +127,16 @@ public enum LogMatch: Hashable, Sendable {
 /// A static pure function over `(candidates, sessions, overlap, now)` rather than a
 /// nested type or a closure assembled at each call site: two sources matching files two
 /// ways is two answers to one question, and this is the question. `now` is a parameter
-/// rather than a clock read so a caller takes one reading per pass and every window in
+/// rather than a clock read so a caller takes one reading per pass and every decision in
 /// that pass is judged against the same instant.
 public enum AgentLogMatcher {
     /// One entry per session asked about, keyed by session id — including the sessions
-    /// with nothing in their window, because the caller has to record an absence for
-    /// each of them.
+    /// with no conversation spanning them, because the caller has to record an absence
+    /// for each of them.
     ///
-    /// **The whole pass at once.** A per-session signature cannot express this rule: it
-    /// is the sessions that decide a file's fate, so a function that sees one session at
-    /// a time is structurally unable to.
+    /// **The whole pass at once.** A per-session signature cannot express the contention
+    /// rule: it is the sessions that decide a file's fate, so a function that sees one
+    /// session at a time is structurally unable to.
     public static func match(
         _ candidates: [LogCandidate],
         for sessions: [(id: UUID, connectedAt: Date)],
@@ -119,12 +144,12 @@ public enum AgentLogMatcher {
         now: Date
     ) -> [UUID: LogMatch] {
         let windows = sessions.map {
-            (id: $0.id, files: inWindow(candidates, connectedAt: $0.connectedAt, overlap: overlap, now: now))
+            (id: $0.id, files: spanning(candidates, connectedAt: $0.connectedAt, overlap: overlap, now: now))
         }
 
-        // How many sessions could claim each file. Counted per distinct file per
-        // session, so a url appearing twice in one window counts once here and once as a
-        // duplicate below rather than inflating the contention of a file nobody shares.
+        // How many sessions fall inside each conversation. Counted per distinct file per
+        // session, so a url appearing twice counts once here and once as a duplicate
+        // below rather than inflating the contention of a file nobody shares.
         var claimants: [URL: Int] = [:]
         for window in windows {
             for file in window.files {
@@ -150,30 +175,42 @@ public enum AgentLogMatcher {
         return matches
     }
 
-    /// The candidates whose last write falls inside this session's window.
+    /// The candidates whose conversation spans the moment this session connected.
     ///
-    /// Generous either side, because a log's modification time is its *last* write and a
-    /// session's end is not observable: a tight bound would simply miss real matches. The
-    /// cost of generosity is more candidates, which is the ambiguity above rather than a
-    /// guess.
-    ///
-    /// The upper bound is `now`, not a guessed end. That is what keeps a connection open
-    /// for hours matchable at all — and it is also why the windows nest and a live log
-    /// is contested by every session that has ever been recorded.
-    static func inWindow(
+    /// **The tolerance pads both ends of the conversation, and neither end of the
+    /// session.** A session is an instant — the moment the socket was accepted — so there
+    /// is nothing to pad on that side. The conversation is the uncertain one at both
+    /// ends: its first line is written after the agent started, and its last line before
+    /// the connection closed, so a connection either side of the logged span can still be
+    /// the same conversation. Padding it here rather than inside the adapter keeps one
+    /// tolerance for one question — a second window configured in two places was what
+    /// `ClaudeCodeLogAdapter.overlap` was, and deleting it is why there is one now.
+    static func spanning(
         _ candidates: [LogCandidate],
         connectedAt: Date,
         overlap: TimeInterval,
         now: Date
     ) -> [LogCandidate] {
-        let since = connectedAt.addingTimeInterval(-overlap)
-        let until = now.addingTimeInterval(overlap)
         var seen: Set<URL> = []
         var matched: [LogCandidate] = []
-        for candidate in candidates where candidate.modifiedAt >= since
-            && candidate.modifiedAt <= until
-            && seen.insert(candidate.url).inserted
-        {
+        for candidate in candidates {
+            guard seen.insert(candidate.url).inserted, let span = candidate.interval else {
+                continue
+            }
+            // A conversation wholly after `now` is a clock artefact, and a session row
+            // sharing that same skew would "match" it — attributing a conversation to a
+            // connection that cannot have happened. Refusing it is the only direction
+            // that invents nothing, and it is why `now` is a parameter at all.
+            //
+            // **Padded by the same tolerance as everything else**, because a conversation
+            // that began a moment after this pass's clock reading is not an artefact: the
+            // pass asks its sources *after* taking the reading, so a log written in
+            // between is the ordinary case of an agent starting up, not a machine with a
+            // wrong clock. A zero-width version of this bound would refuse it.
+            guard span.start <= now.addingTimeInterval(overlap) else { continue }
+            guard connectedAt >= span.start.addingTimeInterval(-overlap),
+                  connectedAt <= span.end.addingTimeInterval(overlap)
+            else { continue }
             matched.append(candidate)
         }
         return matched

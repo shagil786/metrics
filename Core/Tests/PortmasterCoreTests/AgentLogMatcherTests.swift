@@ -1,10 +1,10 @@
-// The one-to-one rule, with no filesystem anywhere in the file.
+// The matching rule, with no filesystem anywhere in the file.
 //
-// "Which file is whose?" is the decision every figure in this feature rests on, and the
-// wrong answer to it is a *number* rather than an absence. Getting it wrong is also easy:
-// a directory walk in the way means a test that catches it has to write files, set
-// timestamps and hope the clock cooperates. So the rule is here, taking two values and
-// touching nothing.
+// "Which conversation was this connection part of?" is the decision every figure in this
+// feature rests on, and the wrong answer to it is a *number* rather than an absence.
+// Getting it wrong is also easy: a directory walk in the way means a test that catches it
+// has to write files, set timestamps and hope the clock cooperates. So the rule is here,
+// taking two values and touching nothing.
 import XCTest
 import Foundation
 @testable import PortmasterCore
@@ -20,15 +20,29 @@ final class AgentLogMatcherTests: XCTestCase {
     /// per pass; these tests take one per assertion.
     private let now = Date()
 
-    private func session(_ connectedAgo: TimeInterval, id: UUID = UUID()) -> (id: UUID, connectedAt: Date) {
+    private func session(_ connectedAgo: TimeInterval, id: UUID = UUID())
+        -> (id: UUID, connectedAt: Date)
+    {
         (id: id, connectedAt: now.addingTimeInterval(-connectedAgo))
     }
 
-    private func candidate(_ name: String, modifiedAgo: TimeInterval) -> LogCandidate {
+    /// A conversation written between `fromAgo` and `toAgo` seconds before `now`.
+    private func conversation(_ name: String, fromAgo: TimeInterval, toAgo: TimeInterval)
+        -> LogCandidate
+    {
         LogCandidate(
             url: URL(fileURLWithPath: "/logs/\(name).jsonl"),
-            modifiedAt: now.addingTimeInterval(-modifiedAgo)
+            interval: LogInterval(
+                start: now.addingTimeInterval(-fromAgo),
+                end: now.addingTimeInterval(-toAgo),
+                evidence: .lineTimestamps
+            )
         )
+    }
+
+    /// A conversation with no interval at all — nothing said when it was written.
+    private func unplaceable(_ name: String) -> LogCandidate {
+        LogCandidate(url: URL(fileURLWithPath: "/logs/\(name).jsonl"), interval: nil)
     }
 
     private func match(
@@ -39,231 +53,296 @@ final class AgentLogMatcherTests: XCTestCase {
 
     // MARK: - The one case that becomes a number
 
-    /// Exactly one file in the session's window, and no other session that could claim
-    /// it. The only shape `LogMatch.unique` has.
-    func testOneCandidateOneSessionIsAMatch() {
-        let only = session(60)
-        let matched = candidate("only", modifiedAgo: 30)
+    /// A connection made **during** a conversation, and the only one that was. The only
+    /// shape `LogMatch.unique` has.
+    func testOneConversationSpanningTheConnectionIsAMatch() {
+        let theConnection = session(2700)
+        let theConversation = conversation("in-progress", fromAgo: 3600, toAgo: 1800)
 
-        let result = match([matched], [only])
-
-        XCTAssertEqual(result[only.id], .unique(matched))
+        XCTAssertEqual(match([theConversation], [theConnection])[theConnection.id],
+                       .unique(theConversation))
     }
 
-    /// The file need not be the most recent, the only one, or anything but the one.
-    /// What makes it a match is that nothing else overlaps — so a single file written
-    /// *before* the connection still matches, which is the ordinary case for a log that
-    /// ended as the session opened.
-    func testASingleCandidateIsAMatchHoweverOldItIsWithinTheWindow() {
-        let only = session(0)
-        let file = candidate("old", modifiedAgo: overlap - 1)
+    /// A connection at either extreme of the conversation — its first line and its last —
+    /// is inside it. The ends are where a real connection lands: the agent starts, then
+    /// Portmaster connects; the agent's last line, then the connection closes.
+    func testAConnectionAtEitherEndOfTheConversationIsInside() {
+        let conversation = conversation("edge", fromAgo: 3600, toAgo: 1800)
 
-        let result = match([file], [only])
+        for edge in [3600.0, 1800.0] {
+            let atEnd = session(edge)
+            XCTAssertEqual(match([conversation], [atEnd])[atEnd.id], .unique(conversation),
+                           "a connection exactly at an end is inside, not outside")
+        }
+    }
 
-        XCTAssertEqual(result[only.id], .unique(file))
+    /// The tolerance pads the **conversation**, because that is the uncertain end of it:
+    /// the first line is written after the agent started and the last before the
+    /// connection closed. A connection a little outside the logged span can still be the
+    /// same conversation, and the log not having said so is not evidence against it.
+    func testTheTolerancePadsTheConversationsEnds() {
+        let conversation = conversation("padded", fromAgo: 3600, toAgo: 1800)
+        // 30 minutes before the first line and 30 minutes after the last, against a
+        // one-hour tolerance.
+        let before = session(3600 + 1800)
+        let after = session(1800 - 1800)
+
+        XCTAssertEqual(match([conversation], [before])[before.id], .unique(conversation))
+        XCTAssertEqual(match([conversation], [after])[after.id], .unique(conversation))
     }
 
     // MARK: - Nothing to read
 
-    /// Zero candidates is `ambiguous(0)`, and the count is carried so a caller can say
+    /// No conversation spans this connection. `count: 0` is carried so a caller can say
     /// "nothing to read" rather than "too much to choose between" — two different facts
     /// about the machine that a single optional would have merged.
-    func testNoCandidatesIsAmbiguousWithZero() {
-        let only = session(60)
+    func testNoConversationSpanningTheConnectionIsAmbiguousWithZero() {
+        let theConnection = session(2700)
 
-        XCTAssertEqual(match([], [only])[only.id], .ambiguous(count: 0))
+        XCTAssertEqual(match([], [theConnection])[theConnection.id], .ambiguous(count: 0))
     }
 
-    /// Every session asked gets an entry, including the ones with nothing. The caller
-    /// records an absence per session per source, so a session missing from the result
-    /// would silently skip its `noSource` rather than report it.
+    /// Every session asked gets an entry, including the ones with no conversation
+    /// spanning them. The caller records an absence per session per source, so a session
+    /// missing from the result would silently skip its `noSource` rather than report it.
     func testEverySessionAskedGetsAnAnswer() {
-        let a = session(60)
-        let b = session(120)
-        let c = session(180)
+        let a = session(2700)
+        let b = session(5400)
+        let c = session(60)
 
-        let result = match([], [a, b, c])
-
-        XCTAssertEqual(Set(result.keys), [a.id, b.id, c.id])
+        XCTAssertEqual(Set(match([], [a, b, c]).keys), [a.id, b.id, c.id])
     }
 
-    // MARK: - More than one file
+    /// **The fix.** A connection from before the conversation happened is not inside it,
+    /// and does not match.
+    ///
+    /// Under the rule this replaces — *is the file's last write inside the connection's
+    /// window, where the window runs to now* — yesterday's connection matched a
+    /// conversation that ended an hour ago, because every historical session's window
+    /// reached forward to today and contained the log's last write. That is what made the
+    /// feature near-inert: every past session claimed the one live file, the one-to-one
+    /// rule below called the contention, and nobody matched.
+    func testAConnectionFromBeforeTheConversationDoesNotMatch() {
+        let conversation = conversation("last-hour", fromAgo: 3600, toAgo: 0)
+        // A whole day earlier: far outside the tolerance, and squarely before the
+        // conversation began.
+        let yesterday = session(86_400)
 
-    /// **Two files is not a tie to break.** Taking the most recent would file each one's
-    /// tokens against the other — a wrong number, which is the one failure this design
-    /// exists to prevent, and the one no downstream check would catch because it looks
-    /// exactly like a real figure.
-    func testTwoCandidatesAreAmbiguousAndNotBrokenIntoAPick() {
-        let only = session(120)
+        XCTAssertEqual(match([conversation], [yesterday])[yesterday.id], .ambiguous(count: 0))
+    }
+
+    /// The same claim at a finer grain: a connection *before* the first line is outside
+    /// even when it is only minutes earlier, which is the boundary the rule draws.
+    func testAConnectionMinutesBeforeTheFirstLineDoesNotMatch() {
+        let conversation = conversation("later", fromAgo: 1800, toAgo: 900)
+        // Two hours before the conversation began, against a one-hour tolerance.
+        let before = session(1800 + 7200)
+
+        XCTAssertEqual(match([conversation], [before])[before.id], .ambiguous(count: 0))
+    }
+
+    /// A connection from after the conversation ended, far enough past the tolerance.
+    func testAConnectionFromAfterTheConversationDoesNotMatch() {
+        let conversation = conversation("yesterday", fromAgo: 90_000, toAgo: 86_400)
+        let today = session(0)
+
+        XCTAssertEqual(match([conversation], [today])[today.id], .ambiguous(count: 0))
+    }
+
+    /// **A conversation that could not be placed matches nobody.** No line carried a
+    /// timestamp and the filesystem would not say when the file was written, so nothing
+    /// here can say whether this connection was inside it. It is still returned to the
+    /// caller — a log that exists and cannot be placed is worth seeing — but a claim it
+    /// cannot support is the one thing this module never makes.
+    func testACandidateWithNoIntervalMatchesNobody() {
+        let theConnection = session(60)
+        let lonely = unplaceable("nowhere")
+
+        let result = match([lonely], [theConnection])
+
+        XCTAssertEqual(result[theConnection.id], .ambiguous(count: 0))
+    }
+
+    /// …and it does not make a genuine match ambiguous either. A file nobody can place
+    /// must not take a figure down with it.
+    func testAnUnplaceableCandidateDoesNotContendWithAGenuineOne() {
+        let theConnection = session(2700)
+        let real = conversation("real", fromAgo: 3600, toAgo: 1800)
+
+        XCTAssertEqual(match([unplaceable("nowhere"), real], [theConnection])[theConnection.id],
+                       .unique(real))
+    }
+
+    // MARK: - More than one conversation
+
+    /// **Two conversations spanning one connection is not a tie to break.** Taking one
+    /// would be a guess dressed as a finding, and the number it produces would look
+    /// exactly like a real figure to everything downstream.
+    func testTwoConversationsSpanningOneConnectionAreAmbiguous() {
+        let theConnection = session(2700)
         let candidates = [
-            candidate("agent-a", modifiedAgo: 30),
-            candidate("agent-b", modifiedAgo: 20),
+            conversation("agent-a", fromAgo: 3600, toAgo: 1800),
+            conversation("agent-b", fromAgo: 3400, toAgo: 1900),
         ]
 
-        XCTAssertEqual(match(candidates, [only])[only.id], .ambiguous(count: 2))
+        XCTAssertEqual(match(candidates, [theConnection])[theConnection.id],
+                       .ambiguous(count: 2))
     }
 
     /// More than two is the same refusal, and the count must still say how many — a
     /// diagnostic that reports "ambiguous" for both two and twenty is not a diagnostic.
-    func testManyCandidatesReportTheirCount() {
-        let only = session(60)
-        let candidates = (0..<5).map { candidate("agent-\($0)", modifiedAgo: 10) }
+    func testManyConversationsReportTheirCount() {
+        let theConnection = session(2700)
+        let candidates = (0..<5).map {
+            conversation("agent-\($0)", fromAgo: 3600 + Double($0), toAgo: 1800)
+        }
 
-        XCTAssertEqual(match(candidates, [only])[only.id], .ambiguous(count: 5))
+        XCTAssertEqual(match(candidates, [theConnection])[theConnection.id],
+                       .ambiguous(count: 5))
     }
 
-    // MARK: - The rule that was missing: one file, many sessions
+    /// One conversation spanning a connection and a second that is nowhere near it: the
+    /// second must not turn the first into a refusal. A candidate is judged on whether it
+    /// spans, not on existing.
+    func testAConversationThatDoesNotSpanTheConnectionDoesNotCount() {
+        let theConnection = session(2700)
+        let during = conversation("during", fromAgo: 3600, toAgo: 1800)
+        let lastWeek = conversation("last-week", fromAgo: 700_000, toAgo: 690_000)
 
-    /// **The same log claimed by three sessions belongs to none of them.** This is the
-    /// defect the per-session version had: with every session's window running to *now*,
-    /// one continuously-written conversation and three MCP connections made during it all
-    /// contain the same file, so all three matched it and **the same tokens were recorded
-    /// three times and priced three times** — a number where an absence belonged, and one
-    /// nothing downstream could catch, because the fold keys on `sessionID` and each copy
-    /// looked like distinct work.
-    ///
-    /// `count: 1` on each: one file, and it is not this session's alone.
-    func testOneFileClaimedByThreeSessionsIsAmbiguousForAllThree() {
-        let shared = candidate("shared", modifiedAgo: 30)
-        let sessions = [session(60), session(120), session(180)]
+        XCTAssertEqual(match([during, lastWeek], [theConnection])[theConnection.id],
+                       .unique(during))
+    }
 
-        let result = match([shared], sessions)
+    // MARK: - Two connections inside one conversation still contend
+
+    /// **The one-to-one rule survives the interval rule.** Two MCP connections opened
+    /// during one conversation both sit inside it, so each is genuinely a candidate and
+    /// neither may win. The interval rule makes most cases decidable; it does not make
+    /// contention impossible, and this is the case that remains.
+    func testTwoConnectionsInsideOneConversationBothRefuse() {
+        let conversation = conversation("shared", fromAgo: 3600, toAgo: 1800)
+        let first = session(3300)
+        let second = session(2100)
+
+        let result = match([conversation], [first, second])
 
         XCTAssertEqual(
             Set(result.values), [.ambiguous(count: 1)],
-            "a file three sessions can claim must produce three refusals and no figure"
+            "one conversation, two connections inside it: neither may be handed a figure"
         )
     }
 
-    /// The pass-level shape of the same thing, stated as the number it prevents: a
-    /// session that has *already* been written to must not gain a second, identical
-    /// reading of the same conversation.
-    func testOneFileAndSeveralOverlappingSessionsYieldsNoMatchForAnyOfThem() {
-        let shared = candidate("shared", modifiedAgo: 5)
-        let sessions = (0..<5).map { session(Double($0) * 60) }
+    /// Five connections during one conversation is the same refusal, five times over, and
+    /// it is the shape that used to multiply one conversation's tokens across five
+    /// sessions.
+    func testFiveConnectionsInsideOneConversationProduceNoMatchForAnyOfThem() {
+        let conversation = conversation("shared", fromAgo: 3600, toAgo: 1800)
+        let connections = (0..<5).map { session(3300 - Double($0) * 300) }
 
-        let result = match([shared], sessions)
+        let result = match([conversation], connections)
 
-        XCTAssertEqual(sessions.count, 5)
+        XCTAssertEqual(connections.count, 5)
         XCTAssertTrue(
-            result.values.allSatisfy { $0 != .unique(shared) },
-            "not one of five sessions may be handed the same conversation"
+            result.values.allSatisfy { $0 != .unique(conversation) },
+            "not one of five connections may be handed the same conversation"
         )
         XCTAssertEqual(Set(result.values), [.ambiguous(count: 1)])
     }
 
-    /// Contention is counted **per file**, against every session whose window reaches it.
-    /// A session with exactly one candidate is still refused when another session's
-    /// window reaches that same file — and because the windows nest, that is the common
-    /// case for anything written recently. A per-session rule called this a match.
-    func testAFileAnotherSessionCanAlsoSeeIsContestedEvenWithOneCandidate() {
-        let live = candidate("live", modifiedAgo: 30)
-        let stale = candidate("stale", modifiedAgo: 60 * 60 * 2)
-        let older = session(60 * 60 * 3)
-        let newer = session(30)
+    /// Contention is counted **per conversation**, against every connection that falls
+    /// inside it — and a connection with exactly one conversation spanning it is still
+    /// refused when another connection sits inside the same one.
+    func testContentionIsPerConversationNotPerPass() {
+        let shared = conversation("shared", fromAgo: 3600, toAgo: 1800)
+        let other = conversation("other", fromAgo: 87_000, toAgo: 86_400)
+        let firstInside = session(3300)
+        let secondInside = session(2100)
+        let farAway = session(86_700)
 
-        let result = match([live, stale], [older, newer])
+        let result = match([shared, other], [firstInside, secondInside, farAway])
 
-        // The older session sees both files: over-determined on its own account.
-        XCTAssertEqual(result[older.id], .ambiguous(count: 2))
-        // The newer one sees exactly one, and it is still not its own alone.
-        XCTAssertEqual(result[newer.id], .ambiguous(count: 1))
+        XCTAssertEqual(result[firstInside.id], .ambiguous(count: 1),
+                       "two connections fall inside `shared`, so neither has it")
+        XCTAssertEqual(result[secondInside.id], .ambiguous(count: 1))
+        // Contention is counted per conversation: the third connection is inside `other`
+        // and nobody else's, which is unaffected by what the other two are doing.
+        XCTAssertEqual(result[farAway.id], .unique(other), "and the far one is his alone")
     }
 
     // MARK: - Contention is not exclusivity
 
-    /// **One session with a file and another with none: the first still wins.** The rule
-    /// is that a file several sessions could claim belongs to none of them — not that a
-    /// session is ambiguous whenever the store holds any other session. Refusing here
-    /// would refuse a genuine match because an unrelated connection existed, which is
-    /// the absence costing more than it should.
-    func testAFileOnlyOneSessionCanSeeStillMatches() {
-        let oldLog = candidate("old", modifiedAgo: 60 * 60 * 5)
-        // Six hours and two hours ago, against a one-hour overlap: the five-hour-old file
-        // is inside the older session's window and outside the newer one's.
-        let older = session(60 * 60 * 6)
-        let newer = session(60 * 60 * 2)
+    /// **Two conversations and two connections, one each, both match.** The rule is that
+    /// a conversation several connections could claim belongs to none of them — not that a
+    /// connection is ambiguous whenever the store holds more than one connection. The
+    /// matcher can still do the ordinary thing, which is the point of matching on the
+    /// interval rather than on the file's freshness.
+    func testTwoConnectionsInTwoSeparateConversationsBothMatch() {
+        // A day apart, not an hour: the tolerance pads each conversation by an hour, so
+        // conversations closer together than twice that share everything.
+        let older = conversation("older", fromAgo: 90_000, toAgo: 86_400)
+        let newer = conversation("newer", fromAgo: 3600, toAgo: 3400)
+        let first = session(88_000)
+        let second = session(3500)
 
-        let result = match([oldLog], [older, newer])
+        let result = match([older, newer], [first, second])
 
-        XCTAssertEqual(result[older.id], .unique(oldLog))
-        XCTAssertEqual(result[newer.id], .ambiguous(count: 0))
+        XCTAssertEqual(result[first.id], .unique(older))
+        XCTAssertEqual(result[second.id], .unique(newer))
     }
 
-    /// Sessions that can see nothing do not disturb the one that can.
-    ///
-    /// Both bystanders are **newer** than the owner, and that is not a convenience: a
-    /// session older than the owner would have a window reaching further back, so it
-    /// would see the same file and contend for it. A file that only one session can see
-    /// is only visible to the oldest session whose window reaches it — the rule's shape,
-    /// not a detail of this fixture.
-    func testSessionsThatCanSeeNothingDoNotDisturbTheOneThatCan() {
-        let file = candidate("only", modifiedAgo: 60 * 60 * 5)
-        let owner = session(60 * 60 * 6)
-        let recent = session(1)
-        let older = session(60 * 60 * 2)
+    /// A third connection that falls inside neither conversation changes nothing for the
+    /// two that do.
+    func testAConnectionInsideNeitherConversationDoesNotDisturbTheOnesThatDo() {
+        let during = conversation("during", fromAgo: 3600, toAgo: 1800)
+        let owner = session(2700)
+        // Both well outside the conversation's padded hour — a connection a minute ago
+        // would be *inside* it, which is the rule working and not an exception to it.
+        let recent = session(20_000)
+        let ancient = session(200_000)
 
-        let result = match([file], [owner, recent, older])
+        let result = match([during], [owner, recent, ancient])
 
-        XCTAssertEqual(result[owner.id], .unique(file))
+        XCTAssertEqual(result[owner.id], .unique(during))
         XCTAssertEqual(result[recent.id], .ambiguous(count: 0))
-        XCTAssertEqual(result[older.id], .ambiguous(count: 0))
+        XCTAssertEqual(result[ancient.id], .ambiguous(count: 0))
     }
 
-    // MARK: - The window does the excluding
+    // MARK: - The clock
 
-    /// A file outside the window is not a candidate, so it cannot make a match ambiguous
-    /// either. This is why the count is computed after filtering: a month-old log on the
-    /// machine must not turn one live agent's figure into a refusal.
-    ///
-    /// The sharpest form of the claim — one file in, one file out — because a rule that
-    /// counted before filtering would answer `.ambiguous(count: 2)` here.
-    func testACandidateOutsideTheWindowIsExcludedRatherThanCounted() {
-        let live = candidate("live", modifiedAgo: 30)
-        let ancient = candidate("ancient", modifiedAgo: 90 * 24 * 3600)
-        let only = session(120)
-
-        XCTAssertEqual(match([live, ancient], [only])[only.id], .unique(live))
-    }
-
-    /// Both bounds, because "outside the window" is two places: a log written before the
-    /// session and one written after it are both outside, and a rule that checked only
-    /// the lower bound would happily match a file stamped in the future by a machine
-    /// with a wrong clock.
-    func testAFutureCandidateIsExcludedToo() {
-        let live = candidate("live", modifiedAgo: 30)
-        let fromTheFuture = candidate("future", modifiedAgo: -(overlap + 60))
-        let only = session(120)
-
-        XCTAssertEqual(match([live, fromTheFuture], [only])[only.id], .unique(live))
-    }
-
-    /// Zero-width overlap: the window is the session's own instant, so only a file
-    /// written exactly then matches. Exists to pin that `overlap` is applied to *both*
-    /// sides of the comparison rather than added once by accident.
-    func testZeroOverlapMatchesOnlyTheSessionInstantItself() {
-        let only = (id: UUID(), connectedAt: now)
-        let near = LogCandidate(
-            url: URL(fileURLWithPath: "/logs/near.jsonl"), modifiedAt: now.addingTimeInterval(-1)
+    /// A conversation stamped entirely after `now` is a clock artefact — a restored
+    /// backup, a wrong machine clock — and a session row sharing that skew would "match"
+    /// it, attributing a conversation to a connection that cannot have happened. This is
+    /// why `now` is a parameter at all.
+    func testAConversationWhollyInTheFutureMatchesNobody() {
+        let future = LogInterval(
+            start: now.addingTimeInterval(7200), end: now.addingTimeInterval(9000),
+            evidence: .lineTimestamps
         )
+        let skewed = LogCandidate(url: URL(fileURLWithPath: "/logs/skewed.jsonl"), interval: future)
+        let alsoSkewed = (id: UUID(), connectedAt: now.addingTimeInterval(8000))
 
-        let result = AgentLogMatcher.match([near], for: [only], overlap: 0, now: now)
-
-        XCTAssertEqual(result[only.id], .ambiguous(count: 0))
+        XCTAssertEqual(match([skewed], [alsoSkewed])[alsoSkewed.id], .ambiguous(count: 0))
     }
 
-    /// The same url listed twice is one file, not two. Without the dedupe a duplicate
-    /// would both inflate a session's own count and register as contention against a
-    /// session that has nothing to do with it — turning one unreadable file into two
-    /// absences instead of one.
-    func testTheSameFileListedTwiceCountsOnce() {
+    // MARK: - Identity
+
+    /// The same url listed twice is one conversation, not two. Without the dedupe a
+    /// duplicate would both inflate a connection's own count and register as contention
+    /// against a connection that has nothing to do with it — turning one unreadable file
+    /// into two absences instead of one.
+    func testTheSameConversationListedTwiceCountsOnce() {
         let url = URL(fileURLWithPath: "/logs/same.jsonl")
         let duplicates = [
-            LogCandidate(url: url, modifiedAt: now.addingTimeInterval(-30)),
-            LogCandidate(url: url, modifiedAt: now.addingTimeInterval(-20)),
+            LogCandidate(url: url, interval: LogInterval(
+                start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(-1800),
+                evidence: .lineTimestamps)),
+            LogCandidate(url: url, interval: LogInterval(
+                start: now.addingTimeInterval(-3500), end: now.addingTimeInterval(-1700),
+                evidence: .lineTimestamps)),
         ]
-        let only = session(60)
+        let theConnection = session(2700)
 
-        XCTAssertEqual(match(duplicates, [only])[only.id], .unique(duplicates[0]))
+        XCTAssertEqual(match(duplicates, [theConnection])[theConnection.id],
+                       .unique(duplicates[0]))
     }
 }

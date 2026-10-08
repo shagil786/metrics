@@ -85,8 +85,14 @@ final class AgentSourcePollerTests: XCTestCase {
         return id
     }
 
-    private func candidate(_ name: String, modifiedAt: Date) -> LogCandidate {
-        LogCandidate(url: URL(fileURLWithPath: "/logs/\(name)"), modifiedAt: modifiedAt)
+    /// A conversation written between two instants. `to == from` is a conversation whose
+    /// every line carries the same timestamp, which is what a `fileModification` fallback
+    /// looks like and is enough for any matching assertion here.
+    private func candidate(_ name: String, from: Date, to: Date? = nil) -> LogCandidate {
+        LogCandidate(
+            url: URL(fileURLWithPath: "/logs/\(name)"),
+            interval: LogInterval(start: from, end: to ?? from, evidence: .lineTimestamps)
+        )
     }
 
     // MARK: - No sessions means no walk
@@ -101,7 +107,7 @@ final class AgentSourcePollerTests: XCTestCase {
     /// Deleting the guard has to fail here.
     func testAPassWithNoSessionsAsksNoSource() throws {
         let store = try makeStore()
-        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", modifiedAt: Date())])
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: Date())])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
             .pollOnce()
@@ -121,7 +127,7 @@ final class AgentSourcePollerTests: XCTestCase {
         let store = try makeStore()
         let now = Date()
         try recordSession(store, connectedAt: now)
-        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
             .pollOnce()
@@ -147,7 +153,7 @@ final class AgentSourcePollerTests: XCTestCase {
         for offset in [-600.0, -300.0, 0.0] {
             try recordSession(store, connectedAt: now.addingTimeInterval(offset))
         }
-        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
             .pollOnce()
@@ -175,7 +181,7 @@ final class AgentSourcePollerTests: XCTestCase {
         let store = try makeStore()
         let now = Date()
         let sessionID = try recordSession(store, connectedAt: now)
-        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
             .pollOnce()
@@ -203,7 +209,7 @@ final class AgentSourcePollerTests: XCTestCase {
         let store = try makeStore()
         let now = Date()
         try recordSession(store, connectedAt: now)
-        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
         let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
 
         poller.pollOnce()
@@ -222,41 +228,45 @@ final class AgentSourcePollerTests: XCTestCase {
         XCTAssertEqual(segments.last?.output, 75)
     }
 
-    /// A file only one session can see still reaches that session, and the sessions that
-    /// cannot see it report `noSource` rather than sharing its figure.
+    /// **Two conversations and two connections, one each, both counted.** The
+    /// counterweight to the contention test above: a rule that refused whenever the store
+    /// held more than one connection would be refusing *here*, and would be leaving the
+    /// ordinary case — an agent talking to Portmaster twice in an afternoon — uncounted.
     ///
-    /// The counterweight to the contention test above: a rule that refuses whenever the
-    /// store holds more than one session would be refusing *here*, and would be wrong —
-    /// this log belongs to `older` and to nobody else, which is the one thing the
-    /// one-to-one rule is about.
-    func testALogOnlyOneSessionCanSeeReachesOnlyThatSession() throws {
+    /// The conversations are hours apart and each connection sits inside one of them,
+    /// against a ten-minute tolerance, so no padding crosses between them.
+    func testTwoConnectionsInTwoSeparateConversationsBothGetTheirFigure() throws {
         let store = try makeStore()
         let now = Date()
-        let older = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60 * 6))
-        let newer = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60 * 2))
-        // Five hours old against a ten-minute overlap: inside `older`'s window, outside
-        // `newer`'s.
-        let adapter = CountingTokenAdapter(
-            candidates: [candidate("old.jsonl", modifiedAt: now.addingTimeInterval(-60 * 60 * 5))]
-        )
+        let older = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60 * 7))
+        let newer = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60))
+        let adapter = CountingTokenAdapter(candidates: [
+            candidate(
+                "older.jsonl",
+                from: now.addingTimeInterval(-60 * 60 * 8),
+                to: now.addingTimeInterval(-60 * 60 * 6)
+            ),
+            candidate(
+                "newer.jsonl",
+                from: now.addingTimeInterval(-60 * 60 * 2),
+                to: now
+            ),
+        ])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
             .pollOnce()
 
-        XCTAssertEqual(pass.records.count, 2)
-        XCTAssertTrue(pass.records.allSatisfy { $0.sessionID == older })
-        XCTAssertEqual(pass.absences, [
-            AgentSourceAbsence(sessionID: newer, source: "counting-agent", reason: .noSource)
-        ])
+        XCTAssertEqual(pass.records.count, 4, "two models in each of two conversations")
+        XCTAssertEqual(pass.records.filter { $0.sessionID == older }.count, 2)
+        XCTAssertEqual(pass.records.filter { $0.sessionID == newer }.count, 2)
+        XCTAssertTrue(pass.absences.isEmpty)
 
-        // And the record landed under the session whose window matched it, not the newer
-        // one the store lists after it.
-        let byID = try XCTUnwrap(try store.sessions().first { $0.id == older })
-        guard case .reported = byID.usage else {
-            return XCTFail("expected a figure on the owning session, got \(byID.usage)")
+        for session in try store.sessions() {
+            guard case .reported(let segments) = session.usage else {
+                return XCTFail("every connection here is inside its own conversation")
+            }
+            XCTAssertEqual(segments.map(\.modelID), ["model-a", "model-b"])
         }
-        let other = try XCTUnwrap(try store.sessions().first { $0.id == newer })
-        XCTAssertFalse(other.usage.isReported)
     }
 
     // MARK: - A failure among many
@@ -270,11 +280,11 @@ final class AgentSourcePollerTests: XCTestCase {
         let now = Date()
         let sessionID = try recordSession(store, connectedAt: now)
         let broken = CountingTokenAdapter(
-            identifier: "broken-agent", candidates: [candidate("broken.jsonl", modifiedAt: now)]
+            identifier: "broken-agent", candidates: [candidate("broken.jsonl", from: now)]
         )
         broken.parseFailures = ["broken.jsonl": .unreadable]
         let working = CountingTokenAdapter(
-            identifier: "working-agent", candidates: [candidate("live.jsonl", modifiedAt: now)]
+            identifier: "working-agent", candidates: [candidate("live.jsonl", from: now)]
         )
 
         let pass = AgentSourcePoller(store: store, adapters: [broken, working], overlap: overlap)
@@ -301,7 +311,11 @@ final class AgentSourcePollerTests: XCTestCase {
         let now = Date()
         let older = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60 * 6))
         let newer = try recordSession(store, connectedAt: now.addingTimeInterval(-60 * 60 * 2))
-        let oldLog = candidate("old.jsonl", modifiedAt: now.addingTimeInterval(-60 * 60 * 5))
+        let oldLog = candidate(
+            "old.jsonl",
+            from: now.addingTimeInterval(-60 * 60 * 7),
+            to: now.addingTimeInterval(-60 * 60 * 5)
+        )
         let broken = CountingTokenAdapter(identifier: "broken-agent", candidates: [oldLog])
         broken.parseFailures = ["old.jsonl": .unreadable]
         let silent = CountingTokenAdapter(identifier: "silent-agent", candidates: [])
@@ -326,10 +340,14 @@ final class AgentSourcePollerTests: XCTestCase {
         let sessionID = try recordSession(store, connectedAt: now)
         let silent = CountingTokenAdapter(
             identifier: "silent-agent",
-            candidates: [candidate("old.jsonl", modifiedAt: Date(timeIntervalSince1970: 0))]
+            candidates: [candidate(
+                "old.jsonl",
+                from: Date(timeIntervalSince1970: 0),
+                to: Date(timeIntervalSince1970: 60)
+            )]
         )
         let talking = CountingTokenAdapter(
-            identifier: "talking-agent", candidates: [candidate("live.jsonl", modifiedAt: now)]
+            identifier: "talking-agent", candidates: [candidate("live.jsonl", from: now)]
         )
 
         let pass = AgentSourcePoller(store: store, adapters: [silent, talking], overlap: overlap)
@@ -352,8 +370,8 @@ final class AgentSourcePollerTests: XCTestCase {
         let now = Date()
         let sessionID = try recordSession(store, connectedAt: now)
         let adapter = CountingTokenAdapter(candidates: [
-            candidate("agent-a.jsonl", modifiedAt: now),
-            candidate("agent-b.jsonl", modifiedAt: now),
+            candidate("agent-a.jsonl", from: now),
+            candidate("agent-b.jsonl", from: now),
         ])
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
@@ -376,7 +394,7 @@ final class AgentSourcePollerTests: XCTestCase {
         let store = try makeStore()
         let now = Date()
         let sessionID = try recordSession(store, connectedAt: now)
-        let adapter = CountingTokenAdapter(candidates: [candidate("changed.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("changed.jsonl", from: now)])
         adapter.parseFailures = ["changed.jsonl": .unrecognizedFormat]
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
@@ -398,7 +416,7 @@ final class AgentSourcePollerTests: XCTestCase {
         let store = try makeStore()
         let now = Date()
         let sessionID = try recordSession(store, connectedAt: now)
-        let adapter = CountingTokenAdapter(candidates: [candidate("locked.jsonl", modifiedAt: now)])
+        let adapter = CountingTokenAdapter(candidates: [candidate("locked.jsonl", from: now)])
         adapter.parseFailures = ["locked.jsonl": .unreadable]
 
         let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
