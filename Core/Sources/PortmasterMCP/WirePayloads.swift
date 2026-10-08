@@ -437,73 +437,81 @@ struct ResourceHistoryPointPayload: Encodable {
 
 // MARK: - Agent sessions
 
-/// One session's usage, with the absence kept distinct from a measured zero.
+/// One session's usage as a list of per-model segments, with the absence kept
+/// distinct from a measured zero.
 ///
-/// The counts are `nil` for every not-reported case, and `reason` names which one.
-/// A caller cannot read this as "zero tokens" — which would say a session was free
-/// when in fact nobody counted it. That distinction is the whole reason
+/// `segments` is null for every not-reported case and `reason` names which one. A
+/// caller cannot read a null list as "zero tokens" — which would say a session was
+/// free when in fact nobody counted it. That distinction is the whole reason
 /// `TokenUsage` is a three-state value, and it would be lost the moment this
 /// payload collapsed to two integers.
+///
+/// **There is no session-wide total and no session-wide provenance, and that is the
+/// point.** A session can run two models, so one pair of counts would have to discard
+/// one of them — and a single `provenance` naming the total would name it for figures
+/// no source produced: two models counted by two sources have no common origin, and
+/// the one that sorts first is not the one that saw all of it. Both numbers now ride
+/// on the segment they belong to, where each has exactly one true description. A client
+/// that wants a total adds up what it is willing to believe, and can see which segments
+/// it left out.
 struct TokenUsagePayload: Encodable {
     let reported: Bool
-    let inputTokens: Int?
-    let outputTokens: Int?
-    /// Which source produced the figure, or nil when there is none — or when no single
-    /// source did. A number whose origin is unknown cannot be audited, so this is never
-    /// omitted in favour of a default.
-    let provenance: String?
+    /// One entry per `(provenance, model)`. A list rather than two integers because a
+    /// session can run two models, and a single pair of totals would have to pick one.
+    let segments: [SegmentPayload]?
     /// Why no figure exists: `noSource`, `logUnreadable`, `unrecognizedFormat`,
-    /// `awaitingFirstReport`. Present only when `reported` is false.
+    /// `awaitingFirstReport`, `ambiguousMatch`. Present only when `reported` is false.
     let reason: String?
 
     /// **Precondition: `segments` is non-empty.** `aggregating` is what guarantees it —
     /// no records folds to `.notReported(.awaitingFirstReport)` rather than an empty
     /// `.reported`. Hand-built otherwise, the `.reported` branch below emits
-    /// `reported: true` with zero counts, which is the exact shape this payload exists
-    /// not to produce: a client reads that as a session that reported and used nothing.
+    /// `reported: true` with an empty list, which is the exact shape this payload
+    /// exists not to produce: a client reads that as a session that reported and used
+    /// nothing.
     init(_ usage: TokenUsage) {
         switch usage {
         case .reported(let segments):
-            // Interim shape, and both halves of the interim are worth stating. This
-            // payload still carries one pair of counts, so the per-model split in
-            // `TokenUsage` does not reach a client: a session that ran two models
-            // reads here as one total, with no breakdown.
-            //
-            // That total is **one provenance's segments where one source covers the
-            // models it names**, and `preferredProvenance` is what picks: two sources
-            // describing the same model are alternative measurements of the same work, so
-            // summing them would double-count it.
-            //
-            // It is not one provenance's segments in general. When the chosen segments
-            // span both sources — two different models, one self-reported and one
-            // parsed — the counts are a sum across provenances and no single name is
-            // true of them. Naming `chosen.first` would be worse than useless here: the
-            // fold orders parsed segments ahead of self-reported ones, so a figure
-            // containing self-reported tokens would be labelled `parsedFromLog`. Nil is
-            // the honest answer, and it already means "origin unknown" everywhere else
-            // in this payload.
-            let chosen = TokenUsage.preferredProvenance(segments)
-            let provenances = Set(chosen.map(\.provenance))
             self.reported = true
-            self.inputTokens = chosen.reduce(0) { $0 + $1.input }
-            self.outputTokens = chosen.reduce(0) { $0 + $1.output }
-            self.provenance = provenances.count == 1
-                ? provenances.first?.rawValue
-                : nil
+            self.segments = segments.map(SegmentPayload.init)
             self.reason = nil
         case .notReported(let reason):
             self.reported = false
-            self.inputTokens = nil
-            self.outputTokens = nil
-            self.provenance = nil
+            self.segments = nil
             self.reason = reason.rawValue
         }
+    }
+}
+
+/// One model's share of a session, with the source that reported it.
+///
+/// `provenance` is non-optional and lives here rather than on the session, where it
+/// would have to describe a total that may span two sources: a number whose origin is
+/// unknown cannot be audited, and a number with *several* origins cannot be labelled
+/// with one of them.
+struct SegmentPayload: Encodable {
+    let model: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int?
+    let reasoningTokens: Int?
+    let provenance: String
+
+    init(_ segment: TokenUsageSegment) {
+        self.model = segment.modelID
+        self.inputTokens = segment.input
+        self.outputTokens = segment.output
+        self.cacheReadTokens = segment.cacheRead
+        self.reasoningTokens = segment.reasoning
+        self.provenance = segment.provenance.rawValue
     }
 }
 
 /// A session's cost, with `notPriced` and `conflict` distinct from a priced zero.
 struct SessionCostPayload: Encodable {
     let priced: Bool
+    /// A string, not a JSON number: binary floating point cannot carry money and a
+    /// decimal string round-trips through any client unchanged.
     let usd: String?
     /// The newest price table version **this figure actually multiplied**, never the
     /// table's current one — that would renumber the figure whenever an unrelated
@@ -517,35 +525,84 @@ struct SessionCostPayload: Encodable {
     /// for `unpriced` and `conflict` alike, so a caller can act on either — which
     /// is why `reason` distinguishes them rather than the field being absent.
     let models: [String]?
+    /// The per-model split behind the total, so a client can show a total as its parts:
+    /// an escalated session priced as one number hides that two rates were involved.
+    let lines: [CostLinePayload]?
+    /// The same models counted differently by two sources, with **both** totals, so a
+    /// client can put the choice to the user rather than merely asserting a
+    /// disagreement. `models` above names which models; only this says what they were
+    /// counted as, which is the number a person has to choose between.
+    let disagreements: [DisagreementPayload]?
 
     init(_ cost: SessionCost) {
+        // Every branch names every field, so a case that has nothing to say says so by
+        // writing nil where a reader is looking — rather than by inheriting a value set
+        // somewhere above.
         switch cost {
-        case .priced(let usd, let version, _):
+        case .priced(let usd, let version, let lines):
             self.priced = true
-            // A string, not a JSON number: binary floating point cannot carry money
-            // and a decimal string round-trips through any client unchanged.
             self.usd = NSDecimalNumber(decimal: usd).stringValue
             self.priceTableVersion = version
             self.reason = nil
             self.models = nil
+            self.lines = lines.map(CostLinePayload.init)
+            self.disagreements = nil
         case .notPriced(let models):
             self.priced = false
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "unpriced"
             self.models = models
+            // A line behind a total that does not exist would be a figure with nothing
+            // to add up to.
+            self.lines = nil
+            self.disagreements = nil
         case .conflict(let disagreements):
             self.priced = false
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "conflict"
             self.models = disagreements.map(\.modelID)
+            self.lines = nil
+            self.disagreements = disagreements.map(DisagreementPayload.init)
         case .noUsage:
             self.priced = false
             self.usd = nil
             self.priceTableVersion = nil
             self.reason = "noUsage"
             self.models = nil
+            self.lines = nil
+            self.disagreements = nil
+        }
+    }
+}
+
+/// One model's share of a priced session. A decimal string for the same reason the
+/// total is one: a JSON number would let a client round a money figure on its way out.
+struct CostLinePayload: Encodable {
+    let model: String
+    let usd: String
+
+    init(_ line: CostLine) {
+        self.model = line.modelID
+        self.usd = NSDecimalNumber(decimal: line.usd).stringValue
+    }
+}
+
+/// One model's two readings, side by side.
+struct DisagreementPayload: Encodable {
+    let model: String
+    /// Newest total per source, keyed by provenance. Both numbers, because the user is
+    /// being asked to choose between them.
+    let totals: [String: Int]
+
+    init(_ disagreement: UsageDisagreement) {
+        self.model = disagreement.modelID
+        // Re-keyed by the provenance's raw value because a Swift enum is not a
+        // `CodingKey`-friendly JSON dictionary key, and a client reading this has no
+        // way to resolve `selfReported` to itself.
+        self.totals = disagreement.totals.reduce(into: [String: Int]()) { result, entry in
+            result[entry.key.rawValue] = entry.value
         }
     }
 }
