@@ -3,6 +3,7 @@
 // silently never persist — the round-trip test below is what catches it.
 import XCTest
 import Foundation
+import SwiftData
 @testable import PortmasterCore
 
 final class AgentSessionStoreTests: XCTestCase {
@@ -30,6 +31,22 @@ final class AgentSessionStoreTests: XCTestCase {
         }
         let url = directory.appendingPathComponent("agent-sessions.sqlite")
         return (try AgentSessionStore(storeURL: url), url)
+    }
+
+    /// Usage rows on disk for one session, read through a container of our own.
+    ///
+    /// A second `ModelContainer` over the same file rather than a read on the store
+    /// under test, because the question is what is *persisted*: the fold cannot answer
+    /// it, because a fold over two rows and a fold over one returns the same segment.
+    /// A test that cannot distinguish "deleted" from "not read" is not testing deletion.
+    private func usageRowCount(at url: URL, session: UUID) throws -> Int {
+        let container = try ModelContainer(
+            for: AgentSession.self, TokenUsageRecordRow.self, ModelPriceEntry.self,
+            configurations: ModelConfiguration(url: url)
+        )
+        return try ModelContext(container).fetchCount(FetchDescriptor<TokenUsageRecordRow>(
+            predicate: #Predicate { $0.sessionID == session }
+        ))
     }
 
     // MARK: - Round trip
@@ -202,6 +219,40 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertEqual(versionAfter, 2, "a re-cost must name the prices that produced it")
     }
 
+    /// A figure that multiplied no price names version **0**, not the table's newest.
+    ///
+    /// Every component count zero means the total is exact under any price, so the
+    /// version is asked for by nothing here and there is no entry to name. Reporting the
+    /// table's current version instead would be a figure claiming a price table it never
+    /// consulted — and it would renumber on every unrelated price edit, which is the
+    /// mislabelling this pins shut.
+    ///
+    /// Pinned because the fallback that used to answer this case was removed, leaving
+    /// zero as the only reachable value and nothing asserting it.
+    func testAFigureThatNeededNoPriceReportsVersionZero() throws {
+        let store = try makeStore()
+
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        let sid = UUID()
+        try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sid, recordedAt: Date(), input: 0, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+
+        // A measured zero is still a figure: usage was reported, and it was zero tokens.
+        XCTAssertEqual(
+            try store.usage(for: sid),
+            .reported(input: 0, output: 0, modelID: "m", provenance: .selfReported)
+        )
+        XCTAssertEqual(
+            try store.cost(for: sid),
+            .priced(usd: Decimal(0), priceTableVersion: 0,
+                    lines: [CostLine(modelID: "m", usd: Decimal(0))]),
+            "zero tokens spend nothing under any price, so 0 is the version that describes it"
+        )
+    }
+
     // MARK: - Cost wiring to TokenUsage's conflict rule
 
     /// One agent escalating models mid-session costs rather than blocking. This pins the
@@ -278,6 +329,97 @@ final class AgentSessionStoreTests: XCTestCase {
                        Decimal(string: "0.0001")!)
         XCTAssertEqual(lines.first(where: { $0.modelID == "model-b" })?.usd,
                        Decimal(string: "0.0018")!)
+    }
+
+    /// **A documented limitation, not an approval.** The overlap case: a self-report
+    /// that escalated `model-a` → `model-b`, beside a log parse that has only reached
+    /// `model-a`.
+    ///
+    /// The self-report's newest total is 1,000 stamped `model-b`, and it still *contains*
+    /// the tokens spent on `model-a`. The parse's `model-a` segment is 600. The two
+    /// sources name **different** models, so `hasMaterialDisagreement` has nothing to
+    /// compare — one source per model is not a disagreement — and `preferredProvenance`
+    /// finds no model claimed twice, so it keeps both. The bill is 1,000 at `model-b`'s
+    /// rate plus 600 at `model-a`'s rate: 1,600 tokens billed for 1,000 real, with
+    /// `model-a` counted once inside the 1,000 and again as the 600.
+    ///
+    /// **The failure direction reversed, and that is the part worth naming.** Under the
+    /// old whole-session `hasModelConflict` rule this shape was `.conflict` — it was
+    /// *blocked*, wrong but visible, with no figure produced at all. Segments made the
+    /// disagreement rule per model, which is what lets two models in two sources be
+    /// priced honestly, and this shape slipped through the gap between the two. It now
+    /// **inflates where it used to refuse.**
+    ///
+    /// There is no rule here that could fix it, and inventing one would be worse than
+    /// the limitation. The 1,000 is one cumulative number with nothing marking where one
+    /// model's tokens stop and the next's begin, so the `model-a` tokens inside it cannot
+    /// be subtracted without knowing how many there were — which is exactly the figure
+    /// the log parse is offering and which disagrees with the self-report about. Any
+    /// split would have to pick a side, and picking one is what `preferredProvenance`
+    /// already does for the models where the choice is safe.
+    ///
+    /// The assertions below **record a known-wrong figure**. They exist so the shape
+    /// cannot drift silently: if a future change made this `.conflict`, or stopped
+    /// double-counting, this test fails and someone has to look at whether the fix was
+    /// sound — which is the only way this stops being a limitation nobody remembers.
+    ///
+    /// Reachability today is nil: `TokenSourceRunner` has no caller outside its own
+    /// file, so no log parse is ever recorded. This is a documentation-honesty and
+    /// coverage defect, not a live money bug — and the day an adapter ships, this test
+    /// is the one that says the cost was already known to be wrong.
+    func testAnEscalatingSelfReportBesideAPartialLogParseBillsTheOverlapTwice() throws {
+        let (store, _) = try makeStoreOnDisk()
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "overlap", clientVersion: nil,
+            connectedAt: Date()
+        )
+        let at = Date()
+        // Two self-reports of one cumulative total: the older is a prefix of the newer,
+        // so the fold keeps `model-b` at 1,000 — which is where model-a's tokens went.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at, input: 400, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "model-a", provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at.addingTimeInterval(1), input: 1_000,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "model-b",
+            provenance: .selfReported
+        ))
+        // And a parse that has only seen model-a, so its 600 overlaps the self-report's.
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: at.addingTimeInterval(2), input: 600,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "model-a",
+            provenance: .parsedFromLog
+        ))
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "model-a")
+        try store.setPrice(Decimal(string: "0.000002")!, modelID: "model-b")
+        try store.flush()
+
+        // Two segments, one per source, on two different models — so neither rule fires.
+        guard case .reported(let segments) = try store.usage(for: session) else {
+            return XCTFail("expected a reported usage")
+        }
+        XCTAssertEqual(segments.map(\.modelID).sorted(), ["model-a", "model-b"])
+
+        // **Not a conflict.** Naming this explicitly, because the assertion a reader
+        // expects here is the old `.conflict` and its absence is the regression.
+        if case .conflict = try store.cost(for: session) {
+            return XCTFail("the old whole-session rule used to block this shape")
+        }
+        // 1,000 × 0.000002 + 600 × 0.000001 = 0.0026. Known-wrong: 1,600 tokens billed
+        // for 1,000 real. Recorded deliberately, per the doc comment above.
+        guard case .priced(let usd, _, let lines) = try store.cost(for: session) else {
+            return XCTFail("expected a priced total")
+        }
+        XCTAssertEqual(usd, Decimal(string: "0.0026")!,
+                       "records the double-count; a smaller figure here means a rule "
+                       + "changed and this limitation needs re-examining")
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines.first(where: { $0.modelID == "model-a" })?.usd,
+                       Decimal(string: "0.0006")!)
+        XCTAssertEqual(lines.first(where: { $0.modelID == "model-b" })?.usd,
+                       Decimal(string: "0.002")!)
     }
 
     /// One priced and one unpriced model must report the absence, naming the model,
@@ -896,9 +1038,13 @@ final class AgentSessionStoreTests: XCTestCase {
     /// The superseded case, which *should* still be deleted: a newer record for the
     /// same (provenance, model) means this one is unread, so removing it is inert.
     ///
-    /// The other half of the fix. Keeping a segment's latest reading is only safe while
-    /// the rest still goes — otherwise the trim trades a moved figure for a table that
-    /// grows forever, and the sweep stops being a bound on anything.
+    /// **The row count is the assertion, not the figure.** Reading back `usage` cannot
+    /// tell a deleted row from an unread one — the fold collapses a same-key pair to its
+    /// latest reading either way, so a `prune` that deletes nothing returns exactly what
+    /// this one returns. Counting rows through our own container is the only way to see
+    /// the deletion, and without it the half of the fix that keeps retention a bound on
+    /// growth is asserted by nothing: the trim could quietly become a no-op and the
+    /// table would grow forever with every test still green.
     func testPruneStillDropsASupersededRecord() throws {
         let (store, url) = try makeStoreOnDisk()
         let cutoff = Date(timeIntervalSince1970: 1_000)
@@ -918,6 +1064,8 @@ final class AgentSessionStoreTests: XCTestCase {
             provenance: .parsedFromLog
         ))
         try store.flush()
+        XCTAssertEqual(try usageRowCount(at: url, session: session), 2,
+                       "two records were written, so the count below can fall")
 
         store.prune(olderThan: cutoff, keepingSessionIDs: [])
 
@@ -927,6 +1075,9 @@ final class AgentSessionStoreTests: XCTestCase {
         }
         XCTAssertEqual(segments.count, 1)
         XCTAssertEqual(segments[0].input, 99, "the newer reading is the one that survives")
+        XCTAssertEqual(try usageRowCount(at: url, session: session), 1,
+                       "the superseded row must actually be gone: a figure that merely "
+                       + "reads the same proves nothing about deletion")
     }
 
     // MARK: - Price text is parsed strictly

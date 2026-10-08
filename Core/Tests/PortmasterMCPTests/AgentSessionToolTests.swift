@@ -145,10 +145,13 @@ final class AgentSessionToolTests: XCTestCase {
     }
 
     /// A two-source session still names the source its figure came from. The wire shape
-    /// carries one pair of counts, so it has to pick a provenance — and it must pick a
-    /// real one rather than reporting nil, which would tell a caller nobody reported
-    /// this session when in fact two sources did. Summing both instead would be the
-    /// other wrong answer: the same tokens counted twice.
+    /// carries one pair of counts, so it has to pick a provenance — and here both sources
+    /// describe the *same* model, so `preferredProvenance` keeps one segment and one name
+    /// is true of it. Summing both instead would be the other wrong answer: the same
+    /// tokens counted twice.
+    ///
+    /// The two sources on *different* models, where no single name fits, is
+    /// `testAFigureSpanningBothSourcesNamesNeither` below.
     func testTwoProvenanceFigureStillNamesItsSource() async throws {
         let id = UUID()
         try store.recordSession(
@@ -172,6 +175,46 @@ final class AgentSessionToolTests: XCTestCase {
 
         XCTAssertEqual(usage["provenance"] as? String, "selfReported")
         XCTAssertEqual(usage["inputTokens"] as? Int, 1_000, "one reading of the session, not two")
+    }
+
+    /// A figure summed across both sources names **neither**, because no single name is
+    /// true of it.
+    ///
+    /// Two different models, one self-reported and one parsed, so neither source is
+    /// measuring the other's work and both segments are legitimately chosen. The counts
+    /// are then a sum across provenances — and the field could only have named one.
+    ///
+    /// Which is worse than useless: the fold orders segments by provenance's raw value,
+    /// so `"parsedFromLog"` sorts first and `chosen.first` would label a figure that
+    /// contains self-reported tokens as `parsedFromLog`. A client auditing the number
+    /// would be told to trust a source for part of it that source never saw. Nil is the
+    /// honest reading, and nil already means "origin unknown" everywhere else here.
+    func testAFigureSpanningBothSourcesNamesNeither() async throws {
+        let id = UUID()
+        try store.recordSession(
+            id: id, peerPID: 1, clientName: nil, clientVersion: nil, connectedAt: Date()
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date(), input: 1_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "self-model", provenance: .selfReported
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: id, recordedAt: Date().addingTimeInterval(1), input: 600, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "parsed-model", provenance: .parsedFromLog
+        ))
+        try store.flush()
+
+        let json = try await wire()
+        let usage = try XCTUnwrap(
+            (try XCTUnwrap((json["sessions"] as? [[String: Any]])?.first))["usage"] as? [String: Any]
+        )
+
+        XCTAssertNil(usage["provenance"] as? String,
+                     "two sources contributed, so neither name describes the total")
+        // The counts still arrive: nil says the origin is unknown, not that nothing was
+        // counted. A session that reported must never read as one that did not.
+        XCTAssertEqual(usage["reported"] as? Bool, true)
+        XCTAssertEqual(usage["inputTokens"] as? Int, 1_600)
     }
 
     /// A priced session carries its figures and the price-table version that

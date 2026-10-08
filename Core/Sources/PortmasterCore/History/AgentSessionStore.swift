@@ -588,7 +588,6 @@ public final class AgentSessionStore: @unchecked Sendable {
     private func priceTableLocked() -> PriceTable {
         let all = (try? context.fetch(FetchDescriptor<ModelPriceEntry>())) ?? []
         var byKey: [String: (price: Decimal, version: Int)] = [:]
-        var version = 0
         for entry in all {
             // A row whose text will not parse is left out of the table entirely, so
             // costing asks for a price, finds none, and says the model is unpriced —
@@ -596,9 +595,8 @@ public final class AgentSessionStore: @unchecked Sendable {
             if let price = entry.pricePerToken {
                 byKey[entry.key] = (price, entry.tableVersion)
             }
-            version = max(version, entry.tableVersion)
         }
-        return PriceTable(byKey: byKey, currentVersion: version)
+        return PriceTable(byKey: byKey)
     }
 
     private func costLocked(records: [TokenUsageRecord], table: PriceTable) -> SessionCost {
@@ -692,15 +690,16 @@ public final class AgentSessionStore: @unchecked Sendable {
 
     /// A read-only view of the price table for one costing pass. Small enough to be a
     /// value, so a caller cannot hold a half-read table across a later write.
+    ///
+    /// Carries the per-entry version and nothing else. The table's own newest version
+    /// used to sit here too and was read by no one — it would have renumbered a figure
+    /// on any unrelated price edit — so it is gone rather than left as a trap for the
+    /// next reader who assumes a stored total is worth one.
     private struct PriceTable {
-        /// Internal rather than private: `prices()` and `modelsMissingAPrice()`
-        /// read it, and both are on the lock-holding side already.
         let byKey: [String: (price: Decimal, version: Int)]
-        let currentVersion: Int
 
-        init(byKey: [String: (price: Decimal, version: Int)], currentVersion: Int) {
+        init(byKey: [String: (price: Decimal, version: Int)]) {
             self.byKey = byKey
-            self.currentVersion = currentVersion
         }
 
         func price(_ key: String) -> (Decimal, Int)? {

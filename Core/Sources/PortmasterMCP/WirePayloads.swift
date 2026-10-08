@@ -448,14 +448,19 @@ struct TokenUsagePayload: Encodable {
     let reported: Bool
     let inputTokens: Int?
     let outputTokens: Int?
-    /// Which source produced the figure, or nil when there is none. A number whose
-    /// origin is unknown cannot be audited, so this is never omitted in favour of
-    /// a default.
+    /// Which source produced the figure, or nil when there is none — or when no single
+    /// source did. A number whose origin is unknown cannot be audited, so this is never
+    /// omitted in favour of a default.
     let provenance: String?
     /// Why no figure exists: `noSource`, `logUnreadable`, `unrecognizedFormat`,
     /// `awaitingFirstReport`. Present only when `reported` is false.
     let reason: String?
 
+    /// **Precondition: `segments` is non-empty.** `aggregating` is what guarantees it —
+    /// no records folds to `.notReported(.awaitingFirstReport)` rather than an empty
+    /// `.reported`. Hand-built otherwise, the `.reported` branch below emits
+    /// `reported: true` with zero counts, which is the exact shape this payload exists
+    /// not to produce: a client reads that as a session that reported and used nothing.
     init(_ usage: TokenUsage) {
         switch usage {
         case .reported(let segments):
@@ -464,18 +469,27 @@ struct TokenUsagePayload: Encodable {
             // `TokenUsage` does not reach a client: a session that ran two models
             // reads here as one total, with no breakdown.
             //
-            // What it *does* carry is one provenance's segments rather than a sum of
-            // both. Two sources describing one session are alternative measurements of
-            // the same work, so summing them double-counts it — and the chosen one is
-            // named below rather than dropped, because the whole point of carrying
-            // `provenance` at all is that a figure whose origin is unknown cannot be
-            // audited. Emitting nil here would say "no source reported this" about a
-            // number two sources reported.
+            // That total is **one provenance's segments where one source covers the
+            // models it names**, and `preferredProvenance` is what picks: two sources
+            // describing the same model are alternative measurements of the same work, so
+            // summing them would double-count it.
+            //
+            // It is not one provenance's segments in general. When the chosen segments
+            // span both sources — two different models, one self-reported and one
+            // parsed — the counts are a sum across provenances and no single name is
+            // true of them. Naming `chosen.first` would be worse than useless here: the
+            // fold orders parsed segments ahead of self-reported ones, so a figure
+            // containing self-reported tokens would be labelled `parsedFromLog`. Nil is
+            // the honest answer, and it already means "origin unknown" everywhere else
+            // in this payload.
             let chosen = TokenUsage.preferredProvenance(segments)
+            let provenances = Set(chosen.map(\.provenance))
             self.reported = true
             self.inputTokens = chosen.reduce(0) { $0 + $1.input }
             self.outputTokens = chosen.reduce(0) { $0 + $1.output }
-            self.provenance = chosen.first?.provenance.rawValue
+            self.provenance = provenances.count == 1
+                ? provenances.first?.rawValue
+                : nil
             self.reason = nil
         case .notReported(let reason):
             self.reported = false
@@ -491,6 +505,11 @@ struct TokenUsagePayload: Encodable {
 struct SessionCostPayload: Encodable {
     let priced: Bool
     let usd: String?
+    /// The newest price table version **this figure actually multiplied**, never the
+    /// table's current one — that would renumber the figure whenever an unrelated
+    /// model's price was edited. `0` when no price was needed, which is a real case: a
+    /// session whose every component count is zero spends nothing under any price, so
+    /// there is no entry to name. A client must not read `0` as a broken table.
     let priceTableVersion: Int?
     /// `unpriced`, `conflict`, or `noUsage` when `priced` is false.
     let reason: String?

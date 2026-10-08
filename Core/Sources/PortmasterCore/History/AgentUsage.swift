@@ -167,6 +167,13 @@ public struct CostLine: Hashable, Sendable {
 /// A session's token usage: one segment per model a source reported separately — or
 /// one for a cumulative self-report — or a reason there is none.
 public enum TokenUsage: Hashable, Sendable {
+    /// **Never empty.** A figure with no segments is not a figure, and
+    /// `isReported` is `true` for this case whatever the array holds — so an empty
+    /// array would read as "reported, and nothing was used", which is the one shape
+    /// the three-state type exists to rule out. `aggregating` is the constructor that
+    /// guarantees it, turning no records into `.notReported(.awaitingFirstReport)`;
+    /// anything hand-building this case owes the same check, because a payload built
+    /// from an empty `.reported` emits `reported: true` with zero counts.
     case reported([TokenUsageSegment])
     case notReported(reason: UsageUnavailableReason)
 
@@ -281,9 +288,11 @@ public enum TokenUsage: Hashable, Sendable {
         var preferred: [String: TokenProvenance] = [:]
         for segment in segments {
             let incumbent = preferred[segment.modelID]
-            // Ranked rather than "first seen wins": segments arrive ordered by
-            // provenance's raw value, which happens to put `selfReported` first today
-            // and would quietly reverse this rule if a third case were ever added.
+            // Ranked rather than "first seen wins": the fold's order is fixed by
+            // provenance's raw value and by the fold key, not by which source should be
+            // believed, so reading precedence off arrival would invert the rule the day
+            // that ordering changed — and `"parsedFromLog" < "selfReported"`, so parsed
+            // segments do arrive first.
             if incumbent == nil || (incumbent == .parsedFromLog && segment.provenance == .selfReported) {
                 preferred[segment.modelID] = segment.provenance
             }
