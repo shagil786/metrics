@@ -507,3 +507,181 @@ final class AgentUsageTests: XCTestCase {
         XCTAssertNotEqual(cost, .priced(usd: Decimal(0), priceTableVersion: 1, lines: []))
     }
 }
+
+/// Withdrawal: a pass that learns a figure it wrote is no longer attributable must be able
+/// to stop the store pricing it, without a migration and without a deletion.
+final class TokenWithdrawalTests: XCTestCase {
+
+    private func record(
+        _ id: UUID, model: String, input: Int, output: Int, at: Date,
+        provenance: TokenProvenance = .parsedFromLog
+    ) -> TokenUsageRecord {
+        TokenUsageRecord(
+            sessionID: id, recordedAt: at, input: input, output: output,
+            cacheRead: nil, reasoning: nil, modelID: model, provenance: provenance
+        )
+    }
+
+    private func withdrawal(_ id: UUID, at: Date) -> TokenUsageRecord {
+        // No counts, and that is not a claim of zero: a withdrawal is filtered out before
+        // anything displays or costs it.
+        TokenUsageRecord(
+            sessionID: id, recordedAt: at, input: 0, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "", provenance: .parseWithdrawn
+        )
+    }
+
+    /// The whole point: a reading that a later pass withdrew stops being a figure.
+    func testAWithdrawalSupersedesAParsedReading() {
+        let id = UUID()
+        let before = Date(timeIntervalSince1970: 1_000)
+        let after = before.addingTimeInterval(60)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 100, output: 50, at: before),
+            withdrawal(id, at: after),
+        ])
+
+        XCTAssertEqual(usage, .notReported(reason: .ambiguousMatch),
+                       "a figure the rule has stopped believing must not read as a figure")
+    }
+
+    /// **Every** model goes, not one of them. The withdrawal is about the session's parse as
+    /// a whole: the conversation cannot be attributed, so no model's share of it can be.
+    func testAWithdrawalRemovesEveryModelTheParseContributed() {
+        let id = UUID()
+        let before = Date(timeIntervalSince1970: 1_000)
+        let after = before.addingTimeInterval(60)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 100, output: 50, at: before),
+            record(id, model: "model-b", input: 200, output: 75, at: before),
+            withdrawal(id, at: after),
+        ])
+
+        XCTAssertEqual(usage, .notReported(reason: .ambiguousMatch))
+    }
+
+    /// A withdrawal takes the parse down and **only** the parse. A self-report is a
+    /// different source with its own evidence, and losing one source's figure is not a
+    /// reason to throw away another's.
+    func testAWithdrawalLeavesASelfReportAlone() {
+        let id = UUID()
+        let before = Date(timeIntervalSince1970: 1_000)
+        let after = before.addingTimeInterval(60)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 100, output: 50, at: before, provenance: .selfReported),
+            record(id, model: "model-a", input: 100, output: 50, at: before),
+            withdrawal(id, at: after),
+        ])
+
+        guard case .reported(let segments) = usage else {
+            return XCTFail("the self-report is still a figure, got \(usage)")
+        }
+        XCTAssertEqual(segments.map(\.provenance), [.selfReported])
+        XCTAssertEqual(segments.first?.input, 100)
+    }
+
+    /// **A later reading re-establishes the figure**, so a withdrawal is not a one-way door.
+    /// A conversation that stops being contended and a new log appearing both look like this
+    /// from the store, and neither should need a migration to undo.
+    func testAReadingAfterAWithdrawalStandsAgain() {
+        let id = UUID()
+        let at = Date(timeIntervalSince1970: 1_000)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 100, output: 50, at: at),
+            withdrawal(id, at: at.addingTimeInterval(60)),
+            record(id, model: "model-a", input: 100, output: 90, at: at.addingTimeInterval(120)),
+        ])
+
+        guard case .reported(let segments) = usage else {
+            return XCTFail("a later reading is a figure again, got \(usage)")
+        }
+        XCTAssertEqual(segments.first?.output, 90)
+    }
+
+    /// **A withdrawal wins a timestamp tie.** The fold breaks equal timestamps by keeping
+    /// the earlier element; between "a figure we once believed" and "we no longer can" at
+    /// the same instant, the absence is the safer answer. This is the one deliberate
+    /// exception to that convention and it is pinned here so it cannot be changed quietly.
+    func testAWithdrawalWinsATimestampTie() {
+        let id = UUID()
+        let at = Date(timeIntervalSince1970: 1_000)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 100, output: 50, at: at),
+            withdrawal(id, at: at),
+        ])
+
+        XCTAssertEqual(usage, .notReported(reason: .ambiguousMatch))
+    }
+
+    /// Records exist but none survived. That is **not** `awaitingFirstReport`: something
+    /// did report, and a later pass said it cannot be attributed. Telling the user to wait
+    /// for a report that has already arrived and been withdrawn is advice that cannot help.
+    func testWithdrawnRecordsAreNotReportedAsAwaitingFirstReport() {
+        let id = UUID()
+        let at = Date(timeIntervalSince1970: 1_000)
+
+        XCTAssertEqual(
+            TokenUsage.aggregating([withdrawal(id, at: at)]),
+            .notReported(reason: .ambiguousMatch)
+        )
+        // And a session with nothing at all is still awaiting its first report.
+        XCTAssertEqual(
+            TokenUsage.aggregating([]),
+            .notReported(reason: .awaitingFirstReport)
+        )
+    }
+
+    /// **The costing path agrees with the read path.** Both go through the one place a
+    /// withdrawal is applied, so a withdrawn session cannot read as "no figure" on the card
+    /// and "a real cost" on the wire — which is the same two-surfaces-disagree defect
+    /// segments exist to prevent.
+    func testSegmentsAgreeWithAggregatingAboutAWithdrawal() {
+        let id = UUID()
+        let at = Date(timeIntervalSince1970: 1_000)
+        let records = [
+            record(id, model: "model-a", input: 100, output: 50, at: at),
+            withdrawal(id, at: at.addingTimeInterval(60)),
+        ]
+
+        XCTAssertTrue(TokenUsage.segments(from: records).isEmpty)
+        XCTAssertFalse(TokenUsage.aggregating(records).isReported)
+    }
+
+    /// A withdrawal occupies its own fold slot and cannot shadow a model id.
+    func testAWithdrawalCannotShadowAReading() {
+        XCTAssertEqual(
+            TokenUsageRecord(
+                sessionID: UUID(), recordedAt: Date(), input: 0, output: 0,
+                cacheRead: nil, reasoning: nil, modelID: "",
+                provenance: .parseWithdrawn
+            ).foldKey,
+            TokenUsageRecord(
+                sessionID: UUID(), recordedAt: Date(), input: 1, output: 1,
+                cacheRead: nil, reasoning: nil, modelID: "",
+                provenance: .parsedFromLog
+            ).foldKey,
+            "both key on nothing, but they are different fold slots — different provenance"
+        )
+    }
+
+    /// **Unknown is never zero, in either direction.** The withdrawal carries zero counts
+    /// and none of them reach a figure: a withdrawn session reads as an *absence*, not as a
+    /// session that used nothing.
+    func testAWithdrawnSessionIsNotZero() {
+        let id = UUID()
+        let at = Date(timeIntervalSince1970: 1_000)
+
+        let usage = TokenUsage.aggregating([
+            record(id, model: "model-a", input: 1_000, output: 500, at: at),
+            withdrawal(id, at: at.addingTimeInterval(60)),
+        ])
+
+        XCTAssertNotEqual(usage, .reported([]), "must not become a figure of nothing")
+        XCTAssertFalse(usage.isReported)
+    }
+}

@@ -51,32 +51,28 @@
 
 import Foundation
 
-/// Where a conversation's interval came from.
+/// A conversation's span in time: the earliest and latest of the log's own line
+/// timestamps.
 ///
-/// Carried on the candidate because the two are not the same kind of evidence, and a
-/// caller that cannot tell them apart will trust the weaker one as though it were the
-/// stronger. `fileModification` is one filesystem timestamp standing in for a whole
-/// span; `lineTimestamps` is the log's own account of itself.
-public enum LogIntervalEvidence: Hashable, Sendable {
-    /// Earliest and latest of the log's own per-line timestamps.
-    case lineTimestamps
-    /// No line carried a timestamp, so the file's single modification time is used for
-    /// both ends — a *point* where a span is wanted. It answers "was this file touched
-    /// near the connection", which is the older and weaker question, and it is labelled
-    /// so nobody reads it as the interval it is not.
-    case fileModification
-}
-
-/// A conversation's span in time.
+/// **There is no cheaper kind of this, and that is deliberate.** A fallback to the
+/// file's single modification time was built and then removed: a point where a span is
+/// wanted cannot answer a question about containment, and the one way to make it answer
+/// was to pad it — at which point a `±1h` window built from one filesystem timestamp was
+/// reporting `.unique` confidently, which is the old rule wearing the new code. It also
+/// could not be carried anywhere: `evidence` on a candidate reaches no record and no
+/// absence, because `TokenUsageRecord` has no column for it and adding one is a schema
+/// migration. So the honest options were "refuse it" and "build somewhere for it to be
+/// read", and refusing is the one that cannot invent a number.
+///
+/// A file with no line timestamps is therefore **listed and unplaceable**: a diagnostic
+/// can see that a log exists here, and no connection is ever told it is inside it.
 public struct LogInterval: Hashable, Sendable {
     public let start: Date
     public let end: Date
-    public let evidence: LogIntervalEvidence
 
-    public init(start: Date, end: Date, evidence: LogIntervalEvidence) {
+    public init(start: Date, end: Date) {
         self.start = start
         self.end = end
-        self.evidence = evidence
     }
 }
 
@@ -84,14 +80,12 @@ public struct LogInterval: Hashable, Sendable {
 public struct LogCandidate: Hashable, Sendable {
     public let url: URL
 
-    /// **Nil when nothing could place this file in time** — no line carried a timestamp
-    /// *and* the filesystem would not say when it was written.
+    /// **Nil when nothing could place this file in time** — no line in it carried a
+    /// timestamp, and there is no weaker source that would be allowed to answer.
     ///
-    /// Such a file is still returned, so that "there is a log here that cannot be placed"
-    /// is visible to a diagnostic rather than looking like "no log". It matches nobody,
-    /// because a claim it cannot support is the one thing this module never makes. The
-    /// cost is that it reaches the session as `noSource`, which says no source could be
-    /// *attributed* — the closest honest word in a set that has no separate one.
+    /// Such a file is still returned, so "there is a log here that cannot be placed" is
+    /// visible to a diagnostic rather than looking like "no log". It matches nobody,
+    /// because a claim it cannot support is the one thing this module never makes.
     public let interval: LogInterval?
 
     public init(url: URL, interval: LogInterval?) {
@@ -106,9 +100,10 @@ public struct LogCandidate: Hashable, Sendable {
 /// this size reads as "matched something" at a call site that only cares which of four
 /// things went wrong.
 ///
-/// One case per answer rather than an optional candidate plus a flag: "no file", "one
-/// file but not this session's alone" and "several files" are three facts, and an
-/// optional could carry any of them without saying which.
+/// The count belongs here, on the value, rather than in a reason a caller has to be told
+/// separately: "one conversation and it is not yours alone" and "four conversations" are
+/// different facts and `UsageUnavailableReason` names them the same way, so this is the
+/// only place the distinction survives.
 public enum LogMatch: Hashable, Sendable {
     /// Exactly one conversation spans this connection, and no other session's connection
     /// falls inside it. The only shape that becomes a number.
@@ -185,6 +180,19 @@ public enum AgentLogMatcher {
     /// the same conversation. Padding it here rather than inside the adapter keeps one
     /// tolerance for one question — a second window configured in two places was what
     /// `ClaudeCodeLogAdapter.overlap` was, and deleting it is why there is one now.
+    ///
+    /// **The margin is itself a contention source, and that is a cost of the padding, not
+    /// a bug in it.** Two connections 40 and 59 minutes before one conversation's first
+    /// line both fall inside the hour this adds, so both contend and neither matches —
+    /// verified in `testTheMarginIsItselfAContentionSource`. Two connections an hour apart
+    /// are cleanly decidable; two connections in the same hour of slack are not. Widening
+    /// the tolerance to catch more real matches widens the band in which no match is
+    /// possible, so the number is a real trade and is chosen without data behind it —
+    /// the same admission the disagreement tolerance carries.
+    ///
+    /// It also decides how much of a conversation a connection is charged for: a
+    /// connection up to an hour before the first line matches, and is then billed for the
+    /// whole conversation including the part before it arrived.
     static func spanning(
         _ candidates: [LogCandidate],
         connectedAt: Date,
@@ -194,9 +202,13 @@ public enum AgentLogMatcher {
         var seen: Set<URL> = []
         var matched: [LogCandidate] = []
         for candidate in candidates {
-            guard seen.insert(candidate.url).inserted, let span = candidate.interval else {
-                continue
-            }
+            // **The interval first, the dedupe second.** Deduping first would let an
+            // unplaceable copy of a url shadow a placeable one later in the list, so a
+            // conversation that is fully described would read as unplaced — an absence
+            // with no fact behind it. Unreachable with this adapter, which lists one
+            // candidate per file, and ordered so it stays unreachable.
+            guard let span = candidate.interval,
+                  seen.insert(candidate.url).inserted else { continue }
             // A conversation wholly after `now` is a clock artefact, and a session row
             // sharing that same skew would "match" it — attributing a conversation to a
             // connection that cannot have happened. Refusing it is the only direction

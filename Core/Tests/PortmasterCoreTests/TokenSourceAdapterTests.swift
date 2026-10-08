@@ -9,8 +9,9 @@ import Foundation
 /// Every `.json` file under a directory, with each one's last write time.
 ///
 /// Shared by the fixtures here and in `AgentSourcePollerTests`, and the same shape
-/// `ClaudeCodeLogAdapter` falls back to: these files carry no timestamps of their own, so
-/// their interval comes from file metadata and says so.
+/// `ClaudeCodeLogAdapter` cannot place: these files carry no timestamps of their own, so
+/// the interval below is what a caller sees when a real log is unplaceable, and the
+/// point-in-time shape is the only one these fixtures can produce.
 func fixtureLogCandidates(in root: URL) -> [LogCandidate] {
     let contents = (try? FileManager.default.contentsOfDirectory(
         at: root, includingPropertiesForKeys: [.contentModificationDateKey]
@@ -25,7 +26,7 @@ func fixtureLogCandidates(in root: URL) -> [LogCandidate] {
             // so this is the fallback shape rather than a conversation's real span.
             return LogCandidate(
                 url: url,
-                interval: LogInterval(start: modified, end: modified, evidence: .fileModification)
+                interval: LogInterval(start: modified, end: modified)
             )
         }
         .sorted { $0.url.path < $1.url.path }
@@ -42,7 +43,7 @@ struct FixtureTokenAdapter: TokenSourceAdapter {
     let identifier = "fixture-agent"
     var root: URL
 
-    func logCandidates() -> [LogCandidate] { fixtureLogCandidates(in: root) }
+    func logCandidates(newerThan: Date?) -> [LogCandidate] { fixtureLogCandidates(in: root) }
 
     func parse(_ url: URL) throws -> [RawAgentUsage] {
         let data = try Data(contentsOf: url)
@@ -77,7 +78,7 @@ struct ThrowingTokenAdapter: TokenSourceAdapter {
     let identifier = "throwing-agent"
     var root: URL
 
-    func logCandidates() -> [LogCandidate] { fixtureLogCandidates(in: root) }
+    func logCandidates(newerThan: Date?) -> [LogCandidate] { fixtureLogCandidates(in: root) }
 
     func parse(_ url: URL) throws -> [RawAgentUsage] {
         throw NSError(domain: "fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
@@ -119,7 +120,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         session: (id: UUID, connectedAt: Date)
     ) -> TokenSourceOutcome {
         let match = AgentLogMatcher.match(
-            adapter.logCandidates(), for: [session], overlap: overlap, now: now
+            adapter.logCandidates(newerThan: nil), for: [session], overlap: overlap, now: now
         )
         return TokenSourceRunner(adapter: adapter).run(
             sessionID: session.id, match: match[session.id] ?? .ambiguous(count: 0)
@@ -138,7 +139,7 @@ final class TokenSourceAdapterTests: XCTestCase {
     /// An empty directory is an empty candidate list, which is normal and not a failure:
     /// most sessions have no readable log.
     func testMissingLogIsNoSourceNotAFailure() {
-        XCTAssertTrue(FixtureTokenAdapter(root: root).logCandidates().isEmpty)
+        XCTAssertTrue(FixtureTokenAdapter(root: root).logCandidates(newerThan: nil).isEmpty)
     }
 
     /// A file the test just wrote is a candidate carrying its real last-write time. The
@@ -147,7 +148,7 @@ final class TokenSourceAdapterTests: XCTestCase {
     func testAFileOnDiskIsACandidateCarryingItsLastWriteTime() throws {
         let written = try writeLog(#"{"input": 1, "output": 1, "model": "m"}"#, named: "a.json")
 
-        let candidates = FixtureTokenAdapter(root: root).logCandidates()
+        let candidates = FixtureTokenAdapter(root: root).logCandidates(newerThan: nil)
 
         let candidate = try XCTUnwrap(candidates.first)
         XCTAssertEqual(candidates.count, 1)
@@ -158,7 +159,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         let interval = try XCTUnwrap(candidate.interval)
         XCTAssertEqual(interval.start.timeIntervalSince1970,
                        onDisk.timeIntervalSince1970, accuracy: 1)
-        XCTAssertEqual(interval.evidence, .fileModification)
+
     }
 
     // MARK: - Parsing
@@ -265,7 +266,7 @@ final class TokenSourceAdapterTests: XCTestCase {
         let adapter = FixtureTokenAdapter(root: root)
 
         let match = AgentLogMatcher.match(
-            adapter.logCandidates(), for: [located], overlap: overlap, now: now
+            adapter.logCandidates(newerThan: nil), for: [located], overlap: overlap, now: now
         )
         let outcome = TokenSourceRunner(adapter: adapter)
             .run(sessionID: located.id, match: match[located.id] ?? .ambiguous(count: 0))

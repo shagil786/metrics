@@ -73,8 +73,13 @@ public struct AgentSourcePass: Hashable, Sendable {
     /// no-sessions guard is observable instead by `sessionsConsidered == 0` with this
     /// also zero, since nothing is asked before a session exists to ask about.
     public let sourcesQueried: Int
-    /// Every record the pass persisted, in the order it wrote them.
+    /// Every figure the pass wrote, in the order it wrote them.
     public let records: [TokenUsageRecord]
+    /// Figures the pass took back — records whose only content is that an earlier one is no
+    /// longer attributable. **Kept apart from `records`** so "how much did this pass write"
+    /// and "what did this pass take back" are two answerable questions rather than one with
+    /// a provenance filter on it.
+    public let withdrawals: [TokenUsageRecord]
     public let absences: [AgentSourceAbsence]
     public let failures: [AgentSourceFailure]
 
@@ -83,6 +88,7 @@ public struct AgentSourcePass: Hashable, Sendable {
         sessionsConsidered: Int,
         sourcesQueried: Int,
         records: [TokenUsageRecord],
+        withdrawals: [TokenUsageRecord],
         absences: [AgentSourceAbsence],
         failures: [AgentSourceFailure]
     ) {
@@ -90,6 +96,7 @@ public struct AgentSourcePass: Hashable, Sendable {
         self.sessionsConsidered = sessionsConsidered
         self.sourcesQueried = sourcesQueried
         self.records = records
+        self.withdrawals = withdrawals
         self.absences = absences
         self.failures = failures
     }
@@ -104,6 +111,7 @@ public struct AgentSourcePass: Hashable, Sendable {
             sessionsConsidered: sessionsConsidered,
             sourcesQueried: 0,
             records: [],
+            withdrawals: [],
             absences: [],
             failures: failures
         )
@@ -127,10 +135,11 @@ public final class AgentSourcePoller: @unchecked Sendable {
 
     private let store: AgentSessionStore
     private let adapters: [any TokenSourceAdapter]
-    /// How far either side of a session a log's last write may fall and still count as
-    /// overlapping. Generous, because a log's modification time is its *last* write and
-    /// a session's end is not observable; the cost of generosity is ambiguity, which is
-    /// an absence rather than a guess.
+    /// How far either side of a conversation a connection may fall and still count as
+    /// having been inside it. Generous, because a conversation's first line is written
+    /// after the agent started and its last before the connection closed; the cost of
+    /// generosity is a wider band in which two connections contend and neither matches,
+    /// which is an absence rather than a guess.
     private let overlap: TimeInterval
     private let onPass: (@Sendable (AgentSourcePass) -> Void)?
 
@@ -250,11 +259,35 @@ public final class AgentSourcePoller: @unchecked Sendable {
         guard !sessions.isEmpty else { return .idle(at: now) }
 
         var records: [TokenUsageRecord] = []
+        var withdrawals: [TokenUsageRecord] = []
         var absences: [AgentSourceAbsence] = []
         var failures: [AgentSourceFailure] = []
 
+        // **What this store already believes, per session and provenance.** Read once, and
+        // read for a reason: a refusal only withdraws a figure that exists, and a pass
+        // that withdrew blindly would write a withdrawal for a session that never had a
+        // parsed figure — leaving a `parseWithdrawn` record behind that outlives the
+        // figure it was meant to cancel.
+        var alreadyParsed: Set<UUID> = []
+        do {
+            for snapshot in try store.sessions() {
+                if case .reported(let segments) = snapshot.usage,
+                   segments.contains(where: { $0.provenance == .parsedFromLog }) {
+                    alreadyParsed.insert(snapshot.id)
+                }
+            }
+        } catch {
+            NSLog("Portmaster agent source poll could not read existing usage: \(error)")
+            failures.append(AgentSourceFailure(source: "store", sessionID: nil, detail: "\(error)"))
+        }
+
+        // The cost bound every source gets: no connection in this pass can match a
+        // conversation that ended before the earliest one opened, less the tolerance.
+        let earliestMatch = sessions.map(\.connectedAt).min()!
+            .addingTimeInterval(-overlap)
+
         for adapter in adapters {
-            let candidates = adapter.logCandidates()
+            let candidates = adapter.logCandidates(newerThan: earliestMatch)
             let matches = AgentLogMatcher.match(
                 candidates, for: sessions, overlap: overlap, now: now
             )
@@ -264,7 +297,8 @@ public final class AgentSourcePoller: @unchecked Sendable {
             for session in sessions {
                 switch runner.run(
                     sessionID: session.id,
-                    match: matches[session.id] ?? .ambiguous(count: 0)
+                    match: matches[session.id] ?? .ambiguous(count: 0),
+                    readsParsedUsage: alreadyParsed.contains(session.id)
                 ) {
                 case .reported(let found):
                     for record in found {
@@ -281,6 +315,33 @@ public final class AgentSourcePoller: @unchecked Sendable {
                             ))
                         }
                     }
+                case .withdrew(let parsedFromLog):
+                    let withdrawal = TokenUsageRecord(
+                        sessionID: session.id,
+                        recordedAt: now,
+                        // No counts, and that is not a claim of zero: a withdrawal is
+                        // filtered out before any display or cost sees it. A zero here
+                        // would be the cheaper-looking option and is exactly the
+                        // conflation this module exists to refuse.
+                        input: 0, output: 0, cacheRead: nil, reasoning: nil,
+                        modelID: "",
+                        provenance: .parseWithdrawn
+                    )
+                    do {
+                        try store.recordUsage(withdrawal)
+                        withdrawals.append(withdrawal)
+                    } catch {
+                        NSLog("Portmaster agent source poll could not record a withdrawal: \(error)")
+                        failures.append(AgentSourceFailure(
+                            source: adapter.identifier, sessionID: session.id,
+                            detail: "\(error)"
+                        ))
+                    }
+                    absences.append(AgentSourceAbsence(
+                        sessionID: session.id, source: adapter.identifier,
+                        reason: .ambiguousMatch
+                    ))
+                    _ = parsedFromLog
                 case .notReported(let reason):
                     absences.append(AgentSourceAbsence(
                         sessionID: session.id, source: adapter.identifier, reason: reason
@@ -307,6 +368,7 @@ public final class AgentSourcePoller: @unchecked Sendable {
             sessionsConsidered: sessions.count,
             sourcesQueried: adapters.count,
             records: records,
+            withdrawals: withdrawals,
             absences: absences,
             failures: failures
         )

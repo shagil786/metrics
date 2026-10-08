@@ -35,7 +35,6 @@ final class AgentLogMatcherTests: XCTestCase {
             interval: LogInterval(
                 start: now.addingTimeInterval(-fromAgo),
                 end: now.addingTimeInterval(-toAgo),
-                evidence: .lineTimestamps
             )
         )
     }
@@ -131,14 +130,47 @@ final class AgentLogMatcherTests: XCTestCase {
         XCTAssertEqual(match([conversation], [yesterday])[yesterday.id], .ambiguous(count: 0))
     }
 
-    /// The same claim at a finer grain: a connection *before* the first line is outside
-    /// even when it is only minutes earlier, which is the boundary the rule draws.
-    func testAConnectionMinutesBeforeTheFirstLineDoesNotMatch() {
+    /// The same claim at a finer grain: a connection before the first line is outside once
+    /// it is more than the tolerance earlier, which is the boundary the rule draws.
+    ///
+    /// Two hours before, against a one-hour tolerance. The name says two hours because the
+    /// fixture is two hours — an earlier version of this test was called
+    /// `testAConnectionMinutesBeforeTheFirstLine…` while asserting `1800 + 7200`, and a
+    /// test that does not test what its name says is worse than no test, because it
+    /// silences the question it appears to ask.
+    func testAConnectionTwoHoursBeforeTheFirstLineDoesNotMatch() {
         let conversation = conversation("later", fromAgo: 1800, toAgo: 900)
-        // Two hours before the conversation began, against a one-hour tolerance.
         let before = session(1800 + 7200)
 
         XCTAssertEqual(match([conversation], [before])[before.id], .ambiguous(count: 0))
+    }
+
+    /// **The other side of that boundary, and the cost of the padding.** Forty-five
+    /// minutes before the first line is *inside* an hour of tolerance, so it matches — and
+    /// is then billed for the whole conversation, including the part before it arrived.
+    /// The tolerance is what makes a real connection matchable at all, and this is what it
+    /// charges for it.
+    func testAConnectionInsideTheMarginBeforeTheFirstLineStillMatches() {
+        let conversation = conversation("early", fromAgo: 3600, toAgo: 1800)
+        let insideTheMargin = session(3600 + 45 * 60)
+
+        XCTAssertEqual(match([conversation], [insideTheMargin])[insideTheMargin.id],
+                       .unique(conversation))
+    }
+
+    /// **And the margin is itself a contention source.** Two connections 40 and 59 minutes
+    /// before one conversation's first line both fall inside the hour this adds, so both
+    /// contend and neither matches — while the same two connections an hour apart are
+    /// cleanly decidable. Widening the tolerance to catch more real matches widens the band
+    /// in which no match is possible.
+    func testTheMarginIsItselfAContentionSource() {
+        let conversation = conversation("opening", fromAgo: 3600, toAgo: 1800)
+        let fortyMinutesIn = session(3600 + 40 * 60)
+        let fiftyNineMinutesIn = session(3600 + 59 * 60)
+
+        let result = match([conversation], [fortyMinutesIn, fiftyNineMinutesIn])
+
+        XCTAssertEqual(Set(result.values), [.ambiguous(count: 1)])
     }
 
     /// A connection from after the conversation ended, far enough past the tolerance.
@@ -149,11 +181,13 @@ final class AgentLogMatcherTests: XCTestCase {
         XCTAssertEqual(match([conversation], [today])[today.id], .ambiguous(count: 0))
     }
 
-    /// **A conversation that could not be placed matches nobody.** No line carried a
-    /// timestamp and the filesystem would not say when the file was written, so nothing
-    /// here can say whether this connection was inside it. It is still returned to the
-    /// caller — a log that exists and cannot be placed is worth seeing — but a claim it
-    /// cannot support is the one thing this module never makes.
+    /// **A conversation that could not be placed matches nobody.** A log with no line
+    /// timestamps — or one that could be read but not understood — gives nothing that can
+    /// say whether this connection was inside it. It is still returned to the caller, so
+    /// "a log exists here and cannot be placed" is visible to a diagnostic, but a claim it
+    /// cannot support is the one thing this module never makes. The file's modification
+    /// time would place it, and is deliberately not used: that is a point where a span is
+    /// wanted, and padding one into a window rebuilt the rule this replaced.
     func testACandidateWithNoIntervalMatchesNobody() {
         let theConnection = session(60)
         let lonely = unplaceable("nowhere")
@@ -315,8 +349,7 @@ final class AgentLogMatcherTests: XCTestCase {
     /// why `now` is a parameter at all.
     func testAConversationWhollyInTheFutureMatchesNobody() {
         let future = LogInterval(
-            start: now.addingTimeInterval(7200), end: now.addingTimeInterval(9000),
-            evidence: .lineTimestamps
+            start: now.addingTimeInterval(7200), end: now.addingTimeInterval(9000)
         )
         let skewed = LogCandidate(url: URL(fileURLWithPath: "/logs/skewed.jsonl"), interval: future)
         let alsoSkewed = (id: UUID(), connectedAt: now.addingTimeInterval(8000))
@@ -334,11 +367,9 @@ final class AgentLogMatcherTests: XCTestCase {
         let url = URL(fileURLWithPath: "/logs/same.jsonl")
         let duplicates = [
             LogCandidate(url: url, interval: LogInterval(
-                start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(-1800),
-                evidence: .lineTimestamps)),
+                start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(-1800))),
             LogCandidate(url: url, interval: LogInterval(
-                start: now.addingTimeInterval(-3500), end: now.addingTimeInterval(-1700),
-                evidence: .lineTimestamps)),
+                start: now.addingTimeInterval(-3500), end: now.addingTimeInterval(-1700))),
         ]
         let theConnection = session(2700)
 

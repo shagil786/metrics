@@ -14,6 +14,21 @@ public enum TokenProvenance: String, Hashable, Sendable {
     case selfReported
     /// Read out of an agent's own session log by a `TokenSourceAdapter`.
     case parsedFromLog
+    /// A later pass decided this session's log is **no longer attributable to it**, and
+    /// recorded that so a figure already written stops counting.
+    ///
+    /// **Carries no counts.** A conversation's interval only grows while it runs, so a
+    /// session uniquely matched at one pass can become unattributable at the next: a
+    /// second MCP connection opens inside the same conversation, and the one-to-one rule
+    /// turns a clean match into a refusal for both. Without this record the store kept
+    /// showing a priced figure for a session the current rule refuses — the
+    /// confidently-wrong-dollar direction, reached *by* the rule that was supposed to
+    /// prevent it, and reached silently because the pass that knew better was discarded.
+    ///
+    /// The zero counts are not a claim of zero: a withdrawal is filtered out before any
+    /// display or cost ever sees it. Storing a zero would have been the cheaper-looking
+    /// option and is exactly the conflation this module exists to refuse.
+    case parseWithdrawn
 }
 
 /// Why no figure exists. Every case is a different fact needing a different word.
@@ -85,9 +100,16 @@ extension TokenUsageRecord {
     /// Keying them apart would count the earlier prefix twice, which is the unsound
     /// escalation figure the README documents and segments deliberately do not claim
     /// to fix.
+    ///
+    /// `parseWithdrawn` keys on nothing but its provenance, and that is the whole of what
+    /// it must do: a withdrawal is about the *session's* parse as a whole, not about any
+    /// one model, so it occupies one slot of its own rather than competing with a model
+    /// id. No `parsedFromLog` record can land in that slot — its provenance differs —
+    /// so a withdrawal can never shadow a reading, which is what keeps this additive and
+    /// free of a schema change.
     var foldKey: String {
         switch provenance {
-        case .selfReported: return ""
+        case .selfReported, .parseWithdrawn: return ""
         case .parsedFromLog: return modelID
         }
     }
@@ -254,13 +276,52 @@ public enum TokenUsage: Hashable, Sendable {
     /// Latest-per-segment, not a sum: agents report cumulative totals, so summing
     /// three reports of the same session counts the first two twice.
     public static func aggregating(_ records: [TokenUsageRecord]) -> TokenUsage {
+        let live = liveRecords(records)
         // Empty in, empty out: no records means no segment won, which the guard
         // reports as `awaitingFirstReport` rather than a zero.
-        let segments = segments(from: records)
-        guard !segments.isEmpty else {
-            return .notReported(reason: .awaitingFirstReport)
+        guard !live.isEmpty else {
+            // **Records exist but none survived** — every reading a withdrawal has
+            // superseded. That is not "nothing has reported": something did, and a later
+            // pass said it cannot be attributed. Reporting it as `awaitingFirstReport`
+            // would tell the user to wait for a report that has already arrived and been
+            // withdrawn, which is advice that cannot help.
+            return records.contains { $0.provenance == .parseWithdrawn }
+                ? .notReported(reason: .ambiguousMatch)
+                : .notReported(reason: .awaitingFirstReport)
         }
-        return .reported(segments)
+        return .reported(segments(from: live))
+    }
+
+    /// The records the fold keeps, with any reading a withdrawal has superseded dropped.
+    ///
+    /// **The single place a withdrawal is applied**, because the sessions list and a
+    /// single-session read both read records and both price them: a rule written twice
+    /// here is the same defect segments fixed, where two surfaces answered the same
+    /// question separately and held in agreement by nothing.
+    static func liveRecords(_ records: [TokenUsageRecord]) -> [TokenUsageRecord] {
+        let folded = latestPerSegment(records)
+        guard let withdrawal = folded.first(where: { $0.provenance == .parseWithdrawn }) else {
+            return folded
+        }
+        // **`<=`, so a withdrawal wins a timestamp tie.** The fold breaks equal
+        // timestamps by keeping the earlier element; here the absence and the reading
+        // describe the same instant, and between "a figure we once believed" and "we no
+        // longer can" the absence is the safer answer. This is a deliberate exception to
+        // that convention and it is the only one.
+        // **Dropped, never passed through.** A withdrawal is evidence about a reading, not
+        // a reading: kept in the live set it would become a segment of its own — a model
+        // named `""` reporting zero — which is the conflation this type exists to refuse.
+        //
+        // And it touches **only the parse**. A self-report is a different source with its
+        // own evidence, and losing the log's claim on a conversation says nothing about
+        // what an agent reported about its own usage. Dropping both would turn "we can no
+        // longer attribute the log" into "the session reported nothing", which is a
+        // different and much stronger claim.
+        return folded.filter { record in
+            guard record.provenance != .parseWithdrawn else { return false }
+            guard record.provenance == .parsedFromLog else { return true }
+            return record.recordedAt > withdrawal.recordedAt
+        }
     }
 
     /// The fold's records read as segments.
@@ -271,7 +332,7 @@ public enum TokenUsage: Hashable, Sendable {
     /// each spelled out its own mapping, the two could drift and the same session
     /// would cost two different amounts depending on which API asked.
     public static func segments(from records: [TokenUsageRecord]) -> [TokenUsageSegment] {
-        latestPerSegment(records).map { record in
+        liveRecords(records).map { record in
             TokenUsageSegment(
                 modelID: record.modelID, input: record.input, output: record.output,
                 cacheRead: record.cacheRead, reasoning: record.reasoning,

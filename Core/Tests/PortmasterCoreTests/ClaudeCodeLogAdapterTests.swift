@@ -172,6 +172,12 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
     /// production uses rather than a number chosen for the fixture.
     private let overlap: TimeInterval = 60 * 60
 
+    /// Every log in a fixture tree, unfiltered — the enumeration half on its own, so a
+    /// test about what the adapter *reads* does not also depend on the matcher.
+    private func found(_ root: URL) -> [LogCandidate] {
+        ClaudeCodeLogAdapter(projectsRoot: root).logCandidates(newerThan: nil)
+    }
+
     /// A connection made at an absolute instant, for placing one inside a conversation
     /// whose own times are absolute too.
     private func connected(_ at: Date) -> (id: UUID, connectedAt: Date) {
@@ -188,18 +194,12 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         try writeLog(realSummary, in: root, name: "live", modified: now.addingTimeInterval(-30))
         try writeLog(realSummary, in: root, name: "ancient", modified: now.addingTimeInterval(-90 * 24 * 3600))
 
-        let found = ClaudeCodeLogAdapter(projectsRoot: root).logCandidates()
-        XCTAssertEqual(found.map(\.url.lastPathComponent), ["ancient.jsonl", "live.jsonl"])
-        // Both ends of the interval must be the file's real mtime, since neither log
-        // carries a line timestamp — see the fallback test for why that is labelled.
-        let live = try XCTUnwrap(found.first { $0.url.lastPathComponent == "live.jsonl" })
-        let onDisk = try XCTUnwrap(
-            (try FileManager.default.attributesOfItem(
-                atPath: live.url.path
-            )[.modificationDate]) as? Date
-        )
-        XCTAssertEqual(try XCTUnwrap(live.interval).start.timeIntervalSince1970,
-                       onDisk.timeIntervalSince1970, accuracy: 1)
+        let candidates = found(root)
+        XCTAssertEqual(candidates.map(\.url.lastPathComponent), ["ancient.jsonl", "live.jsonl"])
+        // Both are listed — age is the matcher's question — and neither is *placed*, since
+        // `realSummary` carries no line timestamp. Listed-and-unplaced is the honest shape
+        // for a log nothing can put in time.
+        XCTAssertTrue(candidates.allSatisfy { $0.interval == nil })
     }
 
     // MARK: - Where the interval comes from
@@ -216,12 +216,9 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         let written = Date().addingTimeInterval(-90 * 24 * 3600)
         try writeLog(timestampedLog, in: root, name: "conversation", modified: written)
 
-        let found = try XCTUnwrap(
-            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first
-        )
-        let interval = try XCTUnwrap(found.interval)
+        let candidate = try XCTUnwrap(found(root).first)
+        let interval = try XCTUnwrap(candidate.interval)
 
-        XCTAssertEqual(interval.evidence, .lineTimestamps)
         XCTAssertEqual(
             interval.start.timeIntervalSince1970,
             Self.conversationStart.timeIntervalSince1970, accuracy: 0.002
@@ -230,10 +227,14 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
             interval.end.timeIntervalSince1970,
             Self.conversationEnd.timeIntervalSince1970, accuracy: 0.002
         )
-        // And not the mtime the file was deliberately given.
-        XCTAssertNotEqual(
-            interval.start.timeIntervalSince1970,
-            written.timeIntervalSince1970, accuracy: 60
+        // And not the mtime the file was deliberately given. **Asserted as a difference
+        // from the offset this test chose**, rather than against a fixed instant: an
+        // earlier version pinned a hardcoded epoch, and around 2027-01-02 the two coincide
+        // and the assertion starts failing for a reason that has nothing to do with the
+        // code under it.
+        XCTAssertGreaterThan(
+            abs(interval.start.timeIntervalSince(written)), 60 * 24 * 3600,
+            "the interval came from the log's lines, not from the file's mtime"
         )
     }
 
@@ -252,7 +253,7 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         """, in: root, name: "jumbled")
 
         let interval = try XCTUnwrap(
-            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates(newerThan: nil).first?.interval
         )
 
         XCTAssertEqual(
@@ -266,46 +267,153 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         )
     }
 
-    /// **A log with no line timestamps falls back to its file metadata, and says so.**
+    /// **A log with no line timestamps is not placed at all.**
     ///
     /// The real observed summary line is exactly this shape — a `modelUsage` line with no
-    /// `timestamp` — so the fallback is not hypothetical. It is a *point* where a span is
-    /// wanted, and `evidence` is the only thing stopping a caller reading it as the
-    /// interval it is not. A weaker claim wearing a stronger claim's name is how a
-    /// plausible wrong number ships.
-    func testALogWithNoLineTimestampsFallsBackToFileMetadataAndSaysSo() throws {
+    /// `timestamp` — so the refusal is not hypothetical. The file is *still listed*, so a
+    /// diagnostic can see that a log exists here and cannot be placed; what it cannot do is
+    /// match anything.
+    ///
+    /// **Why no fallback to the modification time.** There was one, and it was removed: a
+    /// point where a span is wanted cannot answer a containment question, and the only way
+    /// to make it answer was to pad it — at which point a `±1h` window built from one
+    /// filesystem timestamp was reporting `.unique` confidently. That is the rule this
+    /// whole change replaced, rebuilt inside the new code. It could not be carried as
+    /// weaker evidence either: `TokenUsageRecord` has no column for it and adding one is a
+    /// schema migration.
+    func testALogWithNoLineTimestampsIsListedButNotPlaced() throws {
+        let root = try makeRoot()
+        try writeLog(realSummary, in: root, name: "no-stamps", modified: Date().addingTimeInterval(-45 * 60))
+
+        let candidates = found(root)
+
+        XCTAssertEqual(candidates.count, 1, "a log here that cannot be placed is still visible")
+        XCTAssertNil(candidates.first?.interval)
+    }
+
+    /// …and the matcher refuses it, rather than matching a point padded into a window.
+    func testAnUnplacedLogMatchesNothingEvenWithAConnectionRightAtItsMtime() throws {
         let root = try makeRoot()
         let modified = Date().addingTimeInterval(-45 * 60)
         try writeLog(realSummary, in: root, name: "no-stamps", modified: modified)
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
-        let interval = try XCTUnwrap(
-            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+        // A connection at the file's own modification time — the most favourable moment
+        // any fallback could be handed.
+        let atItsMtime = session(now: Date(), connectedAgo: 45 * 60)
+        XCTAssertEqual(
+            run(adapter: adapter, sessions: [atItsMtime], now: Date())[atItsMtime.id],
+            .ambiguous(count: 0),
+            "one filesystem timestamp cannot place a connection inside a conversation"
         )
-
-        XCTAssertEqual(interval.evidence, .fileModification)
-        // Both ends are the one timestamp there is, so the "span" has no width — which is
-        // the fact a caller needs and cannot infer from the numbers alone.
-        XCTAssertEqual(interval.start.timeIntervalSince1970, interval.end.timeIntervalSince1970)
-        XCTAssertEqual(interval.start.timeIntervalSince1970, modified.timeIntervalSince1970, accuracy: 1)
     }
 
-    /// A timestamp that is not a timestamp must not become one. Quoted prose inside a
-    /// message body can contain the marker; the shape check is what keeps that from
-    /// inventing a conversation.
-    func testAMarkerInProseIsNotReadAsATimestamp() throws {
+    /// A `"timestamp"` key whose value is not a timestamp must not become one — and the
+    /// fixture has to be able to fail, which the earlier version of this test could not.
+    /// It used quoted prose inside a message body, where JSON's escaping means the marker
+    /// bytes never appear at all; it would have passed with the parser replaced by
+    /// `return 0`. A **nested** object with its own `timestamp` key does put the marker in
+    /// the bytes, and its value is free to be anything.
+    func testATimestampKeyWithANonTimestampValueIsNotReadAsOne() throws {
         let root = try makeRoot()
-        let modified = Date().addingTimeInterval(-45 * 60)
         try writeLog("""
-        {"type":"user","message":{"role":"user","content":"why is \"timestamp\":\"nonsense\" in my log"}}
+        {"meta":{"timestamp":"last tuesday"},"type":"user"}
+        {"nested":{"deeper":{"timestamp":null}},"type":"assistant"}
         {"modelUsage":{"claude-fable-5":{"inputTokens":0,"outputTokens":16739}}}
-        """, in: root, name: "prose", modified: modified)
+        """, in: root, name: "not-a-timestamp")
 
-        let interval = try XCTUnwrap(
-            ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().first?.interval
+        let candidates = found(root)
+
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertNil(candidates.first?.interval, "a key that looks right is not a timestamp")
+    }
+
+    /// **The key is found as a key, not as a fixed literal.** JSON-legal whitespace around
+    /// the colon is legal, and matching `"timestamp":"` byte-for-byte dropped every
+    /// timestamp in every file written that way — which is not one file failing to parse
+    /// but the whole feature reverting to `mtime`, silently, with every test still green.
+    func testJSONLegalWhitespaceAroundTheColonIsTolerated() throws {
+        let root = try makeRoot()
+        try writeLog("""
+        { "type" : "assistant" , "timestamp" : "2026-10-03T22:31:52.452Z" }
+        {"type":"assistant","timestamp":"2026-10-03T22:58:30.007Z"}
+        """, in: root, name: "spaced")
+
+        let interval = try XCTUnwrap(found(root).first?.interval)
+
+        XCTAssertEqual(interval.start.timeIntervalSince1970,
+                       Self.conversationStart.timeIntervalSince1970, accuracy: 0.002)
+        XCTAssertEqual(interval.end.timeIntervalSince1970,
+                       Self.conversationEnd.timeIntervalSince1970, accuracy: 0.002)
+    }
+
+    /// **Six or more fractional digits must not drop the timestamp.**
+    ///
+    /// The earlier parser stopped accumulating and left its cursor on a digit rather than
+    /// on the `Z`, so the shape check rejected the whole value — and a log whose timestamps
+    /// all carried six digits was unplaced, silently. Digits are now always consumed; only
+    /// the arithmetic stops, at 100 ns.
+    func testHighPrecisionTimestampsArePlacedNotRejected() throws {
+        let root = try makeRoot()
+        try writeLog("""
+        {"type":"assistant","timestamp":"2026-10-03T22:31:52.452123789Z"}
+        {"type":"assistant","timestamp":"2026-10-03T22:58:30.000000001Z"}
+        {"type":"mode","mode":"normal"}
+        """, in: root, name: "precise")
+
+        let interval = try XCTUnwrap(found(root).first?.interval)
+
+        XCTAssertEqual(interval.start.timeIntervalSince1970,
+                       Self.conversationStart.timeIntervalSince1970, accuracy: 0.002)
+        // 22:58:30 exactly: the trailing digits are all zeros, so the end of this
+        // conversation is the whole second.
+        XCTAssertEqual(interval.end.timeIntervalSince1970, 1_791_068_310, accuracy: 0.002)
+    }
+
+    /// **The precision the parser accepts, stated as a test.** Nine fractional digits are
+    /// consumed and truncated at 100 ns, so the value is the instant to well under a
+    /// microsecond — finer than anything this module prints. What it must never be is
+    /// dropped, which is what the previous bound did.
+    func testFractionalSecondsAreTruncatedRatherThanDropped() {
+        let span = ClaudeCodeLogAdapter.lineTimestampSpan(
+            in: Data(#"{"timestamp":"2026-10-03T22:31:52.452123456Z"}"#.utf8)
         )
+        XCTAssertNotNil(span)
+        // **Exactly six of the nine digits contribute** — `.452123` — and the remaining
+        // three are consumed without contributing. That is the stated precision, and it is
+        // a deliberate one: finer than 100 ns is finer than anything this module prints,
+        // and consuming the rest without rejecting is what stops a high-precision log from
+        // being unplaced.
+        XCTAssertEqual(try XCTUnwrap(span).earliest,
+                       Self.conversationStart.timeIntervalSince1970 + 0.000123,
+                       accuracy: 1e-9)
+    }
 
-        XCTAssertEqual(interval.evidence, .fileModification, "prose is not a timestamp")
-        XCTAssertEqual(interval.start.timeIntervalSince1970, modified.timeIntervalSince1970, accuracy: 1)
+    /// **A year before 1970 is refused rather than computed.** It cannot occur in a log,
+    /// and the branch that would have handled it subtracted a whole year *and* the current
+    /// month, putting `1969-12-31T23:59:59Z` 365 days out — the one input here that
+    /// produced a *wrong interval* rather than a fallback.
+    func testAPre1970TimestampIsRefusedRatherThanMiscomputed() {
+        let wrong = ClaudeCodeLogAdapter.lineTimestampSpan(
+            in: Data(#"{"timestamp":"1969-12-31T23:59:59.000Z"}"#.utf8)
+        )
+        XCTAssertNil(wrong, "refused beats 365 days out")
+
+        // And the epoch itself is exact, which is what the branch used to break.
+        let origin = ClaudeCodeLogAdapter.lineTimestampSpan(
+            in: Data(#"{"timestamp":"1970-01-01T00:00:00.000Z"}"#.utf8)
+        )
+        XCTAssertEqual(try XCTUnwrap(origin).earliest, 0)
+    }
+
+    /// **An offset-zone timestamp is refused, not read as UTC.** `+05:30` is legal JSON and
+    /// legal ISO-8601; the shape check stops at the `Z`, so the value is dropped rather
+    /// than silently five and a half hours out. The consequence is the whole file going
+    /// unplaced, which is the honest direction and also the reason to say so here.
+    func testAnOffsetZoneTimestampIsRefusedNotReadAsUTC() {
+        XCTAssertNil(ClaudeCodeLogAdapter.lineTimestampSpan(
+            in: Data(#"{"timestamp":"2026-10-03T22:31:52.452+05:30"}"#.utf8)
+        ))
     }
 
     // MARK: - A connection, against a real interval
@@ -351,46 +459,49 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         )
     }
 
-    func testALogModifiedDuringTheWindowIsACandidate() throws {
+    func testALogWrittenDuringTheConnectionIsAMatch() throws {
         let root = try makeRoot()
-        let now = Date()
-        try writeLog(realSummary, in: root, name: "match", modified: now.addingTimeInterval(-30))
-        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+        try writeLog(timestampedLog, in: root, name: "match")
 
-        let theSession = session(now: now, connectedAgo: 120)
-        guard case .unique(let candidate) = run(adapter: adapter, sessions: [theSession], now: now)[theSession.id] else {
-            return XCTFail("a log written inside the window is this session's")
+        let theSession = connected(Self.conversationStart.addingTimeInterval(500))
+        let outcome = run(
+            adapter: ClaudeCodeLogAdapter(projectsRoot: root), sessions: [theSession], now: Date()
+        )
+        guard case .unique(let candidate) = outcome[theSession.id] else {
+            return XCTFail("a connection inside the conversation is that conversation's")
         }
         XCTAssertEqual(candidate.url.lastPathComponent, "match.jsonl")
     }
 
-    func testALogFarOutsideTheWindowIsNotACandidate() throws {
+    func testAConversationFromLongBeforeTheConnectionIsNotAMatch() throws {
         let root = try makeRoot()
-        let now = Date()
-        try writeLog(realSummary, in: root, name: "stale", modified: now.addingTimeInterval(-90 * 24 * 3600))
-        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+        try writeLog(timestampedLog, in: root, name: "stale")
 
-        let theSession = session(now: now, connectedAgo: 120)
+        let theSession = session(now: Date(), connectedAgo: 120)
         XCTAssertEqual(
-            run(adapter: adapter, sessions: [theSession], now: now)[theSession.id],
+            run(
+                adapter: ClaudeCodeLogAdapter(projectsRoot: root),
+                sessions: [theSession], now: Date()
+            )[theSession.id],
             .ambiguous(count: 0),
-            "a three-month-old log is not this session's"
+            "a conversation from October is not today's connection"
         )
     }
 
     /// The case the uniqueness rule exists for: two agents running side by side both
     /// overlap one window. Both must be returned so the matcher can refuse — picking
     /// one here is the whole bug the rule prevents.
-    func testTwoOverlappingLogsBothComeBackSoTheMatcherCanRefuse() throws {
+    func testTwoConversationsSpanningOneConnectionBothComeBackSoTheMatcherCanRefuse() throws {
         let root = try makeRoot()
-        let now = Date()
-        try writeLog(realSummary, in: root, name: "agent-a", modified: now.addingTimeInterval(-30))
-        try writeLog(realSummary, in: root, name: "agent-b", modified: now.addingTimeInterval(-20))
-        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+        try writeLog(timestampedLog, in: root, name: "agent-a")
+        try writeLog(timestampedLog, in: root, name: "agent-b")
 
-        let theSession = session(now: now, connectedAgo: 120)
+        let theSession = connected(Self.conversationStart.addingTimeInterval(500))
         XCTAssertEqual(
-            run(adapter: adapter, sessions: [theSession], now: now)[theSession.id],
+            run(
+                adapter: ClaudeCodeLogAdapter(projectsRoot: root),
+                sessions: [theSession], now: Date()
+            )[theSession.id],
             .ambiguous(count: 2)
         )
     }
@@ -402,41 +513,86 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         try realSummary.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: url.path)
 
-        XCTAssertTrue(ClaudeCodeLogAdapter(projectsRoot: root).logCandidates().isEmpty)
+        XCTAssertTrue(ClaudeCodeLogAdapter(projectsRoot: root).logCandidates(newerThan: nil).isEmpty)
     }
 
     func testMissingRootIsNoCandidatesNotACrash() {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("no-such-root-\(UUID().uuidString)")
-        XCTAssertTrue(ClaudeCodeLogAdapter(projectsRoot: missing).logCandidates().isEmpty)
+        XCTAssertTrue(ClaudeCodeLogAdapter(projectsRoot: missing).logCandidates(newerThan: nil).isEmpty)
     }
 
-    /// A file stamped in the future **is** enumerated, and the matcher refuses it.
-    ///
-    /// A machine whose clock is wrong, or a log restored from a backup, produces exactly
-    /// this. It used to be dropped here, behind a second `overlap` the adapter carried
-    /// alongside the poller's own: an upper bound configured in two places, which
-    /// silently narrowed the matcher's window whenever it was set smaller, for no saving
-    /// at all — `modificationDate(of:)` already reads every file's attributes. The
-    /// matcher already has the bound, and the file has to reach it either way.
-    func testAFutureStampedLogIsEnumeratedAndThenRefusedByTheMatcher() throws {
+    /// **The age filter is a lower bound only, and it lives in the matcher for the upper
+    /// one.** A file stamped in the future is enumerated and the matcher refuses it, since
+    /// a conversation cannot have been written before `now`. That bound was once applied
+    /// here behind a second `overlap`, which silently narrowed the matcher's window
+    /// whenever it was set smaller — for no saving, since reading the modification date
+    /// happens either way.
+    func testAFutureStampedConversationIsEnumeratedAndThenRefusedByTheMatcher() throws {
         let root = try makeRoot()
         let now = Date()
-        try writeLog(realSummary, in: root, name: "live", modified: now)
-        try writeLog(realSummary, in: root, name: "skewed", modified: now.addingTimeInterval(7200))
+        try writeLog(timestampedLog, in: root, name: "live",
+                     modified: now.addingTimeInterval(-30))
+        try writeLog(timestampedLog, in: root, name: "skewed",
+                     modified: now.addingTimeInterval(7200))
         let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
         XCTAssertEqual(
-            adapter.logCandidates().map(\.url.lastPathComponent),
+            found(root).map(\.url.lastPathComponent),
             ["live.jsonl", "skewed.jsonl"],
-            "enumeration applies no age predicate at all"
+            "enumeration applies no age predicate of its own"
         )
 
-        let theSession = session(now: now, connectedAgo: 120)
-        guard case .unique(let candidate) = run(adapter: adapter, sessions: [theSession], now: now)[theSession.id] else {
-            return XCTFail("the live log is the only matchable file")
-        }
-        XCTAssertEqual(candidate.url.lastPathComponent, "live.jsonl")
+        // A connection two hours from now shares the skewed file's interval and nothing
+        // else, so it is refused by the matcher's own `now` bound.
+        let skewed = connected(now.addingTimeInterval(7200))
+        XCTAssertEqual(
+            run(adapter: adapter, sessions: [skewed], now: now)[skewed.id],
+            .ambiguous(count: 0)
+        )
+    }
+
+    /// **The cost bound: a file older than the pass could match is never read.**
+    ///
+    /// `logCandidates()` without a bound reads every log on the machine at any age, and
+    /// the scan is 2.63 ms per 712 KB — so ~300 conversations is ~0.8 s per pass and ~1 GB
+    /// of logs is ~3.7 s, roughly 12% of a core continuously, spent on intervals the
+    /// matcher throws away. The bound is safe because a conversation's interval cannot
+    /// reach past its own last write: a file whose `mtime` predates the earliest instant
+    /// any session could match has an interval that ends before it.
+    func testTheAgeFilterExcludesFilesThePassCouldNotMatch() throws {
+        let root = try makeRoot()
+        let now = Date()
+        try writeLog(timestampedLog, in: root, name: "recent",
+                     modified: now.addingTimeInterval(-30 * 60))
+        try writeLog(timestampedLog, in: root, name: "ancient",
+                     modified: now.addingTimeInterval(-90 * 24 * 3600))
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+
+        XCTAssertEqual(found(root).count, 2, "unbounded, both are read")
+
+        let bound = now.addingTimeInterval(-60 * 60)
+        let bounded = adapter.logCandidates(newerThan: bound)
+        XCTAssertEqual(bounded.map(\.url.lastPathComponent), ["recent.jsonl"])
+    }
+
+    /// And the bound must not drop a file the matcher *would* have accepted: a conversation
+    /// older than the bound is unreachable by construction, so the filter can only be
+    /// wrong by being too eager, and this pins that it is not.
+    func testTheAgeFilterKeepsEveryConversationTheMatcherWouldMatch() throws {
+        let root = try makeRoot()
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+        let connections = [
+            connected(Self.conversationStart.addingTimeInterval(500)),
+            session(now: Date(), connectedAgo: 90 * 24 * 3600),
+        ]
+        let bound = connections.map(\.connectedAt).min()!.addingTimeInterval(-overlap)
+
+        // Written after the bound is computed but stamped well before it, so only the
+        // interval can make it matchable — and it must.
+        try writeLog(timestampedLog, in: root, name: "boundary",
+                     modified: bound.addingTimeInterval(1))
+        XCTAssertEqual(adapter.logCandidates(newerThan: bound).count, 1)
     }
 
     // MARK: - The runner, end to end from a real file
@@ -444,34 +600,38 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
     /// Two logs in one window must produce `ambiguousMatch`, never a pick.
     func testTwoLogsInOneWindowRefuseRatherThanPick() throws {
         let root = try makeRoot()
-        let now = Date()
-        try writeLog(realSummary, in: root, name: "a", modified: now.addingTimeInterval(-30))
-        try writeLog(realSummary, in: root, name: "b", modified: now.addingTimeInterval(-20))
-        let theSession = session(now: now, connectedAgo: 120)
+        try writeLog(timestampedLog, in: root, name: "a")
+        try writeLog(timestampedLog, in: root, name: "b")
+        let theSession = connected(Self.conversationStart.addingTimeInterval(500))
         let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
         let outcome = TokenSourceRunner(adapter: adapter).run(
             sessionID: theSession.id,
-            match: run(adapter: adapter, sessions: [theSession], now: now)[theSession.id] ?? .ambiguous(count: 0)
+            match: run(
+                adapter: adapter, sessions: [theSession], now: Date()
+            )[theSession.id] ?? .ambiguous(count: 0)
         )
         guard case .notReported(let reason) = outcome else {
-            return XCTFail("two logs must not produce a figure, got \(outcome)")
+            return XCTFail("two conversations must not produce a figure, got \(outcome)")
         }
         XCTAssertEqual(reason, .ambiguousMatch)
     }
 
     func testOneLogProducesOneRecordPerModel() throws {
         let root = try makeRoot()
-        let now = Date()
         try writeLog("""
+        {"type":"assistant","timestamp":"2026-10-03T22:31:52.452Z"}
         {"modelUsage":{"model-a":{"inputTokens":100,"outputTokens":50},"model-b":{"inputTokens":200,"outputTokens":75}}}
-        """, in: root, name: "escalated", modified: now.addingTimeInterval(-30))
-        let theSession = session(now: now, connectedAgo: 120)
+        {"type":"assistant","timestamp":"2026-10-03T22:58:30.007Z"}
+        """, in: root, name: "escalated")
+        let theSession = connected(Self.conversationStart.addingTimeInterval(500))
         let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
         let outcome = TokenSourceRunner(adapter: adapter).run(
             sessionID: theSession.id,
-            match: run(adapter: adapter, sessions: [theSession], now: now)[theSession.id] ?? .ambiguous(count: 0)
+            match: run(
+                adapter: adapter, sessions: [theSession], now: Date()
+            )[theSession.id] ?? .ambiguous(count: 0)
         )
         guard case .reported(let records) = outcome else {
             return XCTFail("expected records, got \(outcome)")
@@ -506,14 +666,15 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
     /// every test here would still pass.
     func testASingleSessionWithASingleLogIsCounted() throws {
         let root = try makeRoot()
-        let now = Date()
-        try writeLog(realSummary, in: root, name: "only", modified: now.addingTimeInterval(-30))
-        let theSession = session(now: now, connectedAgo: 120)
+        try writeLog(timestampedLog, in: root, name: "only")
+        let theSession = connected(Self.conversationStart.addingTimeInterval(500))
         let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
 
         let outcome = TokenSourceRunner(adapter: adapter).run(
             sessionID: theSession.id,
-            match: run(adapter: adapter, sessions: [theSession], now: now)[theSession.id] ?? .ambiguous(count: 0)
+            match: run(
+                adapter: adapter, sessions: [theSession], now: Date()
+            )[theSession.id] ?? .ambiguous(count: 0)
         )
         guard case .reported(let records) = outcome, let record = records.first else {
             return XCTFail("expected a figure, got \(outcome)")

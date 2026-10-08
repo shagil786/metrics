@@ -27,45 +27,70 @@
 // THE MATCHING PROBLEM
 //
 // A Portmaster session is an MCP connection UUID. This log is named for Claude Code's
-// own session id. **The two share no key.** The only correlation is time: a log whose
-// activity overlaps the connection's lifetime is a candidate. That is a heuristic, and
-// a heuristic that picks when it is unsure produces a number that is confidently
-// wrong — so `logCandidates` returns every log it can see and `AgentLogMatcher`
-// applies the uniqueness rule. Two agents running at once overlap one window, and
-// that is reported as an absence rather than resolved by a guess.
+// own session id. **The two share no key.** The only correlation is time, and the
+// question is which times: `AgentLogMatcher` asks whether the conversation's own interval
+// contains the moment the connection opened. A connection during the conversation is that
+// conversation's; yesterday's connection is not, because yesterday is not inside it.
 //
 // HONEST LIMITS OF WHAT COMES BACK
 //
-// These are the limits this adapter has. They are not a complete account of what is
-// wrong with parsed figures, and the ones below are not the whole list.
+// These are the limits this adapter has. They are not a complete account of what is wrong
+// with parsed figures, and the ones below are not the whole list.
 //
 // - **THE FIGURE IS THE WHOLE CONVERSATION, NOT THE CONNECTED WINDOW.** This is the
 //   largest of them and it is not about matching at all. `parse` returns cumulative
-//   totals for the entire file, and a Claude Code log is one continuously-written file
-//   per conversation — so the matcher proves only that the file's *last write* fell
-//   inside a connection's window, which says nothing about where the conversation
-//   began. A conversation that started an hour before the connection opened and ran for
-//   twenty minutes after it closed contributes **all** of its tokens to the one session
-//   whose window happened to contain its final timestamp. There is no per-window
-//   subtraction to apply: the format carries no session boundary and the file records
-//   nothing about when any given line's tokens were spent.
+//   totals for the entire file, and a Claude Code log is one continuously-written file per
+//   conversation. The matcher establishes that the connection opened *during* the
+//   conversation — it knows where the conversation began and when it ended, and that is
+//   genuinely new — and none of that says *when any given token was spent*. A connection
+//   that opened an hour before the first logged line still matches, and is billed for the
+//   whole conversation including the part before it arrived. There is no subtraction to
+//   apply: the format carries no per-line attribution of which model or call a token
+//   belongs to across a session boundary, so there is no boundary to subtract at.
 //
 //   **It concentrates where there is no self-report.** `preferredProvenance` prefers
 //   `selfReported` and bills the parsed figure only where none exists, so the sessions
 //   most exposed to this are exactly the ones whose agent called no `report_usage`.
 //
-// - **`.ambiguousMatch` will be common on a machine with several sessions recorded**, and
-//   that is the rule working rather than a failure to be tuned away. See
-//   `AgentLogMatcher`: a file more than one session could claim belongs to none of them.
-// - **A log whose shape has changed stays `unrecognizedFormat`** — never a partial
-//   parse, which would be a plausible wrong number.
+// - **One long conversation plus any second Portmaster connection inside it yields no
+//   figures at all.** This is the shape of near-inertness the interval rule was meant to
+//   remove, and it survives in a narrower form: one 8-hour conversation with four
+//   connections inside it gives `ambiguousMatch` for all four, while four separate
+//   20-minute conversations give a unique match for all four. So the feature is live or
+//   inert depending on **whether the agent reused its MCP connection** — and connections
+//   are re-established on `/mcp` reconnect, server restart, Portmaster restart, idle
+//   timeout and sleep/wake. Nothing can be done about it here: the conversation is one
+//   file, the tokens are one cumulative total, and there is no way to split it between two
+//   connections without a per-call boundary the format does not carry.
+//
+// - **A log with no line timestamps is never placed.** Every line of this machine's log
+//   carries `timestamp` on 362 of 423 lines and none of the other 61 matter, but a log
+//   whose lines carry none cannot be placed in time at all and matches nothing. There is
+//   deliberately no fallback to the file's modification time: a point where a span is
+//   wanted cannot answer a question about containment, and padding one to make it answer
+//   rebuilt the rule this replaced.
+//
+// - **`.ambiguousMatch` means one of two different things**, and `UsageUnavailableReason`
+//   has one case for both, because a withdrawal record cannot carry which: one
+//   conversation several connections fell inside, or several conversations one
+//   connection fell inside. Neither is a tie to break.
+//
+// - **A log whose shape has changed stays `unrecognizedFormat`** — never a partial parse,
+//   which would be a plausible wrong number.
+//
 // - **Wiring this in makes two previously unreachable limitations reachable**: the
 //   self-report/partial-log-parse overlap, which now *inflates* where it previously
 //   *blocked* a figure (pinned by a test named `…ThatFigureIsKnownWrong`), and the 1%
 //   disagreement tolerance, which has never been validated against real disagreement.
 //   Neither is fixed by parsing a log, and both are documented in the README.
 //
-// WHAT IS *NOT* TAKEN FROM THE LOG
+// - **A figure already written is withdrawn, not left standing.** A conversation's
+//   interval only grows, so a session uniquely matched at one pass can become
+//   unattributable at the next. The pass that knows records that as
+//   `TokenProvenance.parseWithdrawn` and the fold honours it, so the store stops showing
+//   a priced figure for a session the current rule refuses.
+//
+// // WHAT IS *NOT* TAKEN FROM THE LOG
 //
 // `costUSD` and `totalCostUSD` are read and then ignored. They are Claude Code's
 // pricing, and Portmaster's figures come from the user's own price table; adopting
@@ -101,14 +126,33 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
     }
 
     /// Every log under the projects root, each with **the interval it was written
-    /// across**, whatever its age.
+    /// across**, filtered by age.
     ///
     /// No session is consulted, and none could be: a pass asks once and matches every
-    /// session against the result, so a method that filtered by a window would need a
-    /// session it is not given. Age is therefore not this type's decision — it is
-    /// `AgentLogMatcher`'s, and a month-old log reaches it and is dropped there, which is
-    /// the only place with the connection it would be dropped against.
-    public func logCandidates() -> [LogCandidate] {
+    /// session against the result, so a method that filtered by a session would need a
+    /// session it is not given. `newerThan` is not a session — it is the earliest instant
+    /// any session in this pass could match, which the caller derives.
+    ///
+    /// **The age filter is a cost bound, and it is safe because the interval cannot reach
+    /// past the file's own last write.** A conversation's last line was written at or
+    /// before the moment the file was last modified, so a file whose `mtime` predates
+    /// `newerThan` has an interval that ends before it, and no session at or after that
+    /// instant can be inside it. Without the filter this method reads **every** `.jsonl`
+    /// on the machine, at any age, every 30 seconds, forever — measured at 2.63 ms per
+    /// 712 KB, so ~300 conversations is ~0.8 s per pass and ~1 GB of logs is ~3.7 s,
+    /// roughly 12% of a core continuously, spent on intervals the matcher then discards.
+    /// The cost is linear in the *number* of conversations on the machine, which is the
+    /// axis that grows without limit and the one a per-conversation figure hides.
+    ///
+    /// The bound assumes a monotonic clock. A machine whose clock stepped backwards
+    /// mid-conversation could leave a line stamped after the file's last write, and such a
+    /// file would be dropped rather than matched — an absence, which is the direction
+    /// that invents nothing.
+    ///
+    /// Its cost is visibility: a log older than the bound is not listed at all, so "there
+    /// is a log here that cannot be placed" becomes "no log newer than the oldest session
+    /// worth matching". A diagnostic wanting the full tree passes `nil`.
+    public func logCandidates(newerThan: Date? = nil) -> [LogCandidate] {
         // A missing root is a machine that has never run the agent, which is an absence
         // rather than a failure, so an unwalkable directory yields nothing.
         guard let walker = FileManager.default.enumerator(
@@ -119,6 +163,10 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
 
         var candidates: [LogCandidate] = []
         for case let url as URL in walker where url.pathExtension == "jsonl" {
+            // The enumerator already carries the modification date, so this reads it
+            // rather than paying a second `attributesOfItem` per file to ask again.
+            guard let modified = modificationDate(of: url) else { continue }
+            if let newerThan, modified < newerThan { continue }
             candidates.append(LogCandidate(url: url, interval: interval(of: url)))
         }
         // Sorted by path so a caller inspecting candidates sees a stable order.
@@ -129,28 +177,20 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
 
     /// When this conversation was being written, as the log itself says.
     ///
-    /// **Line timestamps first, filesystem metadata only as a labelled fallback.** The
-    /// log's own timestamps are the only evidence that can place a connection *inside* a
-    /// conversation rather than merely near its last write — `mtime` says when the file
-    /// was last touched and nothing about when it began, which is the whole difference
-    /// between a span and a point. When no line carries one, `mtime` stands in and the
-    /// candidate says so in `evidence`, because a weaker claim wearing a stronger one's
-    /// name is how a plausible wrong number ships.
-    ///
-    /// Nil when neither source answers, which is the only case in which the file is still
-    /// listed: a log that cannot be placed is visible to a diagnostic that way, and
-    //  matches nobody.
+    /// **Line timestamps only.** The log's own timestamps are the only evidence that can
+    /// place a connection *inside* a conversation rather than merely near its last write.
+    /// A file whose lines carry none yields nil — it is listed, and it matches nobody —
+    /// because a modification time is a point where a span is wanted, and the only way to
+    /// make a point answer a containment question was to pad it into a window, which is
+    /// the rule this whole change removed.
     private func interval(of url: URL) -> LogInterval? {
-        if let data = try? Data(contentsOf: url),
-           let span = Self.lineTimestampSpan(in: data) {
-            return LogInterval(
-                start: Date(timeIntervalSince1970: span.earliest),
-                end: Date(timeIntervalSince1970: span.latest),
-                evidence: .lineTimestamps
-            )
-        }
-        guard let modified = modificationDate(of: url) else { return nil }
-        return LogInterval(start: modified, end: modified, evidence: .fileModification)
+        guard let data = try? Data(contentsOf: url),
+              let span = Self.lineTimestampSpan(in: data)
+        else { return nil }
+        return LogInterval(
+            start: Date(timeIntervalSince1970: span.earliest),
+            end: Date(timeIntervalSince1970: span.latest)
+        )
     }
 
     private func modificationDate(of url: URL) -> Date? {
@@ -162,48 +202,58 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
     /// Earliest and latest of every `"timestamp"` value in a JSONL log, as epoch seconds.
     ///
     /// **A byte scan for a fixed-width ISO-8601 shape, not `JSONSerialization` per line
-    /// and not `ISO8601DateFormatter`.** Measured on this machine's 712 KB / 423-line
-    /// log, warm, 200 iterations:
+    /// and not `ISO8601DateFormatter`.** Measured on this machine's 712 KB / 423-line log,
+    /// warm, 200 iterations:
     ///
     /// | | |
     /// |---|---|
     /// | `attributesOfItem` (what a `stat` costs) | 0.04 ms |
     /// | read the whole file, touch nothing | 0.05 ms |
     /// | **this scan** | **1.05 ms** |
-    /// | read all + `ISO8601DateFormatter` per line | 33.2 ms |
+    /// | read all + `JSONSerialization` per line | 5.68 ms |
+    /// | read all + byte-split + `contains` per line | 26.53 ms |
+    /// | read all + `ISO8601DateFormatter` per line | 33.20 ms |
     ///
-    /// So reading the file is not the cost — parsing the timestamps is, and by two and a
-    /// half orders of magnitude. This is what makes the 30-second pass affordable: at
-    /// 1 ms it is 0.003% of one core per conversation, where the obvious implementation
-    /// would have been 0.03% per *line*. The cost is linear in the conversation's size,
-    /// which is stated rather than bounded: a cap would truncate the interval at an
-    /// arbitrary byte and quietly answer a different question.
+    /// Reading the file is not the cost — parsing the timestamps is, by two and a half
+    /// orders of magnitude. `logCandidates(newerThan:)` bounds *which* files are read; this
+    /// bounds what reading one costs.
     ///
-    /// **Every line is read, so out-of-order timestamps are handled** — this file has six
-    /// of them — and min and max are exact rather than the first and last line's values.
-    /// A cheaper head-and-tail read would be 0.2 ms and wrong: the last timestamped line
-    /// here is 419 of 423, and nothing guarantees a burst of lines is written in time
-    /// order.
+    /// **Every line is read, so out-of-order timestamps are handled**: this log's are not
+    /// monotonic — 6 adjacent pairs step backwards and 10 values fall below the running
+    /// maximum — and min and max are exact rather than the first and last line's values. A
+    /// cheaper head-and-tail read would be 0.19 ms and would report a span the log does not
+    /// claim: the last timestamped line here is 419 of 423, and nothing guarantees a burst
+    /// of lines is written in time order.
     ///
-    /// The marker could in principle appear inside a message body quoting it. The fixed
-    /// shape check below is what keeps that harmless — quoted prose does not parse as
-    /// `YYYY-MM-DDTHH:MM:SS` — and a miss would cost a timestamp, never invent one.
+    /// The key is found as a key, not as a literal. JSON-legal whitespace around the colon
+    /// (`"timestamp" : "…"`) is legal and appears in hand-formatted logs, and matching the
+    /// fixed literal dropped **every** timestamp in **every** such file — which is not one
+    /// file falling back to `mtime` but the whole feature reverting to the rule this change
+    /// removed, with none of it visible. The marker is scanned for as `"timestamp"` and the
+    /// separator around `:` is skipped, so the scan survives formatting.
     static func lineTimestampSpan(in data: Data) -> (earliest: Double, latest: Double)? {
         let bytes = [UInt8](data)
-        let marker = Array("\"timestamp\":\"".utf8)
+        let key = Array("\"timestamp\"".utf8)
         var earliest = Double.infinity
         var latest = -Double.infinity
         var found = false
         var index = 0
-        while index + marker.count + minimumStampLength <= bytes.count {
-            var atMarker = true
-            for offset in 0..<marker.count where bytes[index + offset] != marker[offset] {
-                atMarker = false
-                break
+        while index + key.count + minimumStampLength <= bytes.count {
+            guard matches(key, in: bytes, at: index) else {
+                index += 1
+                continue
             }
-            if atMarker,
-               let epoch = iso8601Epoch(at: bytes, index + marker.count)
-            {
+            // `"timestamp"` then JSON-legal whitespace, `:`, whitespace, then the opening
+            // quote of the value. Everything about the shape is checked, because a key that
+            // merely looks like this one — a nested object with its own `timestamp` — is
+            // common and its value may be anything at all.
+            guard let valueStart = valueStartAfterColon(
+                bytes, from: index + key.count
+            ) else {
+                index += 1
+                continue
+            }
+            if let epoch = iso8601Epoch(at: bytes, valueStart) {
                 found = true
                 if epoch < earliest { earliest = epoch }
                 if epoch > latest { latest = epoch }
@@ -213,20 +263,64 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
         return found ? (earliest, latest) : nil
     }
 
-    /// The length of `YYYY-MM-DDTHH:MM:SS` with nothing optional: **19**, which is
-    /// where the fraction and the `Z` may begin. Spelled as a constant rather than
-    /// computed because getting it wrong by one silently skips the `.` and reads the
-    /// first fraction digit as the second field — a parser that finds no timestamps and
-    /// falls back, which is exactly the sort of quiet miss this whole change is about.
+    /// The length of `YYYY-MM-DDTHH:MM:SS` with nothing optional: **19**, which is where
+    /// the fraction and the `Z` may begin. Spelled as a constant because getting it wrong
+    /// by one silently skips the `.` and reads the first fraction digit as a second field
+    /// — a parser that then finds no timestamps at all and falls back, which is exactly the
+    /// quiet miss this whole change is about, and which happened once.
     private static let minimumStampLength = 19
+
+    private static func matches(_ pattern: [UInt8], in bytes: [UInt8], at index: Int) -> Bool {
+        for offset in 0..<pattern.count where bytes[index + offset] != pattern[offset] {
+            return false
+        }
+        return true
+    }
+
+    /// Where the value begins, after `"timestamp"`, JSON-legal whitespace, `:` and more
+    /// whitespace — or nil if the key is not followed by a quoted value.
+    private static func valueStartAfterColon(_ bytes: [UInt8], from start: Int) -> Int? {
+        var cursor = start
+        func skipWhitespace() {
+            while cursor < bytes.count,
+                  bytes[cursor] == 32 || bytes[cursor] == 9
+                    || bytes[cursor] == 10 || bytes[cursor] == 13 {
+                cursor += 1
+            }
+        }
+        skipWhitespace()
+        guard cursor < bytes.count, bytes[cursor] == 58 /* : */ else { return nil }
+        cursor += 1
+        skipWhitespace()
+        guard cursor < bytes.count, bytes[cursor] == 34 /* " */ else { return nil }
+        return cursor + 1
+    }
 
     /// Epoch seconds for an ISO-8601 UTC timestamp at `start`, or nil if the bytes there
     /// are not one.
     ///
-    /// Hand-rolled rather than `ISO8601DateFormatter`, which measured 33 ms for the same
-    /// file. Days-from-epoch is counted directly instead: a log's 354 timestamps do not
-    /// need a Gregorian calendar engine, and `DateFormatter` would be both slower and a
-    /// locale dependency in the middle of a matching decision.
+    /// Hand-rolled rather than `ISO8601DateFormatter`, which measured 33 ms for this file.
+    /// Days-from-epoch is counted directly: a log's timestamps do not need a Gregorian
+    /// calendar engine, and `DateFormatter` would be both slower and a locale dependency in
+    /// the middle of a matching decision.
+    ///
+    /// **Precision accepted: any number of fractional digits, of which the first six
+    /// contribute and the rest are truncated.** The earlier version stopped accumulating
+    /// and left the cursor sitting on a digit rather than on the `Z`, so a timestamp with
+    /// six or more fractional digits was *rejected* — and a file whose timestamps all had
+    /// them fell back for the whole feature, silently. Digits are now always consumed to
+    /// the end of the fraction; only the arithmetic stops, at 100 ns, which is finer than
+    /// any figure this module prints.
+    ///
+    /// **Only `Z` is accepted, and the consequence of that is a dropped timestamp rather
+    /// than a wrong one.** An offset form (`+05:30`) is rejected, so a log written in one
+    /// contributes no interval at all and is placed by nothing. It is not read as UTC: the
+    /// shape check refuses it first.
+    ///
+    /// Years before 1970 are refused for the same reason. They cannot occur in a log, and
+    /// the branch that would have handled them subtracted a whole year *and* the current
+    /// month, putting `1969-12-31T23:59:59Z` 365 days out — the one input class here that
+    /// produced a wrong interval rather than a fallback.
     private static func iso8601Epoch(at s: [UInt8], _ start: Int) -> Double? {
         func digits(_ offset: Int, _ width: Int) -> Int? {
             var value = 0
@@ -245,23 +339,30 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
               let year = digits(start, 4), let month = digits(start + 5, 2),
               let day = digits(start + 8, 2), let hour = digits(start + 11, 2),
               let minute = digits(start + 14, 2), let second = digits(start + 17, 2),
-              (1...12).contains(month)
+              year >= 1970, (1...12).contains(month)
         else { return nil }
 
         var fraction = 0.0
         var cursor = start + minimumStampLength
-        if cursor < s.count, s[cursor] == 46 {
+        if cursor < s.count, s[cursor] == 46 /* . */ {
             cursor += 1
             var scale = 0.1
-            while cursor < s.count, s[cursor] >= 48, s[cursor] <= 57, scale > 0.000_001 {
-                fraction += Double(s[cursor] - 48) * scale
+            // Every digit is consumed; only the arithmetic stops. Leaving a digit behind
+            // would put the `Z` check below on a digit and reject the whole timestamp.
+            // **Counted, not compared against a scale.** A `scale > 1e-7` test is decided
+            // by a floating-point comparison that `1e-6 * 0.1` loses — it lands just above
+            // 1e-7 in binary — so which digits contributed depended on rounding. An
+            // integer count makes "the first six contribute" true rather than nearly true.
+            var contributing = 0
+            while cursor < s.count, s[cursor] >= 48, s[cursor] <= 57 {
+                if contributing < 6 {
+                    fraction += Double(s[cursor] - 48) * scale
+                    contributing += 1
+                }
                 scale *= 0.1
                 cursor += 1
             }
         }
-        // Only UTC is accepted, and only because it is the only shape this format uses.
-        // A log written in an offset zone would be misread as UTC — a fact about this
-        // adapter's input that belongs in its own comment, not silently absorbed here.
         guard cursor < s.count, s[cursor] == 90 /* Z */ else { return nil }
 
         let monthLengths = [31, Self.isLeapYear(year) ? 29 : 28, 31, 30, 31, 30,
@@ -271,13 +372,8 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
         else { return nil }
 
         var days = 0
-        if year >= 1970 {
-            for y in 1970..<year { days += Self.isLeapYear(y) ? 366 : 365 }
-            for m in 1..<month { days += monthLengths[m - 1] }
-        } else {
-            for y in year..<1970 { days -= Self.isLeapYear(y) ? 366 : 365 }
-            for m in month...12 { days -= monthLengths[m - 1] }
-        }
+        for year in 1970..<year { days += Self.isLeapYear(year) ? 366 : 365 }
+        for month in 1..<month { days += monthLengths[month - 1] }
         days += day - 1
         return Double(days) * 86_400 + Double(hour * 3600 + minute * 60 + second) + fraction
     }

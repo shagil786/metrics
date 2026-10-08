@@ -1089,10 +1089,24 @@ private struct SessionLine: View {
             case .logUnreadable: return "log unreadable"
             case .unrecognizedFormat: return "log format unknown"
             case .awaitingFirstReport: return "not reported yet"
-            // Two agent logs overlap this session and nothing ties either to it.
-            // Said plainly rather than as a dash, because "which one?" is the whole
-            // explanation and the user may be able to resolve it by closing one.
-            case .ambiguousMatch: return "2 logs match"
+            // **One state, two causes, so the string names the state and not a cause.**
+            // `ambiguousMatch` means either one conversation that several connections fell
+            // inside, or several conversations one connection fell inside — and the second
+            // reading, "2 logs match", was wrong for the first, which is the ordinary case:
+            // a user with one agent and two MCP connections reads "2 logs match", looks for
+            // two, finds one, and concludes the tool is broken. The hardcoded `2` was
+            // loose for five candidates long before it and is categorically wrong now.
+            //
+            // Neither cause is an action the user can take — a Portmaster MCP connection is
+            // not something a person closes, and there is nothing to close an agent window
+            // for — so the old "you may be able to resolve it by closing one" was advice
+            // that could not be acted on.
+            //
+            // **No count, and no "which".** `UsageUnavailableReason` names both causes the
+            // same way, and a withdrawal record cannot carry which: `TokenUsageRecord` has
+            // no column for it and adding one is a schema migration. Showing the real count
+            // or naming the cause needs somewhere to carry it first.
+            case .ambiguousMatch: return "log not attributable"
             }
         }
     }

@@ -17,7 +17,7 @@ import Foundation
 /// directory also yields nothing.
 final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
     let identifier: String
-    let candidates: [LogCandidate]
+    var candidates: [LogCandidate]
     /// What `parse` throws for a given file, by name. **A file that is not named parses
     /// normally**, so one refusal can be isolated from the files beside it — which is the
     /// case the poller has to survive, and the only way to reach
@@ -33,9 +33,18 @@ final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
         self.candidates = candidates
     }
 
+    /// Every bound this adapter was asked with, in order, so a test can assert the pass
+    /// handed it a real cost bound rather than nothing.
+    private var _bounds: [Date?] = []
+
     var logCandidatesCalls: Int {
         lock.lock(); defer { lock.unlock() }
         return _logCandidatesCalls
+    }
+
+    var bounds: [Date?] {
+        lock.lock(); defer { lock.unlock() }
+        return _bounds
     }
 
     /// Every file this adapter was asked to read, in the order it was asked.
@@ -44,10 +53,12 @@ final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
         return _parsedNames
     }
 
-    func logCandidates() -> [LogCandidate] {
+    func logCandidates(newerThan: Date?) -> [LogCandidate] {
         lock.lock(); defer { lock.unlock() }
         _logCandidatesCalls += 1
-        return candidates
+        _bounds.append(newerThan)
+        guard let newerThan else { return candidates }
+        return candidates.filter { ($0.interval?.end ?? .distantPast) >= newerThan }
     }
 
     func parse(_ url: URL) throws -> [RawAgentUsage] {
@@ -91,7 +102,7 @@ final class AgentSourcePollerTests: XCTestCase {
     private func candidate(_ name: String, from: Date, to: Date? = nil) -> LogCandidate {
         LogCandidate(
             url: URL(fileURLWithPath: "/logs/\(name)"),
-            interval: LogInterval(start: from, end: to ?? from, evidence: .lineTimestamps)
+            interval: LogInterval(start: from, end: to ?? from)
         )
     }
 
@@ -426,5 +437,308 @@ final class AgentSourcePollerTests: XCTestCase {
         XCTAssertEqual(pass.absences.first?.sessionID, sessionID)
         let stored = try XCTUnwrap(try store.sessions().first)
         XCTAssertFalse(stored.usage.isReported)
+    }
+
+    // MARK: - A figure is withdrawn, not left standing
+
+    /// **A second connection opens inside the conversation, and the figure the first pass
+    /// wrote stops counting.**
+    ///
+    /// This is the pass-level form of BLOCKER 2, and it is the whole sequence: a
+    /// conversation that is being written *right now* has a one-connection match at pass N,
+    /// and gains a second connection inside the same conversation before pass N+1. Both go
+    /// to `ambiguousMatch`, and without the withdrawal the store would keep showing a priced
+    /// figure for both — the same 16,739 tokens twice, from a pass that knew better and
+    /// discarded it.
+    func testASecondConnectionInsideTheConversationWithdrawsTheFigureAlreadyWritten() throws {
+        let store = try makeStore()
+        let now = Date()
+        let conversation = candidate(
+            "live.jsonl", from: now.addingTimeInterval(-3600), to: now.addingTimeInterval(600)
+        )
+        let adapter = CountingTokenAdapter(candidates: [conversation])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+
+        // Pass 1: one connection inside the conversation. It is the only one, so it matches.
+        let first = try recordSession(store, connectedAt: now.addingTimeInterval(-1800))
+        let before = poller.pollOnce()
+        XCTAssertEqual(before.records.count, 2)
+        XCTAssertTrue(before.records.allSatisfy { $0.sessionID == first })
+        XCTAssertTrue(try XCTUnwrap(try store.sessions().first { $0.id == first }).usage.isReported)
+
+        // Pass 2: a second connection lands inside the same conversation. Now both contend.
+        let second = try recordSession(store, connectedAt: now.addingTimeInterval(-300))
+        let after = poller.pollOnce()
+
+        XCTAssertTrue(after.records.isEmpty, "no new figures")
+        XCTAssertEqual(after.withdrawals.count, 1, "DEBUG one withdrawal")
+        print("DEBUG usage(for:) =", try store.usage(for: first))
+        print("DEBUG sessions =", try store.sessions().map { ($0.id == first ? "FIRST" : "SECOND", $0.usage) })
+        print("DEBUG direct fold =", TokenUsage.aggregating([
+            TokenUsageRecord(sessionID: first, recordedAt: now, input: 100, output: 50,
+                             cacheRead: nil, reasoning: nil, modelID: "m", provenance: .parsedFromLog),
+            TokenUsageRecord(sessionID: first, recordedAt: now.addingTimeInterval(60), input: 0,
+                             output: 0, cacheRead: nil, reasoning: nil, modelID: "",
+                             provenance: .parseWithdrawn),
+        ]))
+        XCTAssertEqual(Set(after.absences.map(\.sessionID)), [first, second])
+        XCTAssertEqual(Set(after.absences.map(\.reason)), [.ambiguousMatch])
+
+        // **And the store no longer prices the session that had a figure.** This is the
+        // assertion the withdrawal exists for; without it, `first` would still read as
+        // reported and the same conversation's tokens would be billed for it *and* for
+        // nothing else — a priced figure for a session the current rule refuses.
+        let withdrawn = try XCTUnwrap(try store.sessions().first { $0.id == first })
+        XCTAssertEqual(withdrawn.usage, .notReported(reason: .ambiguousMatch))
+        XCTAssertNil(withdrawn.cost.usd, "a withdrawn session must not carry a dollar figure")
+
+        // The second connection never had a figure and never gets a withdrawal, so it reads
+        // as awaiting its first report — a different state from `ambiguousMatch`, and both
+        // are absences rather than zeros.
+        let neverHadOne = try XCTUnwrap(try store.sessions().first { $0.id == second })
+        XCTAssertEqual(neverHadOne.usage, .notReported(reason: .awaitingFirstReport))
+        XCTAssertNil(neverHadOne.cost.usd)
+    }
+
+    /// **A withdrawal is only written where there was a figure.** One connection, no
+    /// contention: a pass that withdrew blindly would leave a `parseWithdrawn` record
+    /// behind for a session that never had a parsed figure, outliving the figure it was
+    /// meant to cancel and turning every later reading on that session into a no-op.
+    func testNoWithdrawalIsWrittenForASessionThatNeverHadAFigure() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        // Nothing in the conversation's window, so the session reads `noSource`.
+        let adapter = CountingTokenAdapter(candidates: [
+            candidate("ancient.jsonl",
+                      from: now.addingTimeInterval(-90 * 24 * 3600),
+                      to: now.addingTimeInterval(-90 * 24 * 3600 - 60))
+        ])
+
+        let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+            .pollOnce()
+
+        XCTAssertEqual(pass.absences.map(\.reason), [.noSource])
+        XCTAssertTrue(pass.records.isEmpty, "a `noSource` absence withdraws nothing")
+        for session in try store.sessions() {
+            XCTAssertFalse(session.usage.isReported)
+        }
+    }
+
+    /// **A withdrawal is not a one-way door, and this shows both halves.**
+    ///
+    /// The conversation the pair contended over is replaced by one that only the *newer*
+    /// connection falls inside, so a later pass can match it unambiguously. The newer
+    /// session gets a fresh figure — a reading newer than the withdrawal supersedes it. The
+    /// older one keeps reading `ambiguousMatch`, because nothing re-established *its*
+    /// figure and a withdrawal that expired on its own would be a record the store could
+    /// not explain. That is the honest residue and it is stated here rather than left for
+    /// someone to read off a card.
+    func testAReadingNewerThanAWithdrawalStandsAgainAndTheOlderOneStaysWithdrawn() throws {
+        let store = try makeStore()
+        let now = Date()
+        let live = candidate(
+            "live.jsonl", from: now.addingTimeInterval(-3600), to: now.addingTimeInterval(600)
+        )
+        let adapter = CountingTokenAdapter(candidates: [live])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+
+        let older = try recordSession(store, connectedAt: now.addingTimeInterval(-1800))
+        poller.pollOnce()
+
+        let newer = try recordSession(store, connectedAt: now.addingTimeInterval(-300))
+        poller.pollOnce()
+        XCTAssertEqual(
+            try XCTUnwrap(try store.sessions().first { $0.id == older }).usage,
+            .notReported(reason: .ambiguousMatch)
+        )
+
+        // A new conversation, inside only the newer connection's window.
+        adapter.candidates = [
+            candidate("next.jsonl", from: now.addingTimeInterval(-400), to: now.addingTimeInterval(-100))
+        ]
+        let pass = poller.pollOnce()
+
+        XCTAssertEqual(pass.records.count, 2)
+        XCTAssertTrue(pass.records.allSatisfy { $0.sessionID == newer })
+        guard case .reported = try XCTUnwrap(try store.sessions().first { $0.id == newer }).usage else {
+            return XCTFail("a reading newer than the withdrawal stands again")
+        }
+        XCTAssertEqual(
+            try XCTUnwrap(try store.sessions().first { $0.id == older }).usage,
+            .notReported(reason: .ambiguousMatch),
+            "and the one with nothing newer stays withdrawn rather than half-resurrected"
+        )
+    }
+
+    // MARK: - The cost bound handed to every source
+
+    /// **Every source is asked with the earliest instant any session could match**, derived
+    /// from the sessions rather than configured. Without it the adapter reads every log on
+    /// the machine at any age every 30 seconds — ~2.63 ms per 712 KB, so ~300 conversations
+    /// is ~0.8 s a pass and ~1 GB of logs is ~3.7 s, about 12% of a core continuously, spent
+    /// on intervals the matcher discards.
+    ///
+    /// **Earliest, not newest**: a pass with one old and one new session can still match the
+    /// old session's log, so bounding on the newest would drop a candidate the matcher would
+    /// have accepted.
+    func testTheBoundIsTheEarliestConnectionLessTheTolerance() throws {
+        let store = try makeStore()
+        let now = Date()
+        let dayOld = now.addingTimeInterval(-24 * 3600)
+        _ = try recordSession(store, connectedAt: dayOld)
+        _ = try recordSession(store, connectedAt: now)
+        let adapter = CountingTokenAdapter(candidates: [])
+
+        _ = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap).pollOnce()
+
+        let bound = try XCTUnwrap(adapter.bounds.first)
+        XCTAssertEqual(
+            try XCTUnwrap(bound).timeIntervalSince(dayOld),
+            -overlap, accuracy: 1,
+            "the bound is the earliest connection less the tolerance, not a constant"
+        )
+    }
+}
+
+/// What the Overview card has to be able to say, pinned as a state rather than as a
+/// string.
+///
+/// The card maps `UsageUnavailableReason` to a phrase in its own view code and there is no
+/// App test target, so the *phrase* cannot be asserted from here — only the state it is
+/// handed. That state is pinned here, because the phrase was wrong for the ordinary case
+/// for as long as it existed: `ambiguousMatch` read **"2 logs match"**, which describes
+/// neither of the two shapes it now means.
+///
+/// **And the state is reachable only through a withdrawal.** A session that was never
+/// counted reads `awaitingFirstReport` however many things contend over it, because it has
+/// no records to withdraw — which is why both tests here take a figure first. That is a
+/// good thing to know about the card: its ambiguous phrase describes a session that *was*
+/// counted and is no longer attributable, not one that never had a source.
+final class AmbiguousMatchStateTests: XCTestCase {
+
+    private func makeStore() throws -> AgentSessionStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ambiguous-state-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return try AgentSessionStore(storeURL: directory.appendingPathComponent("s.sqlite"))
+    }
+
+    private func record(_ store: AgentSessionStore, at: Date, label: String) throws -> UUID {
+        let id = UUID()
+        try store.recordSession(
+            id: id, peerPID: 1, clientName: label, clientVersion: nil, connectedAt: at
+        )
+        return id
+    }
+
+    /// **One log, several connections.** The ordinary case: an agent holding a conversation
+    /// open across two MCP connections. One adapter, one file, **one** conversation — so
+    /// any phrase asserting a number of logs is false here — and the store still reaches
+    /// `ambiguousMatch`, because the figure the first pass wrote is withdrawn when the
+    /// second connection lands inside the same conversation.
+    func testOneConversationAndSeveralConnectionsReachAmbiguousMatchWithOneLog() throws {
+        let store = try makeStore()
+        let now = Date()
+        let adapter = CountingTokenAdapter(candidates: [
+            LogCandidate(
+                url: URL(fileURLWithPath: "/logs/one-conversation.jsonl"),
+                interval: LogInterval(
+                    start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(600)
+                )
+            )
+        ])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: 600)
+
+        let first = try record(store, at: now.addingTimeInterval(-1800), label: "alone")
+        poller.pollOnce()
+        XCTAssertTrue(try XCTUnwrap(try store.sessions().first { $0.id == first }).usage.isReported)
+
+        // A second connection opens inside the same conversation.
+        try record(store, at: now.addingTimeInterval(-300), label: "joined")
+        let pass = poller.pollOnce()
+
+        XCTAssertEqual(pass.sourcesQueried, 1, "one source, one file")
+        XCTAssertEqual(adapter.parsedNames.count, 1, "one log was ever read")
+        XCTAssertEqual(adapter.parsedNames, ["one-conversation.jsonl"])
+        XCTAssertEqual(Set(pass.absences.map(\.reason)), [.ambiguousMatch])
+
+        let stored = try XCTUnwrap(try store.sessions().first { $0.id == first })
+        XCTAssertEqual(stored.usage, .notReported(reason: .ambiguousMatch))
+        XCTAssertNil(stored.cost.usd)
+    }
+
+    /// **Several conversations, one connection** — the other thing `ambiguousMatch` means,
+    /// and it arrives at the *same* state by the *other* route: a figure taken while only
+    /// one conversation was in play, then a second agent's conversation appearing.
+    ///
+    /// Same state, so the same phrase has to cover it — which is why the phrase can name
+    /// neither a count nor a cause, and why naming either would be false for one of the two.
+    func testSeveralConversationsAndOneConnectionReachTheSameState() throws {
+        let store = try makeStore()
+        let now = Date()
+        let only = LogCandidate(
+            url: URL(fileURLWithPath: "/logs/agent-a.jsonl"),
+            interval: LogInterval(
+                start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(-1800)
+            )
+        )
+        let adapter = CountingTokenAdapter(candidates: [only])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: 600)
+
+        let theConnection = try record(
+            store, at: now.addingTimeInterval(-2700), label: "one"
+        )
+        poller.pollOnce()
+
+        // A second agent's conversation, also spanning this connection.
+        adapter.candidates = [only, LogCandidate(
+            url: URL(fileURLWithPath: "/logs/agent-b.jsonl"),
+            interval: LogInterval(
+                start: now.addingTimeInterval(-3400), end: now.addingTimeInterval(-1700)
+            )
+        )]
+        let pass = poller.pollOnce()
+
+        XCTAssertEqual(pass.absences.map(\.reason), [.ambiguousMatch])
+        XCTAssertEqual(
+            try XCTUnwrap(try store.sessions().first { $0.id == theConnection }).usage,
+            .notReported(reason: .ambiguousMatch),
+            "one state for two shapes, so one phrase has to cover both"
+        )
+    }
+
+    /// **A session that was never counted is not `ambiguousMatch`**, however many things
+    /// contend over it — it has nothing to withdraw. Without this, the card's ambiguous
+    /// phrase would read on every session of a busy machine and mean nothing; the honest
+    /// state for a session that never reported is `awaitingFirstReport`.
+    func testASessionThatWasNeverCountedReadsAwaitingFirstReportNotAmbiguousMatch() throws {
+        let store = try makeStore()
+        let now = Date()
+        let adapter = CountingTokenAdapter(candidates: [
+            LogCandidate(
+                url: URL(fileURLWithPath: "/logs/one-conversation.jsonl"),
+                interval: LogInterval(
+                    start: now.addingTimeInterval(-3600), end: now.addingTimeInterval(600)
+                )
+            )
+        ])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: 600)
+
+        // Both connections are inside the conversation from the start, so no pass ever had a
+        // figure to write or withdraw.
+        try record(store, at: now.addingTimeInterval(-1800), label: "a")
+        try record(store, at: now.addingTimeInterval(-300), label: "b")
+        let pass = poller.pollOnce()
+
+        XCTAssertEqual(Set(pass.absences.map(\.reason)), [.ambiguousMatch], "the pass says so")
+        XCTAssertTrue(pass.records.isEmpty)
+        XCTAssertTrue(pass.withdrawals.isEmpty)
+        XCTAssertEqual(
+            Set(try store.sessions().map(\.usage)),
+            [.notReported(reason: .awaitingFirstReport)],
+            "and the store says `awaitingFirstReport`, because there is nothing to withdraw"
+        )
     }
 }

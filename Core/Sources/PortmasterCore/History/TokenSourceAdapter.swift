@@ -47,17 +47,23 @@ public protocol TokenSourceAdapter: Sendable {
     /// Stable name for this source, used in diagnostics.
     var identifier: String { get }
 
-    /// Every log this source could describe, with its last write time.
+    /// Every log this source could describe, each with the interval it was written
+    /// across.
     ///
-    /// **Enumerated once per pass — never once per session.** The old shape asked per
-    /// session, so a machine with ten open sessions walked the agent's log directory
-    /// ten times to answer ten questions one directory read answers. A session id and
-    /// an agent's log filename share no key, so the only correlation is time, and
-    /// time is already in hand: matching one session against a list is arithmetic.
+    /// **Enumerated once per pass — never once per session.** The original shape asked
+    /// per session, so a machine with ten open sessions walked the agent's log directory
+    /// ten times to answer ten questions one directory read answers. A session id and an
+    /// agent's log filename share no key, so the only correlation is time, and matching
+    /// one session against a list is arithmetic.
     ///
-    /// Empty is normal, not an error — and it is the absence a caller should reach
-    /// without a walk at all, which is why a pass with no sessions never gets here.
-    func logCandidates() -> [LogCandidate]
+    /// `newerThan` is an optional cost bound, not a filter the adapter applies to its own
+    /// judgement: it is the earliest instant any session in this pass could match, derived
+    /// by the caller. Passing it may omit candidates the caller would not have matched
+    /// anyway; `nil` asks for everything.
+    ///
+    /// Empty is normal, not an error — and it is the absence a caller should reach without
+    /// a walk at all, which is why a pass with no sessions never gets here.
+    func logCandidates(newerThan: Date?) -> [LogCandidate]
 
     /// Parses a located log into one entry per model. Throws
     /// `TokenSourceError.unrecognizedFormat` rather than returning partial counts.
@@ -69,6 +75,11 @@ public enum TokenSourceOutcome: Hashable, Sendable {
     /// One record per model the log attributed usage to. Never collapsed to one.
     case reported([TokenUsageRecord])
     case notReported(reason: UsageUnavailableReason)
+    /// The pass's decision changed and a figure already stored for this session must stop
+    /// counting. A record rather than a mutation, because the store is append-only and
+    /// "retracting" needs a deliberate representation rather than a deletion the fold
+    /// would then have to reason about being complete.
+    case withdrew(parsedFromLog: Bool)
 }
 
 /// Turns one decision into records to persist, or a reason there are none.
@@ -94,18 +105,34 @@ public struct TokenSourceRunner: Sendable {
         self.now = now
     }
 
-    public func run(sessionID: UUID, match: LogMatch) -> TokenSourceOutcome {
+    /// `readsParsedUsage` is the session's provenance from the pass's own snapshot of what
+    /// it has already written, and it decides whether a refusal withdraws. See
+    /// `AgentSourcePoller`.
+    public func run(
+        sessionID: UUID,
+        match: LogMatch,
+        readsParsedUsage: Bool = false
+    ) -> TokenSourceOutcome {
         // Only `.unique` is a number. The three refusals collapse into two absences
         // because `UsageUnavailableReason` names two of them: nothing to read is a
-        // machine that has not written a log, and both "too many files" and "this file
-        // is not yours alone" are a machine whose figures cannot be attributed. What is
-        // *not* collapsed is the step before this one — a file several sessions could
-        // claim never reaches any of them, so no session gets a figure at all.
+        // machine that has not written a log, and both "too many conversations" and "this
+        // conversation is not yours alone" are a machine whose figures cannot be
+        // attributed. What is *not* collapsed is the step before this one — a conversation
+        // several sessions could claim never reaches any of them, so none gets a figure.
         let url: URL
         switch match {
         case .unique(let candidate):
             url = candidate.url
         case .ambiguous(let count):
+            // **A refusal withdraws a figure this session already had, and only then.**
+            // A conversation's interval only grows while it runs, so a session uniquely
+            // matched at one pass becomes unattributable at the next the moment a second
+            // connection opens inside the same conversation. Without this the store kept
+            // showing a priced figure for a session the current rule refuses — the
+            // confidently-wrong-dollar direction, reached *by* the rule meant to prevent it.
+            if count > 0, readsParsedUsage {
+                return .withdrew(parsedFromLog: true)
+            }
             return .notReported(reason: count == 0 ? .noSource : .ambiguousMatch)
         }
 
