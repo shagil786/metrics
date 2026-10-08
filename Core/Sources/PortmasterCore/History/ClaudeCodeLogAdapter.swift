@@ -21,7 +21,7 @@
 //    single cumulative total gets priced entirely at the newest model's rate.
 //
 // 2. **It is cumulative.** Reading one file twice gives the same totals, not a sum.
-//    So this returns totals, and the runner's latest-per-provenance fold is what makes
+//    So this returns totals, and the runner's latest-per-segment fold is what makes
 //    repeated runs idempotent.
 //
 // THE MATCHING PROBLEM
@@ -36,9 +36,27 @@
 //
 // HONEST LIMITS OF WHAT COMES BACK
 //
-// - **`.ambiguousMatch` will be common on a machine with several agents running**, and
-//   that is the rule working rather than a failure to be tuned away. Two logs
-//   overlapping one session means nothing ties either to it.
+// These are the limits this adapter has. They are not a complete account of what is
+// wrong with parsed figures, and the ones below are not the whole list.
+//
+// - **THE FIGURE IS THE WHOLE CONVERSATION, NOT THE CONNECTED WINDOW.** This is the
+//   largest of them and it is not about matching at all. `parse` returns cumulative
+//   totals for the entire file, and a Claude Code log is one continuously-written file
+//   per conversation — so the matcher proves only that the file's *last write* fell
+//   inside a connection's window, which says nothing about where the conversation
+//   began. A conversation that started an hour before the connection opened and ran for
+//   twenty minutes after it closed contributes **all** of its tokens to the one session
+//   whose window happened to contain its final timestamp. There is no per-window
+//   subtraction to apply: the format carries no session boundary and the file records
+//   nothing about when any given line's tokens were spent.
+//
+//   **It concentrates where there is no self-report.** `preferredProvenance` prefers
+//   `selfReported` and bills the parsed figure only where none exists, so the sessions
+//   most exposed to this are exactly the ones whose agent called no `report_usage`.
+//
+// - **`.ambiguousMatch` will be common on a machine with several sessions recorded**, and
+//   that is the rule working rather than a failure to be tuned away. See
+//   `AgentLogMatcher`: a file more than one session could claim belongs to none of them.
 // - **A log whose shape has changed stays `unrecognizedFormat`** — never a partial
 //   parse, which would be a plausible wrong number.
 // - **Wiring this in makes two previously unreachable limitations reachable**: the
@@ -47,7 +65,7 @@
 //   disagreement tolerance, which has never been validated against real disagreement.
 //   Neither is fixed by parsing a log, and both are documented in the README.
 //
-// WHAT IS NOT TAKEN FROM THE LOG
+// WHAT IS *NOT* TAKEN FROM THE LOG
 //
 // `costUSD` and `totalCostUSD` are read and then ignored. They are Claude Code's
 // pricing, and Portmaster's figures come from the user's own price table; adopting
@@ -63,63 +81,54 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
 
     /// `~/.claude/projects`, or an override so tests can point at a fixture tree
     /// instead of the developer's own sessions.
-    private let projectsRoot: URL
-    /// How far off the clock a file's timestamp may be and still be believed.
     ///
-    /// **This is not the session window.** Generosity there is `overlap`, and it is
-    /// `AgentLogMatcher`'s to apply, because a session is what it is measured against.
-    /// What this guards is the other direction: a file stamped beyond `now + overlap`
-    /// was not written by a session that has not connected yet, so it is dropped
-    /// rather than handed to the matcher to discard. One condition, same bound the
-    /// matcher uses, kept here so an adapter does not spend the machine's file list on
-    /// entries that cannot match.
-    private let overlap: TimeInterval
+    /// **The only parameter, and that is the whole signature.** This adapter used to
+    /// carry an `overlap` of its own; with the window applied by `AgentLogMatcher` it
+    /// bounded nothing a caller could see — `logCandidates()` has no session to measure
+    /// against, so any bound it applied here was a second, separately-configured window
+    /// that silently narrowed the matcher whenever it was set smaller. `projectsRoot`
+    /// alone says what this type actually decides.
+    private let projectsRoot: URL
 
     /// No stored `FileManager`: it is not `Sendable`, and this type is required to be.
     /// Enumeration is a few calls against the default instance, which needs no stored
     /// reference — so the honest fix is not to silence the warning but to stop holding
     /// a non-Sendable type for a convenience that already exists.
-    public init(
-        projectsRoot: URL? = nil,
-        overlap: TimeInterval = 60 * 60
-    ) {
+    public init(projectsRoot: URL? = nil) {
         self.projectsRoot = projectsRoot
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/projects", isDirectory: true)
-        self.overlap = overlap
     }
 
-    /// Every log under the projects root, with its last write time. **No session is
-    /// consulted**: matching a session against this list is `AgentLogMatcher`'s job, and
-    /// doing it here would put one session's window into a method that sees none.
+    /// Every log under the projects root, with its last write time, **whatever its age**.
+    ///
+    /// No session is consulted, and none could be: a pass enumerates once and matches
+    /// every session against the result, so a method that filtered by a window would
+    /// need a session it is not given. Age is therefore not this type's decision — it
+    /// is `AgentLogMatcher`'s, and a month-old log on the machine reaches the matcher
+    /// and is dropped there, which is where the session it might belong to is known.
     ///
     /// Enumerated rather than indexed: the directory is one file per agent session on
-    /// the machine. `AgentSourcePoller` asks once per pass on a 30-second lane, and the
-    /// directory read is a handful of stat calls — so a maintained index would be more
-    /// machinery than the question earns.
+    /// the machine. Every file is `stat`ed to read its timestamp whatever this does, so
+    /// an index would only avoid a walk — not the syscall the cost is actually made of.
     public func logCandidates() -> [LogCandidate] {
-        // A missing root is a machine that has never run the agent, which is an
-        // absence rather than a failure, so an unwalkable directory yields nothing
-        // instead of throwing.
+        // A missing root is a machine that has never run the agent, which is an absence
+        // rather than a failure, so an unwalkable directory yields nothing.
         guard let walker = FileManager.default.enumerator(
             at: projectsRoot,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
-        let notAfter = Date().addingTimeInterval(overlap)
         var candidates: [LogCandidate] = []
         for case let url as URL in walker where url.pathExtension == "jsonl" {
             // An unreadable timestamp leaves nothing to match on, so a file whose
             // modification time cannot be read is not a candidate — guessing one would
             // be a correlation invented rather than observed.
-            guard let modified = modificationDate(of: url), modified <= notAfter else {
-                continue
-            }
+            guard let modified = modificationDate(of: url) else { continue }
             candidates.append(LogCandidate(url: url, modifiedAt: modified))
         }
-        // Sorted by path so a caller inspecting candidates sees a stable order, and so
-        // the single-match case is deterministic on a machine holding more than one log.
+        // Sorted by path so a caller inspecting candidates sees a stable order.
         return candidates.sorted { $0.url.path < $1.url.path }
     }
 

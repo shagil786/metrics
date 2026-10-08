@@ -366,6 +366,26 @@ public final class AgentSessionStore: @unchecked Sendable {
         return TokenUsage.aggregating(usageRecordsLocked(for: sessionID))
     }
 
+    /// Every session's id and connection time, and nothing else.
+    ///
+    /// **A narrow read because the poller needs two fields and no more.**
+    /// `sessions()` fetches every `TokenUsageRecordRow` and runs `costLocked` per
+    /// session — full decimal pricing — and the poller asks every 30 seconds while
+    /// adding a record or two per session per pass. Reading snapshots would make the
+    /// pass cost grow linearly with the very history the poller is writing, to
+    /// compute a cost it then discards. Two columns is the whole of what matching
+    /// needs: an id to answer with and a connection time to bound a window.
+    ///
+    /// Ordered by `connectedAt`, like `sessions()`, so a caller iterating the result
+    /// reaches the same sessions in the same order from either read.
+    public func sessionKeys() throws -> [(id: UUID, connectedAt: Date)] {
+        lock.lock(); defer { lock.unlock() }
+        let rows = try context.fetch(FetchDescriptor<AgentSession>(
+            sortBy: [SortDescriptor(\.connectedAt)]
+        ))
+        return rows.map { (id: $0.id, connectedAt: $0.connectedAt) }
+    }
+
     public func cost(for sessionID: UUID) throws -> SessionCost {
         lock.lock(); defer { lock.unlock() }
         return costLocked(records: usageRecordsLocked(for: sessionID), table: priceTableLocked())

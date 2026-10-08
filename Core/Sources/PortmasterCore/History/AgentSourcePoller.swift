@@ -11,10 +11,9 @@
 //
 // **Not** a collector on `SamplingEngine`. That engine measures this machine and its
 // cadence is driven by whether a surface is visible; an agent log is another
-// application's private file, its cost is a directory read per pass, and its
-// questions are about sessions the engine has no concept of. Injecting the session
-// store into it would take a boundary the engine's design rests on — that it knows
-// about this machine and nothing else — and give it a reason to be constructed at
+// application's private file and the engine has no concept of a session. Injecting the
+// session store into it would take a boundary the engine's design rests on — that it
+// knows about this machine and nothing else — and give it a reason to be constructed at
 // all in a build with no agent sessions.
 //
 // The app starts this with the store. That wiring is a separate change; nothing here
@@ -66,12 +65,14 @@ public struct AgentSourceFailure: Hashable, Sendable {
 /// three-state usage type rests on, applied to the pass itself.
 public struct AgentSourcePass: Hashable, Sendable {
     public let at: Date
-    /// Sessions the pass read. Zero means the store held none.
+    /// Sessions the pass matched against. Zero means the store held none.
     public let sessionsConsidered: Int
-    /// Directory walks performed. **Zero when there were no sessions to match against**,
-    /// and at most one per adapter otherwise — reported rather than assumed, because
-    /// "no walk happened" is the claim worth being able to check.
-    public let enumerations: Int
+    /// **Sources asked**, which is one per adapter — *not* a count of filesystem walks.
+    /// An adapter whose log directory does not exist was still asked and returned
+    /// nothing having done no I/O, so this cannot stand in for "walks performed"; the
+    /// no-sessions guard is observable instead by `sessionsConsidered == 0` with this
+    /// also zero, since nothing is asked before a session exists to ask about.
+    public let sourcesQueried: Int
     /// Every record the pass persisted, in the order it wrote them.
     public let records: [TokenUsageRecord]
     public let absences: [AgentSourceAbsence]
@@ -80,30 +81,28 @@ public struct AgentSourcePass: Hashable, Sendable {
     public init(
         at: Date,
         sessionsConsidered: Int,
-        enumerations: Int,
+        sourcesQueried: Int,
         records: [TokenUsageRecord],
         absences: [AgentSourceAbsence],
         failures: [AgentSourceFailure]
     ) {
         self.at = at
         self.sessionsConsidered = sessionsConsidered
-        self.enumerations = enumerations
+        self.sourcesQueried = sourcesQueried
         self.records = records
         self.absences = absences
         self.failures = failures
     }
 
-    /// A pass with nothing to say: the shape returned before any work was attempted.
-    ///
-    /// Used for the two early returns — an unreadable store and an empty one — so
-    /// neither has to spell five fields to say "nothing happened".
+    /// A pass that was over before any source was asked. Used for the two early returns
+    /// — an unreadable store and an empty one.
     static func idle(at: Date, sessionsConsidered: Int = 0, failures: [AgentSourceFailure] = [])
         -> AgentSourcePass
     {
         AgentSourcePass(
             at: at,
             sessionsConsidered: sessionsConsidered,
-            enumerations: 0,
+            sourcesQueried: 0,
             records: [],
             absences: [],
             failures: failures
@@ -111,13 +110,15 @@ public struct AgentSourcePass: Hashable, Sendable {
     }
 }
 
-/// Asks every configured adapter about every open session, on a slow cadence.
+/// Asks every configured adapter about every recorded session, on a slow cadence.
 ///
-/// The interval, the in-flight guard and the off-main-thread pass follow
-/// `SamplingEngine.kickSlowCollectorsIfNeeded`: a pass that walks another app's
-/// directory and parses JSONL must never run on the main queue, and a machine where
-/// one pass takes longer than the interval must skip the next one rather than stack
-/// them until the machine is doing nothing but parsing agent logs.
+/// The interval gate and the in-flight flag follow `SamplingEngine`'s slow lane: a pass
+/// that walks another app's directory and parses JSONL must never run on the main queue,
+/// and a machine where one pass takes longer than the interval must skip the next rather
+/// than stack them until it is doing nothing but parsing agent logs. It uses **one**
+/// queue rather than that lane's two — the second hop exists there to keep the sampling
+/// queue free while other collectors run, and nothing else shares this queue, so there
+/// is nothing to keep free.
 public final class AgentSourcePoller: @unchecked Sendable {
     /// Slow on purpose. A session's counts move in tens of thousands of tokens, and a
     /// pass that reads the same cumulative log twice inside that window learns nothing
@@ -134,9 +135,9 @@ public final class AgentSourcePoller: @unchecked Sendable {
     private let onPass: (@Sendable (AgentSourcePass) -> Void)?
 
     private let queue = DispatchQueue(label: "dev.portmaster.agentsources", qos: .utility)
-    /// Every mutable field below is touched only on `queue`. `start()` hops there
-    /// before touching `timer`, so there is no state a main-thread call and a tick can
-    /// both reach at once.
+    /// Every mutable field below is touched only on `queue`. `start()`, `stop()` and
+    /// `requestPoll()` hop there before touching anything, so no state a caller can reach
+    /// from another thread and a tick can also reach exists.
     private var timer: DispatchSourceTimer?
     private var inFlight = false
     private var lastPassAt = Date.distantPast
@@ -180,14 +181,28 @@ public final class AgentSourcePoller: @unchecked Sendable {
 
     // MARK: - The pass
 
-    /// One pass, synchronously, on whatever queue the caller is already on.
+    /// One pass, returning what it found. **Blocking**, for a test or a one-off
+    /// diagnostic: neither should have to wait on a clock or race a gate to see a result.
     ///
-    /// **No scheduling and no gating**, which is what makes it the right entry point
-    /// for a test and for the one-off diagnostic run: neither has to wait on a clock or
-    /// race an in-flight flag to see a result. `start()` is what gates.
-    public func pollOnce() -> AgentSourcePass { runPass() }
+    /// Runs through `queue.sync`, so it cannot overlap a scheduled pass — the same
+    /// no-overlap guarantee the timer obeys, applied here too. Without it the natural
+    /// app shape (start on launch, poll again when a surface appears) would run two
+    /// passes at once, and the in-flight flag above would be describing a guarantee this
+    /// method broke. A UI surface wanting a fresher poll without blocking should use
+    /// `requestPoll()`.
+    public func pollOnce() -> AgentSourcePass {
+        queue.sync { runPass(now: Date()) }
+    }
 
-    /// Interval gating and the overlap guard, then the pass. Runs on `queue`.
+    /// Asks for a pass without blocking the caller, under the same interval and
+    /// in-flight rules a timer tick obeys. A poll too soon is dropped rather than
+    /// queued, which is the point: the gate exists so a surface appearing cannot turn
+    /// into a pass per appearance.
+    public func requestPoll() {
+        queue.async { [weak self] in self?.kickIfNeeded() }
+    }
+
+    /// Interval gating and the in-flight guard, then the pass. Runs on `queue`.
     private func kickIfNeeded() {
         let now = Date()
         guard now.timeIntervalSince(lastPassAt) >= Self.pollInterval, !inFlight else {
@@ -195,7 +210,7 @@ public final class AgentSourcePoller: @unchecked Sendable {
         }
         inFlight = true
         lastPassAt = now
-        let pass = runPass()
+        let pass = runPass(now: now)
         inFlight = false
         // Results cross to the main queue because that is where a caller reading them
         // will be, and because the store's own lock is not a substitute for the rule
@@ -205,46 +220,52 @@ public final class AgentSourcePoller: @unchecked Sendable {
         }
     }
 
-    /// Reads every session once, enumerates each source once, and persists what it
-    /// found.
+    /// Reads every session once, asks every source once, and persists what it found.
     ///
-    /// **Enumeration is here and not in the runner** because that is the whole of the
-    /// per-pass saving: one directory walk per adapter, then arithmetic against a list.
-    /// Asking per session was the shape this replaced, and on a machine with several
-    /// agents open it walked the same tree once per session to learn the same thing.
-    private func runPass() -> AgentSourcePass {
-        let at = Date()
-
-        let sessions: [AgentSessionSnapshot]
+    /// **Asking is here and not in the runner** because that is the whole of the
+    /// per-pass saving: one directory walk per source, then arithmetic against a list.
+    /// Asking per session was the shape this replaced.
+    ///
+    /// **Matching is here for the same reason, and it is not the same kind of saving.**
+    /// `AgentLogMatcher.match` is a whole-pass function because a file claimed by two
+    /// sessions belongs to neither, and a per-session question cannot see that. One
+    /// clock reading is taken for the pass and used for both the windows and the record
+    /// timestamps, so every window in a pass is judged against one instant.
+    private func runPass(now: Date) -> AgentSourcePass {
+        let sessions: [(id: UUID, connectedAt: Date)]
         do {
-            sessions = try store.sessions()
+            sessions = try store.sessionKeys()
         } catch {
             NSLog("Portmaster agent source poll could not read sessions: \(error)")
-            return .idle(at: at, failures: [
+            return .idle(at: now, failures: [
                 AgentSourceFailure(source: "store", sessionID: nil, detail: "\(error)")
             ])
         }
 
         // **No sessions means no walk.** Not a micro-optimisation: this is the state of
-        // a machine with no MCP client ever connected, and the enumeration would
-        // otherwise stat every agent log on the machine once a minute to conclude
-        // there is nobody to attribute them to. Returned before `logCandidates` is
-        // reached, and counted in `enumerations` so the claim is checkable.
-        guard !sessions.isEmpty else { return .idle(at: at) }
-
-        var enumerated: [(source: String, candidates: [LogCandidate], adapter: any TokenSourceAdapter)] = []
-        for adapter in adapters {
-            enumerated.append((adapter.identifier, adapter.logCandidates(), adapter))
-        }
+        // a machine with no MCP client ever connected, and asking would otherwise stat
+        // every agent log on the machine once a minute to conclude there is nobody to
+        // attribute them to. Returned before any source is asked, so `sourcesQueried`
+        // is the checkable form of it.
+        guard !sessions.isEmpty else { return .idle(at: now) }
 
         var records: [TokenUsageRecord] = []
         var absences: [AgentSourceAbsence] = []
         var failures: [AgentSourceFailure] = []
 
-        for session in sessions {
-            for entry in enumerated {
-                let runner = TokenSourceRunner(adapter: entry.adapter, now: { at })
-                switch runner.run(session: session, candidates: entry.candidates, overlap: overlap) {
+        for adapter in adapters {
+            let candidates = adapter.logCandidates()
+            let matches = AgentLogMatcher.match(
+                candidates, for: sessions, overlap: overlap, now: now
+            )
+            // One runner per source, not per session: it depends on the adapter and the
+            // pass's single clock reading, neither of which varies with the session.
+            let runner = TokenSourceRunner(adapter: adapter, now: { now })
+            for session in sessions {
+                switch runner.run(
+                    sessionID: session.id,
+                    match: matches[session.id] ?? .ambiguous(count: 0)
+                ) {
                 case .reported(let found):
                     for record in found {
                         do {
@@ -255,13 +276,14 @@ public final class AgentSourcePoller: @unchecked Sendable {
                             // this session's loss, not the next eight sessions'.
                             NSLog("Portmaster agent source poll could not record usage: \(error)")
                             failures.append(AgentSourceFailure(
-                                source: entry.source, sessionID: session.id, detail: "\(error)"
+                                source: adapter.identifier, sessionID: session.id,
+                                detail: "\(error)"
                             ))
                         }
                     }
                 case .notReported(let reason):
                     absences.append(AgentSourceAbsence(
-                        sessionID: session.id, source: entry.source, reason: reason
+                        sessionID: session.id, source: adapter.identifier, reason: reason
                     ))
                 }
             }
@@ -281,9 +303,9 @@ public final class AgentSourcePoller: @unchecked Sendable {
         }
 
         return AgentSourcePass(
-            at: at,
+            at: now,
             sessionsConsidered: sessions.count,
-            enumerations: enumerated.count,
+            sourcesQueried: adapters.count,
             records: records,
             absences: absences,
             failures: failures

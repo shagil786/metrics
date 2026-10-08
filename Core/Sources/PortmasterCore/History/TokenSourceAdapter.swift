@@ -71,20 +71,21 @@ public enum TokenSourceOutcome: Hashable, Sendable {
     case notReported(reason: UsageUnavailableReason)
 }
 
-/// Runs one adapter against one session and maps every failure onto a named
-/// absence, so no caller has to interpret an error to know what it does not know.
+/// Turns one decision into records to persist, or a reason there are none.
 ///
-/// The candidate list is passed in rather than asked for, because one enumeration
-/// per pass serves every session — see `logCandidates()`.
+/// Takes the session's **id** rather than a snapshot because a decision is already made
+/// by the time it gets here, and the only thing left to stamp is the id. That is also
+/// what lets the poller read two columns from the store per session instead of a
+/// snapshot's worth — see `AgentSessionStore.sessionKeys()`.
 public struct TokenSourceRunner: Sendable {
     private let adapter: any TokenSourceAdapter
     private let now: @Sendable () -> Date
 
-    /// The session id is taken from the session passed to `run(session:)`, never
-    /// stored here: a second copy of an id that must equal the first is a copy that
-    /// can be stale, and the result of a stale one is a number counted against the
-    /// wrong session — the one failure here that is not an absence, and therefore
-    /// the one no downstream check would catch.
+    /// The session id is taken from the session passed to `run(sessionID:match:)`, never
+    /// stored here: a second copy of an id that must equal the first is a copy that can
+    /// be stale, and the result of a stale one is a number counted against the wrong
+    /// session — the one failure here that is not an absence, and therefore the one no
+    /// downstream check would catch.
     public init(
         adapter: any TokenSourceAdapter,
         now: @escaping @Sendable () -> Date = { Date() }
@@ -93,19 +94,15 @@ public struct TokenSourceRunner: Sendable {
         self.now = now
     }
 
-    public func run(
-        session: AgentSessionSnapshot,
-        candidates: [LogCandidate],
-        overlap: TimeInterval
-    ) -> TokenSourceOutcome {
-        // **Only a unique match is a match**, and `AgentLogMatcher` owns that rule so
-        // it can be tested without a filesystem. Zero and many are both not-a-match,
-        // but they are not the same absence: nothing to read is a machine that has not
-        // written a log, while two or more is a machine running more than one agent.
-        // Collapsing them would tell a user with nothing to count the same story as a
-        // user whose figure could not be attributed.
+    public func run(sessionID: UUID, match: LogMatch) -> TokenSourceOutcome {
+        // Only `.unique` is a number. The three refusals collapse into two absences
+        // because `UsageUnavailableReason` names two of them: nothing to read is a
+        // machine that has not written a log, and both "too many files" and "this file
+        // is not yours alone" are a machine whose figures cannot be attributed. What is
+        // *not* collapsed is the step before this one — a file several sessions could
+        // claim never reaches any of them, so no session gets a figure at all.
         let url: URL
-        switch AgentLogMatcher.match(candidates, for: session, overlap: overlap) {
+        switch match {
         case .unique(let candidate):
             url = candidate.url
         case .ambiguous(let count):
@@ -120,7 +117,7 @@ public struct TokenSourceRunner: Sendable {
             let at = now()
             return .reported(raw.map { entry in
                 TokenUsageRecord(
-                    sessionID: session.id,
+                    sessionID: sessionID,
                     recordedAt: at,
                     input: entry.input,
                     output: entry.output,
