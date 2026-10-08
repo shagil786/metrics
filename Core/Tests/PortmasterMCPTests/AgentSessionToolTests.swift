@@ -189,11 +189,11 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertEqual(cost["priced"] as? Bool, true)
         // A string, not a JSON number: a client must not round a money figure.
         XCTAssertNotNil(cost["usd"] as? String)
-        // The table version this figure was computed against, which is the table's
-        // newest rather than the input price's: the fixture also wrote an output price
-        // after the input one, taking the table to version 2. The field names the table
-        // a figure was re-costed under, not every price it happens to have used.
-        XCTAssertEqual(cost["priceTableVersion"] as? Int, 2)
+        // The newest price this figure *used*, not the table's newest: the fixture also
+        // wrote an output price after the input one, taking the table to version 2, but
+        // the session has no output tokens, so nothing was multiplied by it. Naming it
+        // would renumber the figure for a price that did not produce it.
+        XCTAssertEqual(cost["priceTableVersion"] as? Int, 1)
     }
 
     /// An unpriced model is not a free one.

@@ -827,23 +827,24 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertEqual(input, 900)
     }
 
-    /// The inverse of the test this replaces, and the property `prune` still owes.
+    /// The inverse of the test this replaces, and the property `prune` owes.
     ///
     /// The deleted `testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice` pinned
     /// a sweep turning a stated disagreement into a confident figure for whichever model
-    /// survived. Segments retire that particular shape — two models in two sources are
+    /// survived. Segments retired that particular shape — two models in two sources are
     /// two segments and both are priced — but the hazard did not go with it: the trim
-    /// still deletes by session and timestamp, so it can still remove the *only* record
-    /// of one provenance and leave a different, still-priced figure behind. Nothing in
-    /// the output says retention chose it.
+    /// still deleted by session and timestamp, so it could remove the *only* record of
+    /// one provenance and leave a different, still-priced figure behind, with nothing in
+    /// the output saying retention had chosen it.
     ///
-    /// The figures are the design's, so the replacement is not a matter of judgement:
+    /// The figures are the design's, so the assertion is not a matter of judgement:
     /// `0.0001 + 0.0018` = `0.0019` before the sweep, `0.0019` after it.
     ///
-    /// **RED, and deliberately so.** A record may only go once a newer one exists for its
-    /// own `(provenance, model)` pair; until that rule lands, the sole self-report below
-    /// is exactly the record the trim takes, and the sweep moves the figure. Written
-    /// first so the fix has something to satisfy, per the design's testing section.
+    /// **Written while red, on purpose.** A record may only go once a newer one exists
+    /// for its own `(provenance, model)` pair, and until that rule landed the sole
+    /// self-report below was exactly the record the trim took. This test alone cannot
+    /// tell a trim that keeps every record from one that keeps the right ones, which is
+    /// what the next test is for.
     func testPruneDoesNotChangeAFigureForATwoSourceSession() throws {
         let (store, url) = try makeStoreOnDisk()
         let cutoff = Date(timeIntervalSince1970: 1_000)
@@ -890,6 +891,42 @@ final class AgentSessionStoreTests: XCTestCase {
             try reopened.cost(for: session).usd, Decimal(string: "0.0019")!,
             "0.0001 + 0.0018 before the sweep, and the same after it"
         )
+    }
+
+    /// The superseded case, which *should* still be deleted: a newer record for the
+    /// same (provenance, model) means this one is unread, so removing it is inert.
+    ///
+    /// The other half of the fix. Keeping a segment's latest reading is only safe while
+    /// the rest still goes — otherwise the trim trades a moved figure for a table that
+    /// grows forever, and the sweep stops being a bound on anything.
+    func testPruneStillDropsASupersededRecord() throws {
+        let (store, url) = try makeStoreOnDisk()
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let session = UUID()
+        try store.recordSession(
+            id: session, peerPID: 1, clientName: "superseded", clientVersion: nil,
+            connectedAt: cutoff.addingTimeInterval(-3_600)
+        )
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: cutoff.addingTimeInterval(-600), input: 10,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .parsedFromLog
+        ))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: session, recordedAt: cutoff.addingTimeInterval(60), input: 99,
+            output: 0, cacheRead: nil, reasoning: nil, modelID: "m",
+            provenance: .parsedFromLog
+        ))
+        try store.flush()
+
+        store.prune(olderThan: cutoff, keepingSessionIDs: [])
+
+        let reopened = try AgentSessionStore(storeURL: url)
+        guard case .reported(let segments) = try reopened.usage(for: session) else {
+            return XCTFail("expected usage to survive")
+        }
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments[0].input, 99, "the newer reading is the one that survives")
     }
 
     // MARK: - Price text is parsed strictly

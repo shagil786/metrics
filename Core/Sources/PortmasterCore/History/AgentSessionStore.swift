@@ -416,29 +416,20 @@ public final class AgentSessionStore: @unchecked Sendable {
     ///   cutoff. The row and all of its records go together, so a session is never
     ///   left claiming it has not reported when its records were deleted underneath it
     ///   (`awaitingFirstReport` would be a lie) and never left with records and no row.
-    /// - **kept, records trimmed** — stale but still reporting. Records older than the
-    ///   cutoff go, and that leaves the session's figures alone **only while every
-    ///   segment that contributed still has a record at or after the cutoff.** With
-    ///   one provenance that holds: aggregation reads the latest record per segment, and
-    ///   a superseded one is never the one it reads.
-    ///
-    ///   Across two it does not, and this comment used to claim otherwise. A session
-    ///   whose only `selfReported` record is older than the cutoff loses its whole source
-    ///   when that record goes, so the aggregate moves to the other provenance, and
-    ///   nothing in the output says a retention sweep just chose between them. Worse
-    ///   than resolving a disagreement it would now *change a priced figure*: deleting
-    ///   one side's reading of a model can leave a different model standing alone at a
-    ///   different total, which is a number the user never saw before and cannot
-    ///   account for. Deleting the *superseded* record of a provenance that still has a
-    ///   newer one is inert; deleting the only record of one is not, and the trim
-    ///   cannot tell the two apart without looking.
-    ///
-    ///   No adapter ships and nothing calls `TokenSourceRunner` in the app, so no
-    ///   two-provenance session exists to be trimmed today; that is a reason it has no
-    ///   test-driven need to be clever, not a reason to promise it cannot happen. What
-    ///   would make trimming provably figure-preserving is deleting a record only when
-    ///   a newer one exists for its own `(provenance, model)` pair, so no source can
+    /// - **kept, records trimmed** — stale but still reporting. Records go, but a
+    ///   record is only removed when a newer one exists for its own
+    ///   `(provenance, model)` pair, so a segment's latest reading always survives.
+    ///   Trimming is therefore figure-preserving: no provenance and no model can
     ///   disappear from an aggregate as a side effect of retention.
+    ///
+    ///   The pair is the identity the fold reads a record under, so a surviving record
+    ///   is always one aggregation could still have chosen. That is the whole difference
+    ///   from deleting by session and timestamp, which cannot tell a *superseded*
+    ///   record — never read, so inert to remove — from the *only* record of a source,
+    ///   which is the segment itself. Deleting the second took a provenance out of the
+    ///   aggregate and turned a stated disagreement into a confident priced figure for
+    ///   whichever side survived, with nothing in the output saying retention had
+    ///   chosen between them.
     /// - **kept whole** — the host is serving it. Nothing of it is touched, including a
     ///   record older than the cutoff: if it were deleted the session would read as
     ///   never having reported. The connection is what bounds that growth.
@@ -448,19 +439,35 @@ public final class AgentSessionStore: @unchecked Sendable {
             let stale = try context.fetch(FetchDescriptor<AgentSession>(
                 predicate: #Predicate { $0.connectedAt < cutoff }
             ))
-            // One query for "who reported since the cutoff", not one per session.
-            let recentlyReported = try context.fetch(FetchDescriptor<TokenUsageRecordRow>(
-                predicate: #Predicate { $0.recordedAt >= cutoff }
-            )).reduce(into: Set<UUID>()) { $0.insert($1.sessionID) }
+            // One query for the whole table, never one per session, because neither
+            // question below is a property of a single session: who reported since the
+            // cutoff, and what each segment's newest reading is. Re-fetching either
+            // inside the loops would rescan the table once per session — against the
+            // table this method exists to shrink, and where a chatty session is exactly
+            // the row that makes the scan large.
+            let rows = try context.fetch(FetchDescriptor<TokenUsageRecordRow>())
+            var recentlyReported: Set<UUID> = []
+            var newestPerSegment: [SegmentKey: Date] = [:]
+            for row in rows {
+                if row.recordedAt >= cutoff {
+                    recentlyReported.insert(row.sessionID)
+                }
+                let key = SegmentKey(
+                    sessionID: row.sessionID,
+                    provenance: row.provenanceRaw,
+                    modelID: row.modelID
+                )
+                newestPerSegment[key] = max(newestPerSegment[key] ?? .distantPast, row.recordedAt)
+            }
 
             var dropped: [UUID] = []
-            var trimmed: [UUID] = []
+            var trimmed: Set<UUID> = []
             for session in stale {
                 let id = session.id
                 if live.contains(id) {
                     continue
                 } else if recentlyReported.contains(id) {
-                    trimmed.append(id)
+                    trimmed.insert(id)
                 } else {
                     dropped.append(id)
                 }
@@ -475,17 +482,41 @@ public final class AgentSessionStore: @unchecked Sendable {
                     where: #Predicate { $0.id == id }
                 )
             }
-            for id in trimmed {
-                _ = try context.delete(
-                    model: TokenUsageRecordRow.self,
-                    where: #Predicate { $0.sessionID == id && $0.recordedAt < cutoff }
+            for row in rows where trimmed.contains(row.sessionID) {
+                // Delete the superseded and out-of-window records, and nothing else.
+                let key = SegmentKey(
+                    sessionID: row.sessionID,
+                    provenance: row.provenanceRaw,
+                    modelID: row.modelID
                 )
+                // Nothing newer for this pair means this *is* the segment's latest
+                // reading, and it must survive whatever the window says. The fallback
+                // makes that case compare equal rather than absent, so the rule reads
+                // as one condition instead of two.
+                let newest = newestPerSegment[key] ?? row.recordedAt
+                if row.recordedAt < newest, row.recordedAt < cutoff {
+                    context.delete(row)
+                }
             }
             try context.save()
         } catch {
             context.rollback()
             NSLog("Portmaster agent session prune failed: \(error)")
         }
+    }
+
+    /// Identity of a usage segment for retention purposes: the same
+    /// `(provenance, model)` pair. A SwiftData model cannot be a dictionary key, so
+    /// this is the value form of the three fields the trim needs.
+    ///
+    /// Keyed on the model even for a source that folds on provenance alone. Grouping
+    /// *finer* than the fold can only keep a record the fold would have discarded, and
+    /// retention deleting something no read ever reaches is the one direction that
+    /// moves a figure.
+    private struct SegmentKey: Hashable {
+        let sessionID: UUID
+        let provenance: String
+        let modelID: String
     }
 
     // MARK: - Locked helpers (callers already hold the lock)
@@ -640,17 +671,16 @@ public final class AgentSessionStore: @unchecked Sendable {
             return .notPriced(models: Set(unpriced).sorted())
         }
         // The newest price this figure consumed, never a version it did not use.
-        // `version` is a maximum over the entries this computation actually read, so a
-        // figure built from `model-a` at table version 1 and `model-b` at version 2
-        // reports 2 — the newest price it stood under, not every price it rests on.
-        // That is what the field can honestly mean; it is not a claim that one version
-        // describes the whole table. A figure that consumed no entry at all — every
-        // token count zero, so the total is exact under any table — falls back to the
-        // table's current version, since a version of 0 would read as "priced from
-        // nothing".
+        // `version` is a maximum over the entries this computation actually multiplied,
+        // so a figure built from `model-a` at table version 1 and `model-b` at version 2
+        // reports 2 — the newest price it stood under, not every price it rests on. It
+        // is deliberately not the table's current version: that would renumber the
+        // figure whenever an unrelated model's price was edited, naming prices this
+        // total never touched. A figure that multiplied nothing — every count zero, so
+        // the total is exact under any table — reports 0, because 0 is what it used.
         return .priced(
             usd: total,
-            priceTableVersion: max(version, table.currentVersion),
+            priceTableVersion: version,
             // One line per model, so model id is a total order here and the sort is
             // stable rather than merely deterministic-ish. Before `preferredProvenance`
             // two lines could carry the same model and this comparator was not a total
