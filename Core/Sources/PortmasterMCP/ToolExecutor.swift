@@ -135,7 +135,14 @@ public struct ToolExecutor: Sendable {
             description: "AI agent sessions that have connected to this machine, newest "
                 + "first, with the tokens each one reported and what that cost. A session "
                 + "that reported nothing says so rather than reporting zero, and a model "
-                + "with no price says so rather than costing nothing.",
+                + "with no price says so rather than costing nothing. Tokens live in "
+                + "usage.segments, one entry per model: add inputTokens, outputTokens, "
+                + "cacheReadTokens and reasoningTokens across the entries for the session's "
+                + "total, because cost bills all four. A null count is missing, not zero — "
+                + "a model whose two readers disagree past the tolerance keeps its entry "
+                + "with null counts while cost.reason reads \"conflict\" and its readings sit "
+                + "in that entry's alternateTotals, which must not be added to the counts. "
+                + "A reported session can therefore hold no countable token at all.",
             arguments: [
                 (name: "limit", required: false, help: "How many sessions to return (1-100, default 20)")
             ],

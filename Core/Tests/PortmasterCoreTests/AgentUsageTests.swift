@@ -196,7 +196,7 @@ final class AgentUsageTests: XCTestCase {
     /// limitation rather than an oversight. `report_usage` sends one cumulative total for
     /// the session, so the second reading still contains the first one's tokens; keying
     /// the fold per model would count that prefix twice and price 1,000 tokens as 2,000.
-    func testASelfReportEscalatingTwoModelsIsStillOneSegment() {
+    func testASelfReportEscalatingTwoModelsCollapsesToOneSegmentAndThatFigureIsKnownWrong() {
         let sid = UUID()
         let records = [
             TokenUsageRecord(sessionID: sid, recordedAt: Date(timeIntervalSince1970: 1),
@@ -345,6 +345,149 @@ final class AgentUsageTests: XCTestCase {
         ]
         XCTAssertTrue(TokenUsage.hasMaterialDisagreement(
             segments, tolerance: Decimal(string: "0.01")!).isEmpty)
+    }
+
+    // MARK: - The one resolution both surfaces run
+
+    /// `believableSegments` replaced a rule written out twice — once by the MCP wire and
+    /// once by the Overview card — and those tests exist because the rule is now the only
+    /// place either surface can get it. They pin **both** former shapes at once: the wire
+    /// needs a contested model listed with nothing to print, and the card needs it out of
+    /// the sum while still naming it. A function that agreed with only one of them fails
+    /// here.
+
+    private func segment(
+        _ model: String, _ input: Int, _ output: Int,
+        cacheRead: Int? = nil, reasoning: Int? = nil,
+        _ provenance: TokenProvenance
+    ) -> TokenUsageSegment {
+        TokenUsageSegment(
+            modelID: model, input: input, output: output,
+            cacheRead: cacheRead, reasoning: reasoning, provenance: provenance
+        )
+    }
+
+    private func conflict(_ modelIDs: [String]) -> SessionCost {
+        .conflict(disagreements: modelIDs.map {
+            UsageDisagreement(
+                modelID: $0, totals: [.selfReported: 1_000, .parsedFromLog: 1_200]
+            )
+        })
+    }
+
+    /// Nothing to contest: every model survives, one reading each. This is the case where
+    /// the two readers agreed, and it is the one the wire and the card are both reducing.
+    func testBelievableSegmentsKeepsEveryModelWhenNoSourceDisagrees() {
+        let usage = TokenUsage.reported([
+            segment("m", 1_000, 0, .selfReported),
+            segment("m", 1_005, 0, .parsedFromLog),
+            segment("other", 400, 50, .parsedFromLog),
+        ])
+        let resolved = usage.believableSegments(
+            cost: .priced(usd: Decimal(1), priceTableVersion: 1, lines: [])
+        )
+        XCTAssertTrue(resolved.contestedModels.isEmpty)
+        XCTAssertEqual(
+            resolved.countable.map(\.modelID), ["m", "other"],
+            "one segment per model, from the source to believe"
+        )
+        XCTAssertEqual(resolved.countable.first?.input, 1_000, "the self-report wins, as priced")
+        XCTAssertTrue(resolved.hasCountableFigure)
+    }
+
+    /// A contested model is **listed but unnumbered**, which is what the wire emits and
+    /// what the card filters down to. Asserted in both directions because the two former
+    /// copies differed here and nothing else separated them.
+    func testAContestedModelIsListedButNeverCountable() {
+        let usage = TokenUsage.reported([
+            segment("m", 1_000, 0, .selfReported),
+            segment("m", 1_200, 0, .parsedFromLog),
+        ])
+        let resolved = usage.believableSegments(cost: conflict(["m"]))
+        XCTAssertEqual(resolved.segments.map(\.modelID), ["m"], "the wire still lists the model")
+        XCTAssertEqual(resolved.contestedModels, ["m"])
+        XCTAssertTrue(resolved.countable.isEmpty, "the card prints no number for it")
+        XCTAssertFalse(resolved.hasCountableFigure, "so the card must not print a zero")
+    }
+
+    /// Several models disagreeing is the ordinary multi-model shape of the same rule, and
+    /// the case where a "first one only" reading would silently drop the rest.
+    func testEveryDisagreeingModelIsContestedNotJustTheFirst() {
+        let usage = TokenUsage.reported([
+            segment("model-a", 1_000, 0, .selfReported),
+            segment("model-a", 1_200, 0, .parsedFromLog),
+            segment("model-b", 500, 0, .selfReported),
+            segment("model-b", 900, 0, .parsedFromLog),
+        ])
+        let resolved = usage.believableSegments(cost: conflict(["model-a", "model-b"]))
+        XCTAssertEqual(resolved.contestedModels, ["model-a", "model-b"])
+        XCTAssertTrue(resolved.countable.isEmpty)
+        XCTAssertFalse(resolved.hasCountableFigure)
+    }
+
+    /// Mixed: a clean model stays printable beside a contested one. Preference runs before
+    /// the contest filter — if it ran after, both readings of the contested model would
+    /// reach the sum and the clean model's count would not be the only one there.
+    func testAContestedModelDoesNotDisplaceTheCleanModelBesideIt() {
+        let usage = TokenUsage.reported([
+            segment("model-a", 400, 0, .parsedFromLog),
+            segment("model-b", 1_000, 0, .selfReported),
+            segment("model-b", 1_200, 0, .parsedFromLog),
+        ])
+        let resolved = usage.believableSegments(cost: conflict(["model-b"]))
+        XCTAssertEqual(resolved.countable.map(\.modelID), ["model-a"])
+        XCTAssertEqual(resolved.countable.first?.input, 400)
+        XCTAssertTrue(resolved.hasCountableFigure)
+    }
+
+    /// A cost case that is not a conflict must not contest anything, however its figures
+    /// compare: an unpriced model was counted, just not priced.
+    func testOnlyAConflictContestsAModel() {
+        let usage = TokenUsage.reported([segment("m", 1_000, 0, .selfReported)])
+        for cost in [
+            SessionCost.priced(usd: Decimal(1), priceTableVersion: 1, lines: []),
+            .notPriced(models: ["m"]),
+            .noUsage,
+        ] {
+            let resolved = usage.believableSegments(cost: cost)
+            XCTAssertTrue(resolved.contestedModels.isEmpty, "\(cost) is not a disagreement")
+            XCTAssertTrue(resolved.hasCountableFigure)
+        }
+    }
+
+    /// Nothing reported means no segments to believe, and `hasCountableFigure` false is
+    /// what stops a display reaching for a zero.
+    func testUnreportedUsageResolvesToNoSegmentsAtAll() {
+        let resolved = TokenUsage.notReported(reason: .awaitingFirstReport)
+            .believableSegments(cost: .noUsage)
+        XCTAssertTrue(resolved.segments.isEmpty)
+        XCTAssertTrue(resolved.contestedModels.isEmpty)
+        XCTAssertFalse(resolved.hasCountableFigure)
+    }
+
+    /// The priced total and the token total cover the same work: cache reads and
+    /// reasoning are priced separately, so a display that totals input and output alone
+    /// describes less than the money beside it. A session whose tokens are all cache reads
+    /// is the case that shows it — zero input and output, real spend.
+    func testCacheReadsAndReasoningCountTowardTheFigureCostBills() {
+        let cacheOnly = segment("m", 0, 0, cacheRead: 50_000, reasoning: nil, .parsedFromLog)
+        XCTAssertEqual(cacheOnly.comparableTotal, 0, "what the disagreement rule compares")
+        XCTAssertEqual(cacheOnly.billableTotal, 50_000, "what the display must total")
+
+        let all = segment("m", 10, 20, cacheRead: 30, reasoning: 40, .parsedFromLog)
+        XCTAssertEqual(all.billableTotal, 100)
+    }
+
+    /// An absent component is not a zero, and it contributes nothing — so the total is
+    /// what was reported, never more than the wire carries.
+    func testAnAbsentComponentContributesNothingToThePricedTotal() {
+        let usage = TokenUsage.reported([
+            segment("m", 10, 20, cacheRead: 30, reasoning: nil, .parsedFromLog)
+        ])
+        let resolved = usage.believableSegments(
+            cost: .priced(usd: Decimal(1), priceTableVersion: 1, lines: [])
+        )
+        XCTAssertEqual(resolved.countable.first?.billableTotal, 60)
     }
 
     // MARK: - Cost

@@ -447,12 +447,22 @@ struct ResourceHistoryPointPayload: Encodable {
 /// three-state value, and it would be lost the moment this payload collapsed to two
 /// integers.
 ///
-/// **Summing `segments` is the session's token count.** One entry per model, holding the
+/// **Summing `segments` is the session's token count, counting all four components on
+/// each entry** — `inputTokens`, `outputTokens`, `cacheReadTokens` and `reasoningTokens`,
+/// because that is the set `cost` prices and a total missing two of them describes less
+/// work than the money on the same payload. One entry per model, holding the
 /// one reading Portmaster believes — the same choice `TokenUsage.preferredProvenance`
 /// makes when costing, and the same one the Overview card makes, because two sources
 /// measuring one piece of work are alternative readings of it and adding them counts the
 /// session twice. A second reader of a model is therefore **not** a second segment: it
 /// rides on that segment's `alternateTotals`, where it is visible and cannot be added.
+///
+/// **The sum under-reports a contested model, and a client has to notice.** Those entries
+/// are listed with null counts, so a client that adds `seg["inputTokens"] ?? 0` drops that
+/// model's tokens and gets a smaller total with nothing in the number saying so. Null
+/// counts are the signal to look for rather than zero-fill: the same models are named by
+/// `cost.reason == "conflict"`, and both readings of each are in `alternateTotals`, so a
+/// client that wants a total it can defend checks for nulls before it adds anything up.
 ///
 /// **There is no session-wide total and no session-wide provenance.** A session can run
 /// two models, so one pair of counts would have to discard one of them — and a single
@@ -476,23 +486,21 @@ struct TokenUsagePayload: Encodable {
     /// exists not to produce: a client reads that as a session that reported and used
     /// nothing.
     ///
-    /// `cost` is read for its `conflict` case alone. The costing pass has already decided
-    /// which models two readers could not agree on, so this asks it rather than
-    /// re-deriving: a second disagreement rule here would be one more place for the two
-    /// halves of this payload to answer differently.
+    /// `cost` is read for its `conflict` case alone, and for that case only through
+    /// `believableSegments` — the same resolution the Overview card runs, so the wire and
+    /// the card cannot reach different verdicts about which models two readers could not
+    /// agree on. The costing pass has already applied the tolerance; a second disagreement
+    /// rule here would be a third answer to one question.
     init(_ usage: TokenUsage, cost: SessionCost) {
-        let contested: Set<String>
-        if case .conflict(let disagreements) = cost {
-            contested = Set(disagreements.map(\.modelID))
-        } else {
-            contested = []
-        }
+        let resolved = usage.believableSegments(cost: cost)
         switch usage {
-        case .reported(let segments):
+        case .reported(let allReadings):
             self.reported = true
-            self.segments = TokenUsage.preferredProvenance(segments).map {
+            self.segments = resolved.segments.map {
                 SegmentPayload(
-                    $0, sessionReadings: segments, isContested: contested.contains($0.modelID)
+                    $0,
+                    sessionReadings: allReadings,
+                    isContested: resolved.contestedModels.contains($0.modelID)
                 )
             }
             self.reason = nil
@@ -570,6 +578,16 @@ struct SegmentPayload: Encodable {
     /// Each value is input plus output, deliberately excluding cache reads and reasoning:
     /// that is the figure the disagreement rule compares, so it is the one an alternate
     /// has to be measured in to be worth showing.
+    ///
+    /// **The limit that leaves is that a parse's cache volume is unrecoverable.** A
+    /// self-report that never mentions cache reads and a parse reporting 50,000 of them
+    /// have the same `comparableTotal`, so the two do not disagree, the self-report wins,
+    /// and the session is priced without the cache reads — a difference in what was
+    /// billed that nothing on this wire can audit, because the reading that would show it
+    /// reports only the figure it shares with the other. `cost.lines` shows what *was*
+    /// billed, so the gap is visible as money; it is not visible as tokens. Widening this
+    /// to all four components would make it auditable and would stop it being the figure
+    /// the disagreement rule compares, so the limit is stated here rather than papered over.
     private static func totals(_ segments: [TokenUsageSegment]) -> [String: Int]? {
         guard !segments.isEmpty else { return nil }
         return segments.reduce(into: [String: Int]()) {

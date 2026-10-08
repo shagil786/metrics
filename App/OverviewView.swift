@@ -973,16 +973,17 @@ struct DonutChart: View {
 /// The token figures the sessions card is allowed to print, for one session or for
 /// the card as a whole.
 ///
-/// Resolved the way the MCP wire resolves them, because the two answer one question:
-/// `preferredProvenance` first, so summing what remains cannot report a session twice
-/// when two sources measured it, and then **no figure at all** for a model whose two
-/// readers disagree past the costing tolerance. The wire hands such a model a segment
-/// with null counts; printing one reader's number here would be a third answer to a
-/// question already answered twice, and printing a dash would claim the session spent
-/// nothing when what is missing is a reason to believe either reading.
+/// Resolution is `believableSegments`, the rule the MCP wire runs for the same question:
+/// `preferredProvenance` first, so summing what remains cannot report a session twice when
+/// two sources measured it, and then **no figure at all** for a model whose two readers
+/// disagree past the costing tolerance. The wire hands such a model a segment with null
+/// counts; printing one reader's number here would be a third answer to a question already
+/// answered twice, and printing a dash would claim the session spent nothing when what is
+/// missing is a reason to believe either reading.
 private struct SessionTokens {
-    /// One segment per model whose count is believed. Empty when nothing is countable,
-    /// which is not the same as a measured zero — that arrives as a segment reading 0.
+    /// One segment per model whose count is believed, across every session summed here.
+    /// Empty when nothing is countable, which is not the same as a measured zero — that
+    /// arrives as a segment reading 0.
     private(set) var counted: [TokenUsageSegment] = []
     /// Models two sources counted too differently to choose between: present, unnumbered.
     private(set) var contested: Set<String> = []
@@ -990,30 +991,32 @@ private struct SessionTokens {
     init(sessions: [AgentSessionSnapshot]) {
         for session in sessions {
             guard case .reported = session.usage else { continue }
-            let part = SessionTokens(usage: session.usage, cost: session.cost)
-            counted += part.counted
-            contested.formUnion(part.contested)
+            let part = session.usage.believableSegments(cost: session.cost)
+            counted += part.countable
+            contested.formUnion(part.contestedModels)
         }
     }
 
-    init(usage: TokenUsage, cost: SessionCost) {
-        guard case .reported(let segments) = usage else { return }
-        // Read from the cost rather than re-derived: the costing pass has already
-        // applied the tolerance, and a second disagreement rule here would be one more
-        // place for the card and the wire to answer differently.
-        if case .conflict(let disagreements) = cost {
-            contested = Set(disagreements.map(\.modelID))
-        }
-        counted = TokenUsage.preferredProvenance(segments)
-            .filter { !contested.contains($0.modelID) }
+    /// One session's share, resolved by the same rule the card-wide sum is.
+    init(_ resolved: BelievableSegments) {
+        counted = resolved.countable
+        contested = resolved.contestedModels
     }
 
-    /// Whether any model's count survives to be printed. **A contested model is not
-    /// one of them**: it has a reading and no reason to believe it, so a session whose
-    /// models are all contested has no figure to print and must not print a zero.
+    /// Whether any model's count survives to be printed. **A contested model is not one
+    /// of them**: it has a reading and no reason to believe it, so a session whose models
+    /// are all contested has no figure to print and must not print a zero.
     var hasCountableFigure: Bool { !counted.isEmpty }
 
-    var total: Int { counted.reduce(0) { $0 + $1.input + $1.output } }
+    /// **Cache reads and reasoning count, because the money beside this figure bills
+    /// them.** A total of input plus output alone describes less work than the dollar
+    /// figure on the same row, and the gap is worst in the case a user is most likely to
+    /// hit: a session whose only tokens are cache reads totals 0 and would print `0 tok`
+    /// beside a real price. The four components are all on the wire, so an audit that needs
+    /// them can have them; a 208pt card does not have room for a cache column beside the
+    /// model names, and a separate cache figure would be a second number to keep agreeing
+    /// with this one.
+    var total: Int { counted.reduce(0) { $0 + $1.billableTotal } }
 
     var modelCount: Int { Set(counted.map(\.modelID)).count }
 
@@ -1023,7 +1026,7 @@ private struct SessionTokens {
     var split: String {
         let counted = self.counted
             .sorted { $0.modelID < $1.modelID }
-            .map { "\($0.modelID) \(Fmt.tokens($0.input + $0.output))" }
+            .map { "\($0.modelID) \(Fmt.tokens($0.billableTotal))" }
         return (counted + contested.sorted().map { "\($0) contested" })
             .joined(separator: " · ")
     }
@@ -1060,7 +1063,7 @@ private struct SessionLine: View {
             // alternative measurements of the same work, so showing both would report
             // the tokens twice — and disagree with the cost on the right of the row,
             // which bills one of them.
-            let tokens = SessionTokens(usage: session.usage, cost: session.cost)
+            let tokens = SessionTokens(session.usage.believableSegments(cost: session.cost))
             guard tokens.hasCountableFigure else {
                 // Nothing survived to print. Contested models are named, because the
                 // repair is a user choosing a source; a fold that yielded no segment at
@@ -1109,12 +1112,19 @@ private struct SessionLine: View {
         case .conflict(let disagreements):
             // A word with nothing to act on is the wrong thing to show. The repair here
             // is choosing a source, so the two totals it is choosing between go on the
-            // row along with which source reported each.
-            guard let only = disagreements.first else { return "sources differ" }
-            let parts = only.totals
-                .sorted { $0.key.rawValue < $1.key.rawValue }
-                .map { "\($0.key.rawValue) \(Fmt.tokens($0.value))" }
-                .joined(separator: " / ")
+            // row along with which source reported each — **all of them**, because the
+            // usage cell on this same row already says how many models are contested and
+            // showing one pair here would contradict that count inside one line. A model
+            // id repeated per pair is what keeps the row unambiguous once it runs long.
+            guard !disagreements.isEmpty else { return "sources differ" }
+            let parts = disagreements.map { disagreement in
+                let totals = disagreement.totals
+                    .sorted { $0.key.rawValue < $1.key.rawValue }
+                    .map { "\($0.key.rawValue) \(Fmt.tokens($0.value))" }
+                    .joined(separator: " / ")
+                return "\(disagreement.modelID) \(totals)"
+            }
+            .joined(separator: " · ")
             return "sources differ (\(parts))"
         case .noUsage:
             // Not a dash: a dash reads as free, and a session nobody counted is not a

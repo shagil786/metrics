@@ -134,6 +134,55 @@ public struct TokenUsageSegment: Hashable, Sendable {
     /// differently enough that a source reporting them where another does not is a
     /// pricing-shape difference, not a disagreement about the total.
     public var comparableTotal: Int { input + output }
+
+    /// Every token the costing pass prices: input plus output plus cache reads plus
+    /// reasoning.
+    ///
+    /// **The figure a display must total to describe the same work its money does**, and
+    /// the four components are what `costLocked` multiplies. A token figure built on
+    /// `comparableTotal` instead describes less than the dollar figure beside it, and the
+    /// gap is largest exactly where it is most visible: a session whose tokens are all
+    /// cache reads totals zero and prints `0 tok` next to a real price.
+    public var billableTotal: Int {
+        input + output + (cacheRead ?? 0) + (reasoning ?? 0)
+    }
+}
+
+/// The segments of a session whose counts a reader may believe, and the models it may not.
+///
+/// **One rule, because two surfaces ask it.** The MCP wire answers with segments and the
+/// Overview card answers with a line of text, and each used to resolve this for itself.
+/// They agreed, and nothing held them there: the answer is contested-first,
+/// preferred-source-second, and either half written twice is one more place for them to
+/// part company.
+///
+/// A contested model is **present and unnumbered** rather than dropped. That is the whole
+/// difference between this and a filter: the model was counted, so removing it says the
+/// session spent nothing where what is missing is a reason to believe either reading.
+public struct BelievableSegments: Hashable, Sendable {
+    /// One segment per model, from the source to believe. A contested model's segment is
+    /// here too — nothing is printed from it, and the models in `contestedModels` are the
+    /// only ones whose counts are withheld, so a caller enumerating models wants it listed.
+    public let segments: [TokenUsageSegment]
+    /// Models two sources counted too differently to choose between. Read from the cost,
+    /// not recomputed: the costing pass has already applied the tolerance, and a second
+    /// disagreement rule here would be a third answer to that question.
+    public let contestedModels: Set<String>
+
+    /// The segments whose counts may be printed: `segments` minus the contested models.
+    public var countable: [TokenUsageSegment] {
+        segments.filter { !contestedModels.contains($0.modelID) }
+    }
+
+    /// Whether any model's count survives to be printed. **A contested model is not one
+    /// of them**: a session whose models are all contested has no figure to print, and must
+    /// not print a zero.
+    public var hasCountableFigure: Bool { !countable.isEmpty }
+
+    public init(segments: [TokenUsageSegment], contestedModels: Set<String>) {
+        self.segments = segments
+        self.contestedModels = contestedModels
+    }
 }
 
 /// Two sources reporting the same model with totals too far apart to be the same
@@ -190,6 +239,11 @@ public enum TokenUsage: Hashable, Sendable {
 
     /// Whether a figure exists. A measured zero is `true`; "we cannot tell" is
     /// `false`. Conflating them is the whole bug this type prevents.
+    ///
+    /// **Kept with no production reader.** The card and the wire both switch on the two
+    /// cases, so nothing calls this — but it is the one expression of the distinction this
+    /// type exists for that can be asserted directly, and the test that asserts it would
+    /// otherwise have to restate the switch the accessor exists to replace.
     public var isReported: Bool {
         if case .reported = self { return true }
         return false
@@ -339,6 +393,33 @@ public enum TokenUsage: Hashable, Sendable {
             }
         }
         return found
+    }
+
+    /// Resolves a session's usage against its cost into the segments a reader may print.
+    ///
+    /// The disagreement comes from the cost rather than from a disagreement rule run here,
+    /// so the wire and the card cannot each reach their own verdict about which models two
+    /// readers could not agree on.
+    ///
+    /// Order matters, and the contested set is consulted first only because it is the
+    /// cheaper fact. Source preference is applied to *every* segment, contested ones
+    /// included: a contested model's counts are withheld either way, so choosing between
+    /// its two readings here would be precisely the arbitrary choice the segment refuses to
+    /// make. Preference also still has to run before the contest filter, or a self-report
+    /// and a parse of a contested model would both survive it as countable segments.
+    public func believableSegments(cost: SessionCost) -> BelievableSegments {
+        guard case .reported(let segments) = self else {
+            return BelievableSegments(segments: [], contestedModels: [])
+        }
+        let contested: Set<String>
+        if case .conflict(let disagreements) = cost {
+            contested = Set(disagreements.map(\.modelID))
+        } else {
+            contested = []
+        }
+        return BelievableSegments(
+            segments: TokenUsage.preferredProvenance(segments), contestedModels: contested
+        )
     }
 }
 
