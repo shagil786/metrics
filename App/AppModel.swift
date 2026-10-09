@@ -46,6 +46,12 @@ final class AppModel: ObservableObject {
     /// nothing for a setting to turn off.
     ///
     /// `nil` is therefore only ever the store's nil. Not a second failure state.
+    ///
+    /// Its pass callback reports to `AppModel.shared` rather than to the instance that
+    /// built it, deliberately: `preview: true` is never constructed, so `shared` is the
+    /// owner, and capturing `self` strongly would close a cycle — model, poller,
+    /// closure, model. A second instance would build a poller whose callback still
+    /// reported to `shared`.
     private(set) var agentSourcePoller: AgentSourcePoller?
     /// Prices set in Settings, refreshed after each edit rather than observed.
     ///
@@ -317,7 +323,12 @@ final class AppModel: ObservableObject {
     ///
     /// Best-effort is the honest word: a pass already running is not interrupted and not
     /// waited for, so a pass that had written but not yet flushed at quit ends where the
-    /// process ends. What stopping does buy is that no further pass starts.
+    /// process ends. What stopping does buy is that the timer stops ticking — no further
+    /// *scheduled* pass starts — and even that has a margin: a `requestPoll()` already
+    /// enqueued on the poller's queue still runs its pass, because `stop()` cancels the
+    /// timer and does not drain the queue. Stopping is not terminal either: a later
+    /// `start()` begins the poller again, the way `MCPHostController` can be restarted
+    /// once a stop has dropped its host.
     func stopAgentSources() {
         agentSourcePoller?.stop()
     }

@@ -178,6 +178,32 @@ final class AgentSourcePollerTests: XCTestCase {
         )
     }
 
+    /// The poller's live timer, or `nil` when it holds none.
+    ///
+    /// Read through `Mirror` because the timer is `private` and there is no accessor —
+    /// and because it is the one thing the ask counts structurally cannot see: the next
+    /// scheduled tick is thirty seconds out, so a poller left running and a poller
+    /// stopped look identical to every assertion about passes within any short window.
+    /// A renamed or reshaped `timer` property returns `nil`, which the callers unwrap —
+    /// so the tripwire fails loudly rather than passing over nothing.
+    private func timer(of poller: AgentSourcePoller) -> DispatchSourceTimer? {
+        Mirror(reflecting: poller).children
+            .first { $0.label == "timer" }
+            .flatMap { $0.value as? DispatchSourceTimer }
+    }
+
+    /// Polls a condition on the test's own thread until it holds or the timeout passes.
+    private func waitUntil(
+        timeout: TimeInterval = 5, _ condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return condition()
+    }
+
     // MARK: - No sessions means no walk
 
     /// **A machine with no MCP client ever connected must not stat every agent log on it
@@ -766,6 +792,97 @@ final class AgentSourcePollerTests: XCTestCase {
         XCTAssertEqual(adapter.askCount, 1, "two starts, one first pass")
         XCTAssertEqual(adapter.maxConcurrentAsks, 1, "and never two passes at once")
     }
+
+    // MARK: - Stop really stops
+
+    /// **`stop()` cancels the timer `start()` made, so no further scheduled pass can
+    /// fire.**
+    ///
+    /// `stop()` had never been observed doing anything — across every test in this file
+    /// it appears only in teardowns, where a broken stop is invisible. Ask counts
+    /// cannot see it either: the next scheduled tick is thirty seconds out, so a
+    /// poller whose timer was left running looks exactly like a stopped one for the
+    /// whole of any short assertion window. What is observable now is the timer
+    /// itself — still the same object, and cancelled — which is the whole of what
+    /// "the timer stops ticking" means. (`stop()` is not terminal and does not drain
+    /// the queue; `AppModel.stopAgentSources`' comment is where those margins are
+    /// written down.)
+    func testStopCancelsTheTimerSoNoFurtherScheduledPassCanFire() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        let adapter = OverlapProbeAdapter(
+            candidates: [candidate("a.jsonl", from: now)], askDuration: 0
+        )
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+        addTeardownBlock { poller.stop() }
+
+        poller.start()
+        XCTAssertEqual(
+            adapter.firstAskStarted.wait(timeout: .now() + 5), .success,
+            "the first pass never asked, so there was no timer to stop"
+        )
+        let live = try XCTUnwrap(
+            timer(of: poller), "start() made no timer — nothing for stop() to cancel"
+        )
+        XCTAssertFalse(live.isCancelled, "the timer the first pass ran on is still live")
+
+        poller.stop()
+        XCTAssertTrue(
+            waitUntil { live.isCancelled },
+            "stop() returned without cancelling the timer it was started with"
+        )
+
+        // A smoke window, not the proof — the proof is the cancelled flag above.
+        // Inside it the stopped poller must not have been provoked into a pass either.
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(adapter.askCount, 1, "and stop() itself provoked no extra pass")
+    }
+
+    /// **The `timer == nil` guard is what makes one `stop()` enough: the second
+    /// `start()` reuses the timer the first made, so cancelling one cancels the only
+    /// one.**
+    ///
+    /// Without the guard a second `start()` would quietly add a second live timer;
+    /// `stop()` cancels the one it holds, so the first would keep ticking — the
+    /// "poller kept polling" leak. No ask-count assertion can see that leak (the
+    /// interval gate absorbs the duplicate tick, and the orphaned timer's next fire is
+    /// thirty seconds out), which is why this compares the timer objects themselves:
+    /// two objects means a leaked one, whatever the passes in between happened to do.
+    func testStartingTwiceReusesTheOneTimerSoStopCancelsTheOnlyOne() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        let adapter = OverlapProbeAdapter(
+            candidates: [candidate("a.jsonl", from: now)], askDuration: 0
+        )
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+        addTeardownBlock { poller.stop() }
+
+        poller.start()
+        XCTAssertEqual(
+            adapter.firstAskStarted.wait(timeout: .now() + 5), .success,
+            "the first pass never asked, so no timer was ever made"
+        )
+        let first = try XCTUnwrap(timer(of: poller), "start() made no timer")
+
+        poller.start()
+        // `pollOnce` joins the poller's own queue behind the second `start()`'s block,
+        // so when it returns the second start has had its say about the timer.
+        _ = poller.pollOnce()
+        let second = try XCTUnwrap(timer(of: poller), "the second start lost the timer")
+        XCTAssertTrue(
+            first === second,
+            "the second start must reuse the first timer, or one stop cannot cancel both"
+        )
+        XCTAssertFalse(second.isCancelled)
+
+        poller.stop()
+        XCTAssertTrue(
+            waitUntil { second.isCancelled },
+            "stop() did not cancel the timer both starts shared"
+        )
+    }
 }
 
 /// What the Overview card has to be able to say, pinned as a state rather than as a
@@ -908,5 +1025,4 @@ final class AmbiguousMatchStateTests: XCTestCase {
             "and the store says `awaitingFirstReport`, because there is nothing to withdraw"
         )
     }
-
 }

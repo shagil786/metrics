@@ -6,17 +6,19 @@
 // allowed to do and which would outweigh the claims. What the repository already does
 // instead is `MCPSettingsChromeTests`: read the shipped source from the repository root
 // and assert the structure the claims rest on, with the pass-for-the-wrong-reason ways
-// closed — the file must be found (an unreadable file fails, never passes empty), and
-// every marker an assertion anchors to must exist (a renamed function fails the claim
-// about it rather than silently asserting over nothing).
+// closed — the file must be found (an unreadable file fails, never passes empty), every
+// marker an assertion anchors to must exist (a renamed function fails the claim about it
+// rather than silently asserting over nothing), and comments are stripped before any
+// matching, because a doc comment can discuss the very strings it forbids (the same
+// rule, for the same reason, as that file's `withoutComments`).
 //
 // **What this proves, and what it does not.** It proves where the poller is built —
 // once, inside the `do` that opens the store — that no second error channel exists for
-// it, where it is started and stopped from (the terminate hook, and nowhere on the
-// awaiting quit path), and that no App code calls the blocking `pollOnce` while a
-// surface asks instead. It does not prove the poller runs, that a pass logs a line, or
-// that quitting stops it: those are runtime facts, and the runtime evidence for them is
-// the production run recorded in this task's report, not this file.
+// it, where it is started and stopped from (the terminate hook, and nowhere else in
+// `App/`), and that no App code calls the blocking `pollOnce` while a surface asks
+// instead. It does not prove the poller runs or that a pass logs a line; the poller's
+// own start and stop are runtime facts pinned in `AgentSourcePollerTests`, and the
+// production run recorded in this task's report covers the app's side of them.
 
 import Foundation
 import XCTest
@@ -32,16 +34,64 @@ final class AppAgentSourceWiringTests: XCTestCase {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
 
-    /// One file's contents, or a failure naming what was missing.
+    /// One file's contents with comments stripped, or a failure naming what was missing.
     private func source(
         _ relativePath: String, file: StaticString = #filePath, line: UInt = #line
     ) throws -> String {
         let url = Self.repositoryRoot.appendingPathComponent(relativePath)
         let text = try? String(contentsOf: url, encoding: .utf8)
         return try XCTUnwrap(
-            text, "\(relativePath) was not found at \(url.path) — the scan would pass over nothing",
+            text.map(Self.withoutComments),
+            "\(relativePath) was not found at \(url.path) — the scan would pass over nothing",
             file: file, line: line
         )
+    }
+
+    /// Every `.swift` file under `App/`, concatenated with comments stripped, counted
+    /// two ways.
+    ///
+    /// **A non-Swift entry is skipped, not treated as the end of the directory.** The
+    /// directory holds only sources today, but `FileManager`'s enumeration order is
+    /// unspecified, so an asset or a `.gitignore` listed before a later source would
+    /// otherwise truncate the walk at that entry — and every whole-App assertion below
+    /// would be reading a prefix while believing it read the tree. The second count,
+    /// taken with `subpathsOfDirectory`, is what makes that truncation loud rather than
+    /// silent; an unreadable file fails by name rather than contributing `""`.
+    private func wholeAppSource(
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> String {
+        let appDirectory = Self.repositoryRoot.appendingPathComponent("App")
+        let enumerator = FileManager.default.enumerator(
+            at: appDirectory, includingPropertiesForKeys: nil
+        )
+        var scanned = ""
+        var fileCount = 0
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "swift" else { continue }
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+                XCTFail(
+                    "\(url.path) was not readable — the scan would miss it",
+                    file: file, line: line
+                )
+                continue
+            }
+            scanned += Self.withoutComments(text)
+            fileCount += 1
+        }
+        let expected = try FileManager.default
+            .subpathsOfDirectory(atPath: appDirectory.path)
+            .filter { $0.hasSuffix(".swift") }
+            .count
+        XCTAssertEqual(
+            fileCount, expected,
+            "every Swift file under App/ was scanned, not a prefix of them",
+            file: file, line: line
+        )
+        XCTAssertGreaterThan(
+            fileCount, 0, "no App sources found — the scan would pass over nothing",
+            file: file, line: line
+        )
+        return scanned
     }
 
     /// The slice from `start` to the line that closes the enclosing declaration at the
@@ -59,6 +109,58 @@ final class AppAgentSourceWiringTests: XCTestCase {
         haystack.components(separatedBy: needle).count - 1
     }
 
+    /// Every comment replaced by spaces, newlines kept, so the code's shape — and every
+    /// range an assertion anchors to — survives.
+    ///
+    /// Same rule and same reason as `MCPSettingsChromeTests.withoutComments`: a doc
+    /// comment can discuss the strings it forbids, so a comment quoting
+    /// `agentSourcePoller?.start()` inside `start()` would satisfy a presence assertion
+    /// with the real call deleted, and a mention of `.pollOnce` in any App comment would
+    /// break the scan that forbids it. Duplicated rather than shared because the two
+    /// files sit in different test targets with no utility target between them, and a
+    /// new target would outweigh the claims. Known limitation, also the precedent's: a
+    /// `//` or `/*` inside a string literal would be read as a comment; no App source
+    /// holds one today.
+    private static func withoutComments(_ source: String) -> String {
+        var characters = Array(source)
+        var index = 0
+        var inBlock = false
+        while index < characters.count {
+            let character = characters[index]
+            if inBlock {
+                if character == "*", index + 1 < characters.count, characters[index + 1] == "/" {
+                    characters[index] = " "
+                    characters[index + 1] = " "
+                    inBlock = false
+                    index += 2
+                    continue
+                }
+                if !character.isNewline { characters[index] = " " }
+                index += 1
+                continue
+            }
+            if character == "/", index + 1 < characters.count {
+                if characters[index + 1] == "*" {
+                    characters[index + 1] = " "
+                    inBlock = true
+                    index += 1
+                    continue
+                }
+                if characters[index + 1] == "/" {
+                    // A line comment runs to the newline, which is kept so the next line
+                    // starts where it would have.
+                    while index < characters.count, !characters[index].isNewline {
+                        characters[index] = " "
+                        index += 1
+                    }
+                    continue
+                }
+            }
+            index += 1
+        }
+        return String(characters)
+    }
+
     // MARK: - One `do`, one poller, one failure
 
     /// **The poller is built from the store this `do` produced, inside the `do`.** A
@@ -69,7 +171,9 @@ final class AppAgentSourceWiringTests: XCTestCase {
     /// Ordering is the assertion: open the store, build the poller from it, and be
     /// inside the `do` while doing it — each checked against the next, so moving the
     /// construction out past the `catch` fails here rather than shipping a poller with
-    /// no store to write to.
+    /// no store to write to. The `catch` is found by the failure it reports, not by
+    /// being the next `} catch {` after the build: that would be `clearHistory`'s,
+    /// which sits past any position the construction could be moved to.
     func testThePollerIsBuiltInsideTheDoThatOpensTheStore() throws {
         let app = try source("App/AppModel.swift")
         let construction = "agentSourcePoller = AgentSourcePoller"
@@ -91,8 +195,8 @@ final class AppAgentSourceWiringTests: XCTestCase {
             "the poller must be built from the store, not beside it"
         )
         let catchStart = try XCTUnwrap(
-            app.range(of: "} catch {", range: build.upperBound..<app.endIndex),
-            "the `do` that builds the poller has no `catch`"
+            app.range(of: "} catch {\n            agentSessionError"),
+            "the `do` that builds the poller has no catch that reports the store's failure"
         )
         XCTAssertTrue(
             build.upperBound < catchStart.lowerBound,
@@ -109,15 +213,19 @@ final class AppAgentSourceWiringTests: XCTestCase {
         let app = try source("App/AppModel.swift")
         let build = try XCTUnwrap(app.range(of: "agentSourcePoller = AgentSourcePoller"))
         let catchStart = try XCTUnwrap(
-            app.range(of: "} catch {", range: build.upperBound..<app.endIndex),
-            "the `do` that builds the poller has no `catch`"
+            app.range(
+                of: "} catch {\n            agentSessionError",
+                range: build.upperBound..<app.endIndex
+            ),
+            "the `do` that builds the poller has no catch that reports the store's failure"
         )
-        // The catch body: statements at eight spaces, closed by the next line at eight.
+        // The catch body, read from the line that opens it: statements at twelve
+        // spaces, closed by the line at eight.
         let bodyEnd = try XCTUnwrap(
             app.range(of: "\n        }", range: catchStart.upperBound..<app.endIndex),
             "the `catch` has no body to read"
         )
-        let body = String(app[catchStart.upperBound..<bodyEnd.lowerBound])
+        let body = String(app[catchStart.lowerBound..<bodyEnd.lowerBound])
         XCTAssertFalse(
             body.contains("agentSourcePoller"),
             "the failure path builds nothing — a store that would not open has no poller"
@@ -173,6 +281,13 @@ final class AppAgentSourceWiringTests: XCTestCase {
             occurrences(of: "agentSourcePoller?.start()", in: startBody), 1,
             "started from `start()` — construction starts nothing, by design"
         )
+        // And from nowhere else in `App/`: the property's getter is internal, so any
+        // file in the app could reach it, and the name's "only" is a claim about the
+        // whole app rather than about this one file.
+        XCTAssertEqual(
+            occurrences(of: "agentSourcePoller?.start()", in: try wholeAppSource()), 1,
+            "started from `start()` and from nowhere else in the app"
+        )
     }
 
     /// **Quit stops it from the terminate hook, and from nowhere else.**
@@ -181,11 +296,15 @@ final class AppAgentSourceWiringTests: XCTestCase {
     /// poller outlives a quit that asked it to stop), and the awaiting quit path must
     /// not (or the stop is skipped on exactly the quits where no host is bound, which
     /// is most of them — that path answers `.terminateNow` and never runs its task).
+    /// "Nowhere else" is counted over all of `App/`, not just the delegate: a second
+    /// stop in any other file would stop the poller on a path this file cannot see.
     func testQuitStopsThePollerFromTheTerminateHookAndFromNowhereElse() throws {
         let delegate = try source("App/PortmasterApp.swift")
+        let wholeApp = try wholeAppSource()
         XCTAssertEqual(
-            occurrences(of: "stopAgentSources()", in: delegate), 1,
-            "one call site in the whole delegate"
+            occurrences(of: "stopAgentSources()", in: wholeApp), 2,
+            "one call across all of App, plus the model's declaration — a second call "
+                + "site anywhere would be three"
         )
 
         let willTerminate = try XCTUnwrap(
@@ -206,9 +325,8 @@ final class AppAgentSourceWiringTests: XCTestCase {
             "not on the awaiting path, which a quit with no host bound never runs"
         )
 
-        let app = try source("App/AppModel.swift")
         XCTAssertEqual(
-            occurrences(of: "agentSourcePoller?.stop()", in: app), 1,
+            occurrences(of: "agentSourcePoller?.stop()", in: wholeApp), 1,
             "the model's stop funnels through one place: `stopAgentSources()`"
         )
     }
@@ -222,17 +340,7 @@ final class AppAgentSourceWiringTests: XCTestCase {
     /// scanned, not just `AppModel`, because a call added to any surface is the same
     /// defect.
     func testASurfaceAsksForAPollAndNeverCallsTheBlockingOne() throws {
-        let enumerator = FileManager.default.enumerator(
-            at: Self.repositoryRoot.appendingPathComponent("App"),
-            includingPropertiesForKeys: nil
-        )
-        var appSource = ""
-        var fileCount = 0
-        while let url = enumerator?.nextObject() as? URL, url.pathExtension == "swift" {
-            appSource += (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            fileCount += 1
-        }
-        XCTAssertGreaterThan(fileCount, 0, "no App sources found — the scan would pass over nothing")
+        let appSource = try wholeAppSource()
         XCTAssertEqual(
             occurrences(of: ".pollOnce", in: appSource), 0,
             "the blocking poll belongs to tests and diagnostics, never to a surface"
