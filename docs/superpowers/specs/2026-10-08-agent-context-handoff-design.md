@@ -1,7 +1,7 @@
 # Agent context handoff — Design
 
 Date: 2026-10-08
-Status: Approved design, pending spec review
+Status: Approved design, spec-reviewed 2026-10-10 (amendments at the end)
 Path: Architectural
 **Depends on:** `2026-10-08-per-model-token-segments-design.md` (`783df64`).
 Chain totals require per-model pricing, so this cannot be implemented before
@@ -34,19 +34,27 @@ summarised itself. So the affordance offers **both**, and the user chooses.
 Verified against the one session log on this machine:
 
 - Claude Code writes `<total_tokens>N tokens left</total_tokens>` into its own
-  log. **158 readings, 5 distinct values**, decreasing 15000000 → 14999357.
+  log. **311 readings, 5 distinct values**, decreasing 15000000 → 14999357.
   Context pressure is therefore knowable from the file we already parse.
+- The signal is **not** a top-level `"type":"total_tokens_reminder"` entry as
+  first assumed (zero exist). It is nested:
+  `{"type":"attachment","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>N tokens left</total_tokens>"}}`
+  — 129 such entries. The parser must read the nested shape.
 - The log contains the user's real request text, 116 user turns, 130 assistant
   turns, and every `tool_use` entry with its command line. Everything a brief
   needs is on disk.
 
 **Not verified:**
 
-- **The log contains no quota messages at all.** An earlier claim of "10 quota
-  signals" in this log was wrong: the regex matched `429` inside UUIDs. Zero
-  real quota messages exist. Quota exhaustion is **not detectable** by us, and
-  this design does not pretend otherwise — it triggers on context pressure,
-  which is the thing we can actually see.
+- **Usage-quota exhaustion is not detectable, and this design does not pretend
+  otherwise** — it triggers on context pressure, which is the thing we can
+  actually see. Two corrections to earlier claims, both real errors: the first
+  draft's "10 quota signals" was a regex matching `429` inside UUIDs; the
+  second draft's "zero quota messages exist" is **now false** — logs on this
+  machine contain `isApiErrorMessage:true, error:"rate_limit",
+  apiErrorStatus:429` entries (70+ files). Those are per-minute rate limits,
+  often transient (`apiErrorIsTransient`), not rolling-window quota state, and
+  the design deliberately does not trigger on either.
 - **Sample size is 1**, and that session is exploratory: 86 bash calls, **0
   commits, 0 recognised test runs**. Whether brief extraction produces useful
   output on real working sessions is untested.
@@ -61,9 +69,20 @@ A session records the **minimum** `tokens left` it has reported — peak pressur
 — not the latest. Latest would be wrong: readings oscillate as sub-contexts
 open and close, so the final value is not the worst one experienced.
 
+Data path (amendment): pressure does **not** ride `TokenSourceAdapter.parse`,
+which returns `[RawAgentUsage]` and skips non-`modelUsage` lines by design. A
+separate extractor reads the nested `attachment` shape and returns a
+`PressureReading?`; the existing `AgentLogMatcher` pass attributes it to a
+session, and the session row gains `peakPressureTokens: Int?` folded as
+`min(existing, new)` across passes. Usage and pressure stay independent
+provenances.
+
 Both options are offered at pressure:
 
-- **Continue here** — invoke the same agent's own summarisation.
+- **Continue here** — the same agent's own summarisation. *Amendment:* we cannot
+  invoke it — the agent's `/compact` lives in its own TTY and we hold no channel
+  to it. The affordance therefore **offers the exact command to run** rather than
+  running it; "invoke" was unbuildable as written.
 - **Hand off** — the automatic path below.
 
 ### 2. The brief: every claim sourced
@@ -174,3 +193,70 @@ second adapter exists.
 - **Evidence is one exploratory session.** Brief quality on real working sessions
   is unmeasured. The first implementation should be read on real logs before the
   gate is opened.
+
+## Spec review amendments (2026-10-10)
+
+A codebase review against `main @ 8327ebb` found the design unexecutable as
+written in seven places. Each amendment below is binding on the implementation.
+
+1. **Chain identification (`handedOffTo`) was unspecified.** At handoff time we
+   record the spawned process's PID on the source session
+   (`handoffTargetPID: Int32?`); when a session later connects with
+   `peerPID == handoffTargetPID`, the store — under its existing `NSLock` — sets
+   `source.handedOffTo` and `target.handoffFrom` in one write. No session with
+   that PID ever arriving leaves `handedOffTo == nil`: the chain stays one
+   session, which is an honest absence, not a zero. Caveat known from
+   `MCPHostServer`: `peerPID` is the process that connects to `mcp.sock` (often
+   a CLI's relay child), so a relay whose PID differs from the spawned CLI will
+   not link.
+2. **Once-only and cycle-freedom** are cross-row invariants SwiftData cannot
+   express. Enforced in `AgentSessionStore` under `NSLock`: refuse a second
+   handoff from a source (`handedOffTo != nil`) or into a target
+   (`handedOffFrom != nil`), returning the reason. Each node having ≤1 outgoing
+   edge is what structurally prevents cycles — no separate cycle check.
+3. **Migration:** `handedOffFrom`, `handedOffTo`, `handoffTargetPID` and
+   `peakPressureTokens` are optional properties on the existing unversioned
+   `ModelContainer` — lightweight migration. The repo has zero migration tests;
+   one smoke test (open a pre-change store file, add the fields, re-open) ships
+   with the task that adds them.
+4. **The gate stays one enforcement point:** handoff is a mutation-effect
+   catalog tool (`handoff_context`) going through `PermissionGate.decide` and
+   `AuditLog` like every other mutation. A UI affordance is disabled and
+   explanatory outside `.allowSession`, mirroring the same mode read — not a
+   second gate implementation.
+5. **Kill switch lives in `AppPreferences`, not `MCPSettings`.** `MCPSettings.load`
+   falls back to defaults on any decode error, so adding a field would silently
+   reset every existing user's mutation mode to `.off`. `AppPreferences` already
+   uses `decodeIfPresent` throughout.
+6. **Brief persistence:** written to `~/.portmaster/handoffs/<session-uuid>.md`
+   *before* launch (the dry run); the audit line cites the path plus the log
+   line numbers, rather than inlining a multi-KB brief as an argument value.
+7. **Launch seam:** `SubprocessRunner.run` sets `standardInput =
+   FileHandle.nullDevice`, so "brief on stdin" needs a new stdin-capable seam;
+   `workingDirectory` is not on the session row (the log has `cwd`, we do not),
+   so it is parsed at extraction time and carried with the brief — never guessed.
+8. **Affordance placement:** the sessions card's footer is a fixed 30pt strip in
+   a 208pt card and the card has no `detailLink` — two action buttons do not
+   fit without redesigning it. `worthALook`/`ActingUpAlert.Kind` is closed and
+   wrong-shaped (engine-sampled vitals, not log-derived state). The pressure
+   state is a dedicated `@Published` on `AppModel`, fed by the poller pass like
+   `agentSourcePassCompleted`, rendered as its own strip above the overview
+   grid; the actions live in a sheet on that strip. No new `MainTab`, no fifth
+   `ActingUpAlert.Kind`, no footer surgery.
+9. **What the number means is unverified — and the spec's label was wrong to
+   assume.** Claude Code's own source map (harness.dtmont.com, "Remaining
+   tokens") shows the attachment's mode is session-latched and its meaning
+   mode-dependent: `countdown` = model context budget − tokens used,
+   `padded-countdown` = task budget remaining, `fixed` = constant `5000000`,
+   `infinite` = the literal text `Infinite`. Our log (78 reminders, 116 user
+   turns) shows a ceiling of exactly 15000000, plateaus, and **only two
+   resets** — each immediately after an ordinary user prompt, each back to the
+   exact ceiling, with **no compaction and no sidechain** in the file. Context
+   consumption cannot explain it (the same session measured 16,739 output
+   tokens while the counter moved −643). So: (a) the parser must tolerate a
+   non-numeric `Infinite` and treat it as no reading, (b) the UI quotes the
+   log's own words — `N tokens left` — and never renames it "context window",
+   (c) the §1 trigger tracks worst-observed, and (d) the strip's appearance
+   threshold is a **provisional literal** (worst ≤ half of the session's first
+   reading, so a counter that never erodes never shouts), recorded like the 1%
+   tolerance: unvalidated, one call site, named in the plan.
