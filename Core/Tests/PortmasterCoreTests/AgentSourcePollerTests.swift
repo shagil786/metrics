@@ -23,6 +23,15 @@ final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
     /// case the poller has to survive, and the only way to reach
     /// `.unrecognizedFormat` as distinct from `.logUnreadable`.
     var parseFailures: [String: TokenSourceError] = [:]
+    /// What `contextPressure` reports. `nil` (the default) keeps every existing test
+    /// asserting what it asserted before this field existed.
+    var pressure: PressureReading?
+    /// What `parse` returns for a file that parses normally. Replaceable so a test can
+    /// model a file with usage worth nothing without a second adapter type.
+    var parsedUsage: [RawAgentUsage] = [
+        RawAgentUsage(input: 100, output: 50, cacheRead: nil, reasoning: nil, modelID: "model-a"),
+        RawAgentUsage(input: 200, output: 75, cacheRead: nil, reasoning: nil, modelID: "model-b"),
+    ]
 
     private let lock = NSLock()
     private var _logCandidatesCalls = 0
@@ -67,11 +76,10 @@ final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
         let failure = parseFailures[url.lastPathComponent]
         lock.unlock()
         if let failure { throw failure }
-        return [
-            RawAgentUsage(input: 100, output: 50, cacheRead: nil, reasoning: nil, modelID: "model-a"),
-            RawAgentUsage(input: 200, output: 75, cacheRead: nil, reasoning: nil, modelID: "model-b"),
-        ]
+        return parsedUsage
     }
+
+    func contextPressure(at url: URL) -> PressureReading? { pressure }
 }
 
 /// Records when it was asked, not only how often, so a test can see whether two
@@ -276,6 +284,67 @@ final class AgentSourcePollerTests: XCTestCase {
         for session in try store.sessions() {
             XCTAssertFalse(session.usage.isReported, "a contested log must leave no figure behind")
         }
+    }
+
+    // MARK: - Context pressure
+
+    /// A uniquely matched conversation's pressure reading reaches the session, folded
+    /// onto the same row the usage figure would land on.
+    func testAUniqueMatchRecordsTheAdaptersPressureReading() throws {
+        let store = try makeStore()
+        let now = Date()
+        let sessionID = try recordSession(store, connectedAt: now)
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
+        adapter.pressure = PressureReading(tokensLeft: 14_999_357, lineNumber: 4)
+
+        let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+            .pollOnce()
+
+        let snapshot = try store.sessions().first { $0.id == sessionID }!
+        XCTAssertEqual(snapshot.tokensLeftFirst, 14_999_357)
+        XCTAssertEqual(snapshot.tokensLeftWorst, 14_999_357)
+        XCTAssertEqual(pass.pressureUpdates, 1, "one matched session, one update")
+    }
+
+    /// The one-to-one rule is one rule, not one rule for numbers and another for text:
+    /// a conversation several connections contend for attributes nothing.
+    func testAContestedSessionGetsNoPressure() throws {
+        let store = try makeStore()
+        let now = Date()
+        var sessionIDs: [UUID] = []
+        for offset in [-600.0, -300.0, 0.0] {
+            sessionIDs.append(try recordSession(store, connectedAt: now.addingTimeInterval(offset)))
+        }
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
+        adapter.pressure = PressureReading(tokensLeft: 14_999_357, lineNumber: 4)
+
+        let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+            .pollOnce()
+
+        for id in sessionIDs {
+            let snapshot = try store.sessions().first { $0.id == id }!
+            XCTAssertNil(snapshot.tokensLeftWorst, "a contested conversation leaves no pressure behind")
+        }
+        XCTAssertEqual(pass.pressureUpdates, 0, "no session may claim a contested reading")
+    }
+
+    /// Absence of usage and absence of pressure are independent facts: a parse that
+    /// finds nothing does not silence a pressure reading the same file carries.
+    func testPressureIsRecordedWhenNoUsageWas() throws {
+        let store = try makeStore()
+        let now = Date()
+        let sessionID = try recordSession(store, connectedAt: now)
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
+        adapter.parsedUsage = []
+        adapter.pressure = PressureReading(tokensLeft: 14_999_357, lineNumber: 4)
+
+        let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+            .pollOnce()
+
+        XCTAssertTrue(pass.records.isEmpty, "a file with no usage writes no usage")
+        XCTAssertEqual(pass.pressureUpdates, 1, "a pressure reading stands on its own")
+        let snapshot = try store.sessions().first { $0.id == sessionID }!
+        XCTAssertEqual(snapshot.tokensLeftWorst, 14_999_357)
     }
 
     // MARK: - What a pass persists

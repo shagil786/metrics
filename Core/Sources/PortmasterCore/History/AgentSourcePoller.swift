@@ -84,6 +84,10 @@ public struct AgentSourcePass: Hashable, Sendable {
     public let withdrawals: [TokenUsageRecord]
     public let absences: [AgentSourceAbsence]
     public let failures: [AgentSourceFailure]
+    /// Pressure readings folded onto sessions this pass. Counted apart from
+    /// `records`: a pass can move pressure with no usage figure at all, and the
+    /// two are independent facts about what the pass established.
+    public let pressureUpdates: Int
 
     public init(
         at: Date,
@@ -92,7 +96,8 @@ public struct AgentSourcePass: Hashable, Sendable {
         records: [TokenUsageRecord],
         withdrawals: [TokenUsageRecord],
         absences: [AgentSourceAbsence],
-        failures: [AgentSourceFailure]
+        failures: [AgentSourceFailure],
+        pressureUpdates: Int
     ) {
         self.at = at
         self.sessionsConsidered = sessionsConsidered
@@ -101,6 +106,7 @@ public struct AgentSourcePass: Hashable, Sendable {
         self.withdrawals = withdrawals
         self.absences = absences
         self.failures = failures
+        self.pressureUpdates = pressureUpdates
     }
 
     /// A pass that was over before any source was asked. Used for the two early returns
@@ -115,7 +121,8 @@ public struct AgentSourcePass: Hashable, Sendable {
             records: [],
             withdrawals: [],
             absences: [],
-            failures: failures
+            failures: failures,
+            pressureUpdates: 0
         )
     }
 }
@@ -264,6 +271,7 @@ public final class AgentSourcePoller: @unchecked Sendable {
         var withdrawals: [TokenUsageRecord] = []
         var absences: [AgentSourceAbsence] = []
         var failures: [AgentSourceFailure] = []
+        var pressureUpdates = 0
 
         // **What this store already believes, per session and provenance.** Read once, and
         // read for a reason: a refusal only withdraws a figure that exists, and a pass
@@ -297,9 +305,10 @@ public final class AgentSourcePoller: @unchecked Sendable {
             // pass's single clock reading, neither of which varies with the session.
             let runner = TokenSourceRunner(adapter: adapter, now: { now })
             for session in sessions {
+                let match = matches[session.id] ?? .ambiguous(count: 0)
                 switch runner.run(
                     sessionID: session.id,
-                    match: matches[session.id] ?? .ambiguous(count: 0),
+                    match: match,
                     readsParsedUsage: alreadyParsed.contains(session.id)
                 ) {
                 case .reported(let found):
@@ -349,6 +358,23 @@ public final class AgentSourcePoller: @unchecked Sendable {
                         sessionID: session.id, source: adapter.identifier, reason: reason
                     ))
                 }
+                // Pressure is attributed by the same one-to-one rule as usage: a conversation
+                // two connections contend for attributes nothing, because a claim it cannot
+                // support is the one thing this pass never makes.
+                if case .unique(let candidate) = match,
+                   let reading = adapter.contextPressure(at: candidate.url) {
+                    do {
+                        try store.recordPressure(
+                            sessionID: session.id, tokensLeft: reading.tokensLeft)
+                        pressureUpdates += 1
+                    } catch {
+                        NSLog("Portmaster agent source poll could not record pressure: \(error)")
+                        failures.append(AgentSourceFailure(
+                            source: adapter.identifier, sessionID: session.id,
+                            detail: "\(error)"
+                        ))
+                    }
+                }
             }
         }
 
@@ -372,7 +398,8 @@ public final class AgentSourcePoller: @unchecked Sendable {
             records: records,
             withdrawals: withdrawals,
             absences: absences,
-            failures: failures
+            failures: failures,
+            pressureUpdates: pressureUpdates
         )
     }
 }

@@ -717,6 +717,26 @@ final class AgentSessionToolTests: XCTestCase {
         XCTAssertNil(row["peerPID"], "an unmeasurable pid must not cross the wire as 0")
     }
 
+    /// Pressure reaches the wire as integers when a reading exists, and the keys
+    /// are absent — not null and not zero — when none does: the same absent-key
+    /// contract the usage and pid figures follow.
+    func testPressureReadsReachTheWireAsIntegersOrNotAtAll() async throws {
+        let base = Date(timeIntervalSince1970: 1_000)
+        let none = try recorded(usage: [], connectedAt: base)
+        let some = try recorded(usage: [], connectedAt: base.addingTimeInterval(1))
+        try store.recordPressure(sessionID: some.id, tokensLeft: 1_234)
+        try store.flush()
+
+        let json = try await wire()
+        let rows = try XCTUnwrap(json["sessions"] as? [[String: Any]])
+        let noneRow = try XCTUnwrap(rows.first { $0["id"] as? String == none.id.uuidString })
+        XCTAssertNil(noneRow["tokensLeftFirst"], "no reading is an absent key, never null")
+        XCTAssertNil(noneRow["tokensLeftWorst"], "no reading is an absent key, never null")
+        let someRow = try XCTUnwrap(rows.first { $0["id"] as? String == some.id.uuidString })
+        XCTAssertEqual(someRow["tokensLeftFirst"] as? Int, 1_234)
+        XCTAssertEqual(someRow["tokensLeftWorst"] as? Int, 1_234)
+    }
+
     // MARK: - The tool contract
 
     func testToolIsAReadWithOnlyOptionalArguments() {

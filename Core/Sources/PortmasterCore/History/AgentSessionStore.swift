@@ -27,6 +27,13 @@ public final class AgentSession {
     public var lastToolCallAt: Date?
     /// Nil while the socket is open, which outlives the process.
     public var endedAt: Date?
+    /// First numeric `tokens left` this session's conversation reported, per the poller.
+    /// `nil` means no reading exists — never that the budget is empty.
+    public var tokensLeftFirst: Int?
+    /// Worst (minimum) `tokens left` observed across passes. Fold: set on first
+    /// observation, thereafter `min(existing, new)` — a recovery is not a rewrite of
+    /// what the session already survived.
+    public var tokensLeftWorst: Int?
 
     public init(
         id: UUID, peerPID: Int32, clientName: String?, clientVersion: String?,
@@ -166,6 +173,10 @@ public struct AgentSessionSnapshot: Sendable {
     public let clientVersion: String?
     public let connectedAt: Date
     public let endedAt: Date?
+    /// First numeric `tokens left` this session reported, or `nil` when no reading exists.
+    public let tokensLeftFirst: Int?
+    /// Worst (minimum) `tokens left` observed, or `nil` when no reading exists.
+    public let tokensLeftWorst: Int?
     public let usage: TokenUsage
     public let cost: SessionCost
 }
@@ -239,6 +250,22 @@ public final class AgentSessionStore: @unchecked Sendable {
     public func recordUsage(_ record: TokenUsageRecord) throws {
         lock.lock(); defer { lock.unlock() }
         context.insert(TokenUsageRecordRow(from: record))
+    }
+
+    /// Folds one pressure observation onto the session. The only two facts kept are the
+    /// first value seen and the worst value seen; intermediate values are deliberately
+    /// not stored, because the strip needs a reference point and a floor, not a history.
+    ///
+    /// `throws` for symmetry with `recordSession`/`recordUsage` (neither has a throwing
+    /// body either), and no save: persistence rides the pass's existing `flush()` at the
+    /// end of `AgentSourcePoller.runPass`, so a save here would be a second write
+    /// discipline to keep in step with the first.
+    public func recordPressure(sessionID: UUID, tokensLeft: Int) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard let session = fetchSession(sessionID) else { return }
+        if session.tokensLeftFirst == nil { session.tokensLeftFirst = tokensLeft }
+        session.tokensLeftWorst =
+            session.tokensLeftWorst.map { min($0, tokensLeft) } ?? tokensLeft
     }
 
     public func setPrice(_ price: Decimal, modelID: String, component: PriceComponent = .input) throws {
@@ -355,6 +382,8 @@ public final class AgentSessionStore: @unchecked Sendable {
                 clientVersion: row.clientVersion,
                 connectedAt: row.connectedAt,
                 endedAt: row.endedAt,
+                tokensLeftFirst: row.tokensLeftFirst,
+                tokensLeftWorst: row.tokensLeftWorst,
                 usage: TokenUsage.aggregating(records),
                 cost: costLocked(records: records, table: table)
             )

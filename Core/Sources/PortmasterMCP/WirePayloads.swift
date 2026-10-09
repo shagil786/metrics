@@ -703,6 +703,11 @@ struct AgentSessionPayload: Encodable {
     /// reading this payload has no way to know 0 means "unknown". The same rule
     /// `MCPSettingsCopy` follows when it renders a process as "not known".
     let peerPID: Int32?
+    /// First / worst numeric `tokens left` observed for this session. Omitted from
+    /// the JSON when no reading exists — a client that shows `0` here is misreading
+    /// the contract.
+    public let tokensLeftFirst: Int?
+    public let tokensLeftWorst: Int?
     /// Always nil on the socket path today: the MCP SDK consumes the `initialize`
     /// handshake, so nothing in the host sees a client name. Carried anyway so a
     /// payload built elsewhere with one does not lose it.
@@ -721,6 +726,8 @@ struct AgentSessionPayload: Encodable {
     init(_ session: AgentSessionSnapshot, isOpen: Bool) {
         self.id = session.id.uuidString
         self.peerPID = session.peerPID > 0 ? session.peerPID : nil
+        self.tokensLeftFirst = session.tokensLeftFirst
+        self.tokensLeftWorst = session.tokensLeftWorst
         self.clientName = session.clientName
         self.clientVersion = session.clientVersion
         self.connectedAt = session.connectedAt

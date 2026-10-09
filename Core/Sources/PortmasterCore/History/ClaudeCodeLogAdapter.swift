@@ -382,6 +382,13 @@ public struct ClaudeCodeLogAdapter: TokenSourceAdapter {
         year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
     }
 
+    /// The conversation's context-pressure reminder from the Claude Code log. A read
+    /// failure yields no reading, which is honest: we do not know, rather than
+    /// knowing zero.
+    public func contextPressure(at url: URL) -> PressureReading? {
+        try? ContextPressureExtractor.peak(in: url)
+    }
+
     /// Parses the summary lines into one entry per model.
     ///
     /// **Throws rather than returning a partial total** if the file parses as JSONL

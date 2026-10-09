@@ -68,6 +68,16 @@ public protocol TokenSourceAdapter: Sendable {
     /// Parses a located log into one entry per model. Throws
     /// `TokenSourceError.unrecognizedFormat` rather than returning partial counts.
     func parse(_ url: URL) throws -> [RawAgentUsage]
+
+    /// Peak `tokens left` this source's format reports, or `nil` when it has no such
+    /// signal. A format without the concept still conforms — absence is the answer
+    /// for it, not an error, which is why the default below returns `nil`.
+    func contextPressure(at url: URL) -> PressureReading?
+}
+
+extension TokenSourceAdapter {
+    /// The default answer for a format that has not been taught the signal.
+    public func contextPressure(at url: URL) -> PressureReading? { nil }
 }
 
 /// What an adapter run produced: records to append, or a reason there are none.

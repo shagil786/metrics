@@ -4,6 +4,7 @@
 import XCTest
 import Foundation
 import SwiftData
+import CoreData
 @testable import PortmasterCore
 
 final class AgentSessionStoreTests: XCTestCase {
@@ -144,6 +145,84 @@ final class AgentSessionStoreTests: XCTestCase {
         let sid = UUID()
         try store.recordSession(id: sid, peerPID: 1, clientName: "a", clientVersion: nil, connectedAt: Date())
         XCTAssertEqual(try store.usage(for: sid), .notReported(reason: .awaitingFirstReport))
+    }
+
+    // MARK: - Context pressure
+
+    func testFirstReadingIsSetOnceAndWorstOnlyFalls() throws {
+        let store = try makeStore()
+        let id = UUID()
+        try store.recordSession(id: id, peerPID: 1, clientName: "c", clientVersion: nil,
+                                connectedAt: Date())
+        try store.recordPressure(sessionID: id, tokensLeft: 5000)
+        try store.recordPressure(sessionID: id, tokensLeft: 4000)
+        try store.recordPressure(sessionID: id, tokensLeft: 6000)
+        let s = try store.sessions().first { $0.id == id }!
+        XCTAssertEqual(s.tokensLeftFirst, 5000, "first means first observed, set once")
+        XCTAssertEqual(s.tokensLeftWorst, 4000, "worst means minimum; a later recovery is not history")
+    }
+
+    func testPressureForAnUnknownSessionRecordsNothing() throws {
+        let store = try makeStore()
+        try store.recordPressure(sessionID: UUID(), tokensLeft: 123)
+        XCTAssertTrue(try store.sessions().isEmpty, "no row is invented for an id we do not have")
+    }
+
+    /// A pre-change app's store file must still open — that is what an upgrading
+    /// user brings. The old schema is built with a programmatic model rather than
+    /// by dropping columns from a current store: a dropped column leaves the store
+    /// metadata claiming the current model version, so CoreData skips lightweight
+    /// migration and the fetch errors — while a file the old model actually wrote
+    /// is the honest simulation.
+    func testAStoreWrittenBeforeTheFieldsExistedStillOpens() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("agent-sessions.sqlite")
+
+        let id = UUID()
+        let entity = NSEntityDescription()
+        entity.name = "AgentSession"
+        entity.managedObjectClassName = "NSManagedObject"
+        func attr(_ name: String, _ type: NSAttributeType, optional: Bool) -> NSAttributeDescription {
+            let a = NSAttributeDescription()
+            a.name = name
+            a.attributeType = type
+            a.isOptional = optional
+            return a
+        }
+        entity.properties = [
+            attr("id", .UUIDAttributeType, optional: false),
+            attr("peerPID", .integer32AttributeType, optional: false),
+            attr("clientName", .stringAttributeType, optional: true),
+            attr("clientVersion", .stringAttributeType, optional: true),
+            attr("connectedAt", .dateAttributeType, optional: false),
+            attr("endedAt", .dateAttributeType, optional: true),
+            attr("lastToolCallAt", .dateAttributeType, optional: true),
+        ]
+        let model = NSManagedObjectModel()
+        model.entities = [entity]
+        let coordinator = NSPersistentStoreCoordinator(managedObjectModel: model)
+        let options: [AnyHashable: Any] = [NSPersistentHistoryTrackingKey: true]
+        let oldStore = try coordinator.addPersistentStore(
+            ofType: NSSQLiteStoreType, configurationName: nil, at: fileURL, options: options
+        )
+        let context = NSManagedObjectContext(concurrencyType: .mainQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        let row = NSEntityDescription.insertNewObject(forEntityName: "AgentSession", into: context)
+        row.setValue(id, forKey: "id")
+        row.setValue(Int32(7), forKey: "peerPID")
+        row.setValue("c", forKey: "clientName")
+        row.setValue(Date(), forKey: "connectedAt")
+        try context.save()
+        try coordinator.remove(oldStore)
+
+        let reopened = try AgentSessionStore(storeURL: fileURL)
+        let session = try reopened.sessions().first { $0.id == id }
+        XCTAssertNotNil(session, "an old file must still open — lightweight migration")
+        XCTAssertNil(session?.tokensLeftFirst, "not-yet-migrated means nil, never zero")
+        XCTAssertNil(session?.tokensLeftWorst)
     }
 
     // MARK: - Cost
