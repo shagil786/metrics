@@ -35,7 +35,7 @@ public enum ContextPressureExtractor {
     public static func peak(in url: URL) throws -> PressureReading? {
         let text = try String(contentsOf: url, encoding: .utf8)
         var worst: PressureReading?
-        for (offset, textLine) in text.split(separator: "\n", omittingEmptySubsequences: true)
+        for (offset, textLine) in text.split(separator: "\n", omittingEmptySubsequences: false)
             .enumerated() {
             // A log mid-write can hold a partial line; unparseable JSON skips, it does not fail.
             guard let data = textLine.data(using: .utf8),

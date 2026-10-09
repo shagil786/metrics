@@ -61,4 +61,13 @@ final class ContextPressureExtractorTests: XCTestCase {
         XCTAssertEqual(try ContextPressureExtractor.peak(in: url)?.lineNumber, 1,
                        "line number identifies the reading, so ties take the first")
     }
+
+    func testBlankLinesStillCountTowardTheLineNumber() throws {
+        let url = try write([
+            "",
+            reminder("<total_tokens>14999357 tokens left</total_tokens>"),
+        ])
+        XCTAssertEqual(try ContextPressureExtractor.peak(in: url)?.lineNumber, 2,
+                       "line number counts every physical line, blank ones included")
+    }
 }
