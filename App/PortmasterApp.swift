@@ -120,6 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor func applicationWillTerminate(_ notification: Notification) {
         AppModel.shared.audioControls.stopAll()
+        // This hook and not the awaiting `applicationShouldTerminate` below it — the
+        // reason `AppModel.stopAgentSources` gives is that the poller's stop has nothing
+        // to await, and a poller still polling into a quitting process is worth stopping
+        // even though the process would end anyway.
+        AppModel.shared.stopAgentSources()
     }
 
     /// Quitting waits for the MCP host to let go of its socket — and only when it has

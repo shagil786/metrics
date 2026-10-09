@@ -5,6 +5,7 @@ import SwiftUI
 import Combine
 import PortmasterCore
 import ServiceManagement
+import os
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -33,6 +34,19 @@ final class AppModel: ObservableObject {
     /// database is allowed to fail, and pretending otherwise would mean an MCP client
     /// reporting tokens into a store nobody can read.
     var agentSessionStore: AgentSessionStore?
+    /// The slow lane that reads agent logs, owned here for the same reason the store is.
+    ///
+    /// **Built in the same `do` that opens the store and nowhere else**, so the two
+    /// cannot disagree: a store that would not open takes no poller with it, and the
+    /// failure stays the one failure it already was rather than becoming two problems to
+    /// read about. Built once — `init` runs before any surface appears, and neither a
+    /// refresh nor a store refresh may reach here — and unconditional, like the MCP host
+    /// it sits beside: a pass reads another application's own log and writes nothing but
+    /// figures about sessions that connected to us, so there is no consent to ask for and
+    /// nothing for a setting to turn off.
+    ///
+    /// `nil` is therefore only ever the store's nil. Not a second failure state.
+    private(set) var agentSourcePoller: AgentSourcePoller?
     /// Prices set in Settings, refreshed after each edit rather than observed.
     ///
     /// A `@Published` pair rather than one value because the Settings page shows two
@@ -57,6 +71,42 @@ final class AppModel: ObservableObject {
         }
         agentSessions = (try? store.sessions()) ?? []
     }
+
+    /// One pass has finished, on the main queue.
+    ///
+    /// Logged every time and acted on only sometimes. "Did this lane ever run?" has
+    /// otherwise no answer anywhere — a feature that produces nothing looks exactly like a
+    /// feature that was never wired — and the pass that changed nothing is the one that
+    /// says it is alive. A pass that wrote or took back a figure is `notice`, because that
+    /// one moved a number the user can see; a pass that found the same totals again is
+    /// `debug`, because a line every thirty seconds is not news.
+    ///
+    /// **Only a pass that changed something republishes.** Re-reading the store for a
+    /// pass that wrote nothing would spend a read and a redraw every interval on a number
+    /// that did not move — the same work `surfaceAppeared` deliberately does once rather
+    /// than per tick.
+    ///
+    /// Failures are not logged here: the poller already reports each one it survives with
+    /// its own `NSLog`, and a second line saying it again would be two lines in the log
+    /// where one is a fact.
+    func agentSourcePassCompleted(_ pass: AgentSourcePass) {
+        let summary = "sessions=\(pass.sessionsConsidered) sources=\(pass.sourcesQueried) "
+            + "wrote=\(pass.records.count) withdrew=\(pass.withdrawals.count) "
+            + "absent=\(pass.absences.count)"
+        if pass.records.isEmpty && pass.withdrawals.isEmpty {
+            Self.agentSourceLog.debug("\(summary, privacy: .public)")
+        } else {
+            Self.agentSourceLog.notice("\(summary, privacy: .public)")
+        }
+        guard !pass.records.isEmpty || !pass.withdrawals.isEmpty else { return }
+        refreshAgentSessions()
+    }
+
+    /// On the subsystem `MCPHostController` logs under, so one
+    /// `log show --predicate` finds the app's own diagnostics rather than two commands.
+    private static let agentSourceLog = Logger(
+        subsystem: "app.portmaster", category: "agent-sources"
+    )
 
     /// Re-reads both price lists from the store. Called when the Prices page appears
     /// and after every save, so what is on screen is what is on disk rather than a
@@ -158,8 +208,15 @@ final class AppModel: ObservableObject {
         // Separate from the history store, and separate in the `catch` too: two files
         // that fail independently must not take each other down, or one unreadable
         // database would look like both were gone.
+        //
+        // The poller is built from the store this `do` produced rather than beside it, so
+        // a poller exists exactly when the store opened — see `agentSourcePoller`.
         do {
-            agentSessionStore = try AgentSessionStore()
+            let store = try AgentSessionStore()
+            agentSessionStore = store
+            agentSourcePoller = AgentSourcePoller(store: store) { pass in
+                Task { @MainActor in AppModel.shared.agentSourcePassCompleted(pass) }
+            }
         } catch {
             agentSessionError = (error as? AgentSessionStore.StoreError)?.errorDescription
                 ?? error.localizedDescription
@@ -204,6 +261,16 @@ final class AppModel: ObservableObject {
         // card is correct on arrival and correct when the window opens, and an agent
         // that reports while the window is closed has its figure waiting there.
         refreshAgentSessions()
+        // Asks for a pass rather than making one, and under the pass interval the timer
+        // already obeys — so a window that opens and closes five times cannot become five
+        // walks of somebody else's log directory, and a request inside the last interval
+        // is dropped rather than stacked. What it buys is narrower than "no wait": in the
+        // ordinary case the gate drops the request and the timer's own next tick is what
+        // moves the card anyway, so this helps only when a tick was missed or a pass
+        // overran and the schedule has fallen behind. What it deliberately does not do is
+        // run a pass here, because `pollOnce` would parse a conversation's worth of log on
+        // the main thread.
+        agentSourcePoller?.requestPoll()
     }
 
     func surfaceDisappeared() {
@@ -214,6 +281,13 @@ final class AppModel: ObservableObject {
     func start() {
         engine.start()
         engine.setSurfaceVisible(false)
+        // Started here rather than where it is built, for the reason the MCP host has its
+        // own `start()`: construction is not running anything, and this is where the app
+        // says it has begun. `start()` is called from every surface that appears and from
+        // intents, so this line runs more than once per launch — the poller's own timer
+        // guard drops all but the first, which is the same answer `MCPHostController.start`
+        // gives its callers.
+        agentSourcePoller?.start()
         // Dock visibility is a launch-time policy: a menu-bar-only accessory
         // app shows no Dock icon until it activates as a regular app.
         NSApp.setActivationPolicy(prefs.showInDock ? .regular : .accessory)
@@ -227,6 +301,25 @@ final class AppModel: ObservableObject {
         }
         pruneHistory()
         refreshAgentSessions()
+    }
+
+    /// Stops the poller on the way out.
+    ///
+    /// **Synchronous on purpose, and that is what decides where it is called from.**
+    /// `MCPHostServer.stop` has to be awaited — it closes its admitted connections, waits
+    /// for the accept thread, and only then unlinks — which is the whole reason the quit
+    /// path has an `applicationShouldTerminate` that answers `.terminateLater` and the
+    /// comment above it says so. This cannot be: it enqueues a cancel on the poller's own
+    /// queue and returns. Calling it from there instead would put a second thing on a path
+    /// whose `.terminateNow` answer — every quit with no host bound — would skip, and a
+    /// poller that kept polling into a half-quit process is a worse thing than the
+    /// cancellation being best-effort.
+    ///
+    /// Best-effort is the honest word: a pass already running is not interrupted and not
+    /// waited for, so a pass that had written but not yet flushed at quit ends where the
+    /// process ends. What stopping does buy is that no further pass starts.
+    func stopAgentSources() {
+        agentSourcePoller?.stop()
     }
 
     // MARK: - History recording

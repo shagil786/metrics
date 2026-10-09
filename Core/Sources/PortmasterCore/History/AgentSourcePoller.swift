@@ -16,8 +16,10 @@
 // knows about this machine and nothing else — and give it a reason to be constructed at
 // all in a build with no agent sessions.
 //
-// The app starts this with the store. That wiring is a separate change; nothing here
-// constructs a poller in production yet.
+// The app starts this with the store, in `AppModel`'s opening `do` — so a store that
+// would not open takes no poller with it — and stops it on the way out alongside the
+// MCP host. Unconditional either way: reading another application's log is read-only
+// and writes only to our own store, about sessions that connected to us.
 
 import Foundation
 

@@ -74,6 +74,78 @@ final class CountingTokenAdapter: TokenSourceAdapter, @unchecked Sendable {
     }
 }
 
+/// Records when it was asked, not only how often, so a test can see whether two
+/// passes were inside it at once.
+///
+/// **A concurrency probe rather than another counter.** The claim under test is that
+/// one queue owns every pass, and only an adapter that *can* be entered twice at once
+/// can fail that claim: each ask here is long enough that a `pollOnce` issued while a
+/// scheduled pass is provably inside would be seen entering beside it if the two were
+/// not serialized. An adapter that only counted asks would see the same two counts
+/// whether they ran one after the other or on top of each other.
+final class OverlapProbeAdapter: TokenSourceAdapter, @unchecked Sendable {
+    let identifier = "overlap-probe"
+    let candidates: [LogCandidate]
+    /// How long one ask occupies. Zero where the test only needs the signal, not the
+    /// window.
+    private let askDuration: TimeInterval
+    /// Signalled when the first ask begins, so a test can call `pollOnce` at a moment
+    /// when a scheduled pass is inside this adapter — the moment an unsynchronized
+    /// implementation would let a second one in.
+    let firstAskStarted = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private var _events: [String] = []
+    private var _inside = 0
+    private var _maxConcurrent = 0
+
+    init(candidates: [LogCandidate], askDuration: TimeInterval = 0.5) {
+        self.candidates = candidates
+        self.askDuration = askDuration
+    }
+
+    /// `enter` and `exit` in the order they happened. An `enter` with no `exit` before
+    /// the next `enter` is two passes walking at once.
+    var events: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _events
+    }
+
+    var maxConcurrentAsks: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _maxConcurrent
+    }
+
+    /// How many asks have begun. `events` records an ask twice — once on entry and
+    /// once on exit — so this is the number to assert on when the claim is "how many
+    /// passes walked", while `events` stays the thing to assert on when the claim is
+    /// "in what order".
+    var askCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _events.filter { $0 == "enter" }.count
+    }
+
+    func logCandidates(newerThan: Date?) -> [LogCandidate] {
+        lock.lock()
+        _events.append("enter")
+        _inside += 1
+        _maxConcurrent = max(_maxConcurrent, _inside)
+        let isFirst = _events.count == 1
+        lock.unlock()
+        if isFirst { firstAskStarted.signal() }
+        Thread.sleep(forTimeInterval: askDuration)
+        lock.lock()
+        _events.append("exit")
+        _inside -= 1
+        lock.unlock()
+        return candidates
+    }
+
+    func parse(_ url: URL) throws -> [RawAgentUsage] {
+        [RawAgentUsage(input: 100, output: 50, cacheRead: nil, reasoning: nil, modelID: "model-a")]
+    }
+}
+
 final class AgentSourcePollerTests: XCTestCase {
 
     /// Wide enough that a file written "now" matches a session connected "now", and
@@ -599,6 +671,101 @@ final class AgentSourcePollerTests: XCTestCase {
             "the bound is the earliest connection less the tolerance, not a constant"
         )
     }
+
+    // MARK: - One queue: a UI poll and a scheduled pass never run at once
+
+    /// **`pollOnce` waits its turn instead of walking beside a scheduled pass.**
+    ///
+    /// The guarantee the app's shape rests on: scheduled passes own the lane, and a
+    /// caller that wants a blocking answer joins the queue rather than opening a
+    /// second walk of somebody else's log directory at the same moment. Both passes
+    /// are seen here — two asks — and seen one strictly after the other.
+    ///
+    /// The `pollOnce` is issued while the scheduled pass is *provably* inside the
+    /// adapter (the probe signalled its entry, and each ask lasts half a second), so
+    /// a poller whose `pollOnce` ran off-queue would be caught entering beside it
+    /// rather than merely racing somewhere the test cannot see.
+    func testPollOnceWaitsForTheScheduledPassRatherThanWalkingAlongsideIt() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        let adapter = OverlapProbeAdapter(candidates: [candidate("a.jsonl", from: now)])
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+        addTeardownBlock { poller.stop() }
+
+        poller.start()
+        XCTAssertEqual(
+            adapter.firstAskStarted.wait(timeout: .now() + 5), .success,
+            "the scheduled pass never asked, so there was nothing to wait behind"
+        )
+
+        let uiPass = poller.pollOnce()
+
+        XCTAssertEqual(
+            adapter.events, ["enter", "exit", "enter", "exit"],
+            "the blocking poll ran inside the scheduled pass rather than after it"
+        )
+        XCTAssertEqual(adapter.maxConcurrentAsks, 1, "one queue, so one pass at a time")
+        XCTAssertGreaterThanOrEqual(uiPass.sessionsConsidered, 1, "and it did run a pass")
+    }
+
+    /// A request from a surface inside the interval adds no walk: the gate that makes
+    /// "a window that opens and closes five times" one pass, not five.
+    ///
+    /// The first pass is observed rather than assumed, and the probe asks instantly —
+    /// so the only thing that can produce a second `enter` within the sleep is the
+    /// request itself. The interval is thirty seconds against a third of one, so the
+    /// timer's next tick cannot reach into the assertion either.
+    func testARequestInsideTheIntervalAddsNoSecondWalk() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        let adapter = OverlapProbeAdapter(
+            candidates: [candidate("a.jsonl", from: now)], askDuration: 0
+        )
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+        addTeardownBlock { poller.stop() }
+
+        poller.start()
+        XCTAssertEqual(
+            adapter.firstAskStarted.wait(timeout: .now() + 5), .success,
+            "the first pass never asked"
+        )
+
+        poller.requestPoll()
+        Thread.sleep(forTimeInterval: 0.3)
+
+        XCTAssertEqual(
+            adapter.askCount, 1,
+            "a request inside the interval is dropped, not stacked into a second walk"
+        )
+    }
+
+    /// `start()` is called from every surface that appears and from intents, so it
+    /// runs more than once per launch — and asking must still happen once.
+    ///
+    /// The property, not the mechanism: whichever internal guard absorbs the repeat
+    /// (and there is more than one that could), two starts must not produce two first
+    /// passes, and must not produce two passes running beside each other either —
+    /// which is what a second `start()` that quietly added a second queue would do.
+    func testStartingTwiceDoesNotAskTwice() throws {
+        let store = try makeStore()
+        let now = Date()
+        try recordSession(store, connectedAt: now)
+        let adapter = OverlapProbeAdapter(
+            candidates: [candidate("a.jsonl", from: now)], askDuration: 0
+        )
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+        addTeardownBlock { poller.stop() }
+
+        poller.start()
+        poller.start()
+        XCTAssertEqual(adapter.firstAskStarted.wait(timeout: .now() + 5), .success)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        XCTAssertEqual(adapter.askCount, 1, "two starts, one first pass")
+        XCTAssertEqual(adapter.maxConcurrentAsks, 1, "and never two passes at once")
+    }
 }
 
 /// What the Overview card has to be able to say, pinned as a state rather than as a
@@ -741,4 +908,5 @@ final class AmbiguousMatchStateTests: XCTestCase {
             "and the store says `awaitingFirstReport`, because there is nothing to withdraw"
         )
     }
+
 }
