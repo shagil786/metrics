@@ -708,6 +708,11 @@ struct AgentSessionPayload: Encodable {
     /// the contract.
     public let tokensLeftFirst: Int?
     public let tokensLeftWorst: Int?
+    /// Chain edges (spec §4). Omitted when nil: an unlinked session has no
+    /// edge, and a JSON `null` here would read as "chain known to be absent"
+    /// rather than "not linked" — the same rule as every other optional.
+    let handedOffFrom: String?
+    let handedOffTo: String?
     /// Always nil on the socket path today: the MCP SDK consumes the `initialize`
     /// handshake, so nothing in the host sees a client name. Carried anyway so a
     /// payload built elsewhere with one does not lose it.
@@ -728,6 +733,8 @@ struct AgentSessionPayload: Encodable {
         self.peerPID = session.peerPID > 0 ? session.peerPID : nil
         self.tokensLeftFirst = session.tokensLeftFirst
         self.tokensLeftWorst = session.tokensLeftWorst
+        self.handedOffFrom = session.handedOffFrom?.uuidString
+        self.handedOffTo = session.handedOffTo?.uuidString
         self.clientName = session.clientName
         self.clientVersion = session.clientVersion
         self.connectedAt = session.connectedAt

@@ -772,4 +772,35 @@ final class AgentSessionToolTests: XCTestCase {
         _ = await executor.execute(name: "get_agent_sessions", arguments: [:])
         XCTAssertEqual(stub.count(of: "agentSessions"), 1)
     }
+
+    // MARK: - Chain edges
+
+    func testHandoffEdgesReachTheWireAndUnlinkedSessionsOmitThem() async throws {
+        let sourceID = UUID(), targetID = UUID(), loneID = UUID()
+        try store.recordSession(id: sourceID, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 100))
+        try store.flush()
+        _ = try store.recordHandoff(sourceID: sourceID, targetPID: 4242, targetName: "codex")
+        try store.recordSession(id: targetID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 200))
+        try store.recordSession(id: loneID, peerPID: 7, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 300))
+        try store.flush()
+
+        let json = try await wire()
+        let sessions = try XCTUnwrap(json["sessions"] as? [[String: Any]])
+
+        let source = try XCTUnwrap(sessions.first { $0["id"] as? String == sourceID.uuidString })
+        XCTAssertEqual(source["handedOffTo"] as? String, targetID.uuidString)
+        XCTAssertNil(source["handedOffFrom"])
+        XCTAssertNil(source["handoffTargetPID"], "the wire carries edges, not spawn plumbing")
+
+        let target = try XCTUnwrap(sessions.first { $0["id"] as? String == targetID.uuidString })
+        XCTAssertEqual(target["handedOffFrom"] as? String, sourceID.uuidString)
+        XCTAssertNil(target["handedOffTo"])
+
+        let lone = try XCTUnwrap(sessions.first { $0["id"] as? String == loneID.uuidString })
+        XCTAssertNil(lone["handedOffFrom"], "absent key, not null and not zero")
+        XCTAssertNil(lone["handedOffTo"])
+    }
 }

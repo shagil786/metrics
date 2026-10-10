@@ -1060,17 +1060,30 @@ private struct SessionLine: View {
     let session: AgentSessionSnapshot
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(session.clientName ?? "agent")
-                .font(.system(size: 11, design: .monospaced))
-                .lineLimit(1).truncationMode(.middle)
-            Spacer(minLength: 4)
-            Text(usage)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Text(cost)
-                .font(.system(size: 10, design: .monospaced))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(session.clientName ?? "agent")
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(usage)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(cost)
+                    .font(.system(size: 10, design: .monospaced))
+            }
+            // The head renders the whole thread's line; middle and tail rows
+            // stay single — one report per chain, placed where the oldest-first
+            // footer is guaranteed to show it (ruling 3).
+            if session.handedOffFrom == nil, let chain = session.chain {
+                let line = chain.renderedLine
+                Text(line)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityLabel("Handoff chain: \(line)")
+            }
         }
     }
 
