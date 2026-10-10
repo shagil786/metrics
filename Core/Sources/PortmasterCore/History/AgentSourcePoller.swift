@@ -382,7 +382,10 @@ public final class AgentSourcePoller: @unchecked Sendable {
         // them in memory until something else happens to save — which for a source only
         // this poller feeds is never. Once per pass rather than once per record: the
         // write is the same either way and a failure must not be retried per record.
-        if !records.isEmpty {
+        // Pressure counts as a reason to flush too: a pass can fold a reading with no
+        // usage figure at all, and durability must not depend on a later pass happening
+        // to write records before the app quits.
+        if !records.isEmpty || pressureUpdates > 0 {
             do {
                 try store.flush()
             } catch {

@@ -347,6 +347,36 @@ final class AgentSourcePollerTests: XCTestCase {
         XCTAssertEqual(snapshot.tokensLeftWorst, 14_999_357)
     }
 
+    /// The pressure-only pass must reach the **disk**, not just the live context:
+    /// `sessions()` on the writing store reads unsaved changes, so it would pass
+    /// even with no flush. A second store on the same file can only see what was
+    /// actually saved — which is what a quitting app leaves behind.
+    func testAPressureOnlyPassPersistsToDisk() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-poller-flush-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("agent-sessions.sqlite")
+        let store = try AgentSessionStore(storeURL: fileURL)
+
+        let now = Date()
+        let sessionID = try recordSession(store, connectedAt: now)
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
+        adapter.parsedUsage = []
+        adapter.pressure = PressureReading(tokensLeft: 14_999_357, lineNumber: 4)
+
+        let pass = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+            .pollOnce()
+
+        XCTAssertTrue(pass.records.isEmpty, "a file with no usage writes no usage")
+        XCTAssertEqual(pass.pressureUpdates, 1)
+
+        let reopened = try AgentSessionStore(storeURL: fileURL)
+        let snapshot = try reopened.sessions().first { $0.id == sessionID }
+        XCTAssertEqual(snapshot?.tokensLeftFirst, 14_999_357, "the fold reached the file")
+        XCTAssertEqual(snapshot?.tokensLeftWorst, 14_999_357, "the fold reached the file")
+    }
+
     // MARK: - What a pass persists
 
     /// One record per model the log attributed usage to, stamped with the session that
