@@ -187,6 +187,7 @@ public struct LiveDataProvider: DataProvider {
     private let stopApp: @Sendable (String, Bool) async throws -> StopReport
     private let stopContainerNamed: @Sendable (String) async throws -> StopReport
     private let stopProject: @Sendable (String) async throws -> StopReport
+    private let handoffSource: (@Sendable (UUID, String) async throws -> HandoffOutcome)?
 
     /// - Parameters:
     ///   - snapshot: returns the app's latest snapshot on demand (the app passes a
@@ -215,7 +216,8 @@ public struct LiveDataProvider: DataProvider {
         stopApp: @escaping @Sendable (String, Bool) async throws -> StopReport,
         stopContainerNamed: @escaping @Sendable (String) async throws -> StopReport,
         stopProject: @escaping @Sendable (String) async throws -> StopReport,
-        sessionReading: (@Sendable () async -> (any AgentSessionReadingSource)?)? = nil
+        sessionReading: (@Sendable () async -> (any AgentSessionReadingSource)?)? = nil,
+        handoff: (@Sendable (UUID, String) async throws -> HandoffOutcome)? = nil
     ) {
         self.snapshotSource = snapshot
         self.alertsSource = alerts
@@ -229,6 +231,7 @@ public struct LiveDataProvider: DataProvider {
         self.stopContainerNamed = stopContainerNamed
         self.stopProject = stopProject
         self.sessionReadingSource = sessionReading
+        self.handoffSource = handoff
     }
 
     // MARK: Snapshot reads
@@ -316,6 +319,19 @@ public struct LiveDataProvider: DataProvider {
         return (result.sessions, result.storeAvailable, result.note)
     }
 
+    // MARK: Handoff
+
+    /// The app's own coordinator, through the seam wired at construction. Refused by
+    /// name when the seam is absent rather than answered with a fake outcome: there
+    /// is no honest success value for a launch nobody performed.
+    public func handoffContext(sessionID: UUID, target: String) async throws -> HandoffOutcome {
+        guard let handoffSource else {
+            throw MCPToolError(
+                message: "The Portmaster app did not offer a handoff path, so nothing was handed off."
+            )
+        }
+        return try await handoffSource(sessionID, target)
+    }
 
     // MARK: History reads
 

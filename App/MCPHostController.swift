@@ -443,7 +443,7 @@ final class MCPHostController: ObservableObject {
     static func needsReading(_ request: MCPApprovalRequest) -> Bool {
         switch request.kind {
         case .quitApp, .stopProject: return true
-        case .stopContainer, .setPreference, .setModelPrice: return false
+        case .stopContainer, .setPreference, .setModelPrice, .handoffContext: return false
         }
     }
 

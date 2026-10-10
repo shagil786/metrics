@@ -362,4 +362,114 @@ final class ToolExecutorMutationTests: XCTestCase {
         )
         XCTAssertEqual(entry["reason"] as? String, "Invalid value for temperatureUnit: fahrenheit")
     }
+
+    // MARK: handoff_context
+
+    /// The whole point of the tool: the session the client named is the session that
+    /// was handed off, and the success line says where the brief went. A handoff audit
+    /// that said only "allowed" would not tell a reader which conversation moved.
+    func testHandoffContextPassesBothArgumentsAndNotesTheBrief() async throws {
+        let stub = StubProvider()
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
+        let sessionID = UUID()
+
+        let outcome = await tool.execute(
+            name: "handoff_context",
+            arguments: ["session_id": sessionID.uuidString, "target": "claude"]
+        )
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertEqual(stub.lastHandoff?.sessionID, sessionID)
+        XCTAssertEqual(stub.lastHandoff?.target, "claude")
+
+        let payload = try jsonObject(outcome.text)
+        XCTAssertEqual(payload["briefPath"] as? String, "/tmp/brief.md")
+        XCTAssertEqual(payload["citedLines"] as? [Int], [1, 2, 3])
+        XCTAssertEqual(payload["launchedPID"] as? Int, 4242)
+        XCTAssertEqual(payload["target"] as? String, "claude")
+
+        let entries = try auditEntries(in: dir)
+        XCTAssertEqual(entries.count, 1, "exactly one line per mutation attempt")
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry["tool"] as? String, "handoff_context")
+        XCTAssertEqual(entry["outcome"] as? String, "allowed")
+        let reason = try XCTUnwrap(entry["reason"] as? String)
+        XCTAssertTrue(reason.hasPrefix("brief=/tmp/brief.md"), reason)
+        XCTAssertTrue(reason.contains("lines=1,2,3"), reason)
+    }
+
+    /// The gate reaches this tool the way it reaches every mutation, and a refusal
+    /// never touches the provider — a launch is the most expensive thing a mutation
+    /// can do here, so the pre-provider rule matters most for it.
+    func testHandoffContextIsDeniedByTheGateBeforeTheProviderRuns() async throws {
+        let stub = StubProvider()
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(provider: stub, mode: .off, appRunning: true, directory: dir)
+
+        let outcome = await tool.execute(
+            name: "handoff_context",
+            arguments: ["session_id": UUID().uuidString, "target": "claude"]
+        )
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(stub.count(of: "handoffContext"), 0)
+        let entries = try auditEntries(in: dir)
+        XCTAssertEqual(entries.count, 1)
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry["tool"] as? String, "handoff_context")
+        XCTAssertEqual(entry["outcome"] as? String, "denied")
+        XCTAssertEqual(
+            entry["reason"] as? String, "MCP mutations are disabled in Portmaster settings."
+        )
+    }
+
+    /// A session id that is not an id is refused inside dispatch — after the gate,
+    /// like every other format check (`requireWindow`, `price`) — audited `failed`
+    /// with the reason, and the provider never runs.
+    func testHandoffContextRefusesASessionIdThatIsNotOneWithoutTouchingTheProvider()
+        async throws
+    {
+        let stub = StubProvider()
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
+
+        let outcome = await tool.execute(
+            name: "handoff_context",
+            arguments: ["session_id": "not-a-uuid", "target": "claude"]
+        )
+
+        XCTAssertTrue(outcome.isError)
+        XCTAssertEqual(stub.count(of: "handoffContext"), 0)
+        let entry = try XCTUnwrap(auditEntries(in: dir).first)
+        XCTAssertEqual(entry["outcome"] as? String, "failed")
+        XCTAssertEqual(
+            entry["reason"] as? String, "Invalid session_id: not an id Portmaster recorded."
+        )
+    }
+
+    /// The note rides only payloads that carry one: an ordinary success still audits
+    /// with no reason, so a reader knows a non-nil `reason` is an exception worth
+    /// reading. The success audit changed for everyone in this task; this pins that
+    /// it changed for no one else.
+    func testAnOrdinarySuccessfulMutationStillAuditsWithNoReason() async throws {
+        let stub = StubProvider()
+        let dir = try makeTemporaryDirectory(prefix: name)
+        let tool = try makeExecutor(
+            provider: stub, mode: .allowSession, appRunning: true, directory: dir
+        )
+
+        let outcome = await tool.execute(
+            name: "set_preference", arguments: ["key": "temperatureUnit", "value": "celsius"]
+        )
+
+        XCTAssertFalse(outcome.isError, outcome.text)
+        let entry = try XCTUnwrap(auditEntries(in: dir).first)
+        XCTAssertEqual(entry["outcome"] as? String, "allowed")
+        XCTAssertNil(entry["reason"] as? String)
+    }
 }

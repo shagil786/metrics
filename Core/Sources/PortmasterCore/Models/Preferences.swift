@@ -161,6 +161,12 @@ public struct AppPreferences: Sendable, Codable {
     public var hasCompletedOnboarding: Bool
     /// Show the regular app icon in the Dock (menu-bar-only when false).
     public var showInDock: Bool
+    /// Whether a pressured session may hand off to another agent at all — the
+    /// spec's kill switch (§5): an off switch that stops the feature without
+    /// touching permissions. Default on: the permission mode is the real gate
+    /// (handoffs still require `allowSession`), so this is the big red button,
+    /// not the lock.
+    public var contextHandoffsEnabled: Bool
 
     public init(
         menuBarMetric: MenuBarMetric = .cpu,
@@ -171,7 +177,8 @@ public struct AppPreferences: Sendable, Codable {
         fixtureMode: Bool = false,
         alertsEnabled: Bool = true,
         showInDock: Bool = false,
-        hasCompletedOnboarding: Bool = false
+        hasCompletedOnboarding: Bool = false,
+        contextHandoffsEnabled: Bool = true
     ) {
         self.presentation = PresentationPreferences(statusItems: [StatusReadout(metric: menuBarMetric)])
         self.menuBarMetric = menuBarMetric
@@ -183,10 +190,11 @@ public struct AppPreferences: Sendable, Codable {
         self.alertsEnabled = alertsEnabled
         self.showInDock = showInDock
         self.hasCompletedOnboarding = hasCompletedOnboarding
+        self.contextHandoffsEnabled = contextHandoffsEnabled
     }
 
     enum CodingKeys: String, CodingKey {
-        case menuBarMetric, cadence, retention, agentSessionRetention, launchAtLogin, fixtureMode, alertsEnabled, showInDock, presentation, hasCompletedOnboarding
+        case menuBarMetric, cadence, retention, agentSessionRetention, launchAtLogin, fixtureMode, alertsEnabled, showInDock, presentation, hasCompletedOnboarding, contextHandoffsEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -216,6 +224,13 @@ public struct AppPreferences: Sendable, Codable {
         alertsEnabled = try c.decodeIfPresent(Bool.self, forKey: .alertsEnabled) ?? true
         hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? true
         showInDock = try c.decodeIfPresent(Bool.self, forKey: .showInDock) ?? false
+        // `try?` for the same reason as `agentSessionRetention` above: a build
+        // that wrote a non-Bool here must not fail the decode of the whole blob
+        // (and reset every other preference) — an unreadable switch reads as
+        // absent, and absent means on.
+        contextHandoffsEnabled = (try? c.decodeIfPresent(
+            Bool.self, forKey: .contextHandoffsEnabled
+        )) ?? true
     }
 
     // MARK: UserDefaults bridging

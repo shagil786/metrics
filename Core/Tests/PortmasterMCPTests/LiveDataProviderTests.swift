@@ -494,6 +494,55 @@ final class LiveDataProviderTests: XCTestCase {
         XCTAssertEqual(settings.retention, "days7")
     }
 
+    // MARK: Handoff
+
+    /// The seam is the coordinator: the provider passes both arguments through and
+    /// returns what the coordinator did, unchanged.
+    func testTheHandoffSeamReceivesTheCallAndReturnsItsOutcome() async throws {
+        let recorder = HandoffRecorder()
+        let provider = makeProvider(
+            PublishedSnapshot(Self.snapshot()),
+            handoff: { sessionID, target in
+                recorder.ask(sessionID: sessionID, target: target)
+                return HandoffOutcome(
+                    briefPath: "/tmp/b.md", citedLines: [4, 5], launchedPID: 7, target: target
+                )
+            }
+        )
+        let sessionID = UUID()
+
+        let got = try await provider.handoffContext(sessionID: sessionID, target: "codex")
+
+        XCTAssertEqual(
+            got,
+            HandoffOutcome(briefPath: "/tmp/b.md", citedLines: [4, 5], launchedPID: 7, target: "codex")
+        )
+        XCTAssertEqual(recorder.last?.sessionID, sessionID)
+        XCTAssertEqual(recorder.last?.target, "codex")
+    }
+
+    /// A provider built without the seam refuses by name rather than inventing an
+    /// outcome: there is no honest success value for a launch nobody performed.
+    func testAProviderWithNoHandoffSeamSaysItDidNotHandOff() async throws {
+        let provider = makeProvider(PublishedSnapshot(Self.snapshot()))
+        do {
+            _ = try await provider.handoffContext(sessionID: UUID(), target: "claude")
+            XCTFail("a provider with no handoff path must refuse, not answer")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(
+                error.message,
+                "The Portmaster app did not offer a handoff path, so nothing was handed off."
+            )
+        }
+    }
+
+    private final class HandoffRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: (sessionID: UUID, target: String)?
+        func ask(sessionID: UUID, target: String) { lock.withLock { storage = (sessionID, target) } }
+        var last: (sessionID: UUID, target: String)? { lock.withLock { storage } }
+    }
+
     // MARK: Helpers
 
     /// The `MCPToolError` a read threw. Fails the test if it answered instead,
@@ -521,7 +570,8 @@ final class LiveDataProviderTests: XCTestCase {
             AlertsSnapshot(source: .live, alerts: [])
         },
         history: HistoryOpener = HistoryOpener(),
-        mutations: RecordedMutations = RecordedMutations()
+        mutations: RecordedMutations = RecordedMutations(),
+        handoff: (@Sendable (UUID, String) async throws -> HandoffOutcome)? = nil
     ) -> LiveDataProvider {
         LiveDataProvider(
             snapshot: { try await published.current() },
@@ -533,7 +583,8 @@ final class LiveDataProviderTests: XCTestCase {
             applyPreference: { key, value in mutations.applyPreference(key: key, value: value) },
             stopApp: { id, force in try await mutations.stopApp(id: id, force: force) },
             stopContainerNamed: { id in try await mutations.stopContainer(id: id) },
-            stopProject: { id in try await mutations.stopProject(id: id) }
+            stopProject: { id in try await mutations.stopProject(id: id) },
+            handoff: handoff
         )
     }
 

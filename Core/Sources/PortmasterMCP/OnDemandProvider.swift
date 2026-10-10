@@ -66,6 +66,13 @@ public struct OnDemandProvider: DataProvider {
     public static let dockerNotKnownMessage =
         "Docker status is not known yet; the first container scan has not finished."
 
+    /// Said when there is no running app to read a session's log from or to own the
+    /// session database. One string for the refusal, shared the way the others are,
+    /// because a caller can reach either provider for the same tool.
+    public static let handoffUnavailableMessage =
+        "Portmaster's app is not running, so it cannot read the session's log or open "
+            + "the session history to hand it off."
+
     /// Said when no app in the reading answers to an id.
     ///
     /// `static`, shared and public: a client can reach this provider, the app-hosted
@@ -372,6 +379,10 @@ public struct OnDemandProvider: DataProvider {
         let reading = sessionReadingSource.get()
             .sessions(limit: limit, openSessionIDs: Set<UUID>())
         return (reading.sessions, reading.storeAvailable, reading.note)
+    }
+
+    public func handoffContext(sessionID _: UUID, target _: String) async throws -> HandoffOutcome {
+        throw MCPToolError(message: Self.handoffUnavailableMessage)
     }
 
     public func projects() async throws -> [ProjectSummary] {

@@ -927,6 +927,18 @@ final class OnDemandProviderTests: XCTestCase {
         )
     }
 
+    /// No running app means no session log to brief from and no app-owned store to
+    /// record the link in, so the on-demand path says so instead of simulating one.
+    func testHandoffContextRefusesBecauseThereIsNoRunningApp() async throws {
+        let provider = OnDemandProvider(appRunning: { false })
+        do {
+            _ = try await provider.handoffContext(sessionID: UUID(), target: "claude")
+            XCTFail("a handoff without the app must be refused, not simulated")
+        } catch let error as MCPToolError {
+            XCTAssertEqual(error.message, OnDemandProvider.handoffUnavailableMessage)
+        }
+    }
+
     // MARK: Stops
 
     func testQuitAppStopsStubbedPids() async throws {

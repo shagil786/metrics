@@ -55,6 +55,7 @@ public enum MCPApprovalCopy {
         case .stopProject: return "Stop a project"
         case .setPreference: return "Change a Portmaster preference"
         case .setModelPrice: return "Set a token price"
+        case .handoffContext: return "Hand off a session"
         }
     }
 
@@ -69,6 +70,7 @@ public enum MCPApprovalCopy {
         case .stopProject: return "Quit Project"
         case .setPreference: return "Change Preference"
         case .setModelPrice: return "Set Price"
+        case .handoffContext: return "Hand Off Session"
         }
     }
 
@@ -131,6 +133,10 @@ public enum MCPApprovalCopy {
             )
             let which = (component?.isEmpty ?? true) ? "input" : component!
             return "Set the \(which) price of \(model) to $\(price) per token."
+        case .handoffContext:
+            let target = named(arguments["target"], fallback: "an agent the client did not name")
+            return "Write this session's context brief and launch '\(target)' to continue "
+                + "the conversation in the session's own working directory."
         }
     }
 
@@ -147,6 +153,8 @@ public enum MCPApprovalCopy {
             return "Portmaster will change:"
         case .setModelPrice:
             return "Every session already recorded for this model will be re-costed:"
+        case .handoffContext:
+            return "The brief will be handed to:"
         }
     }
 

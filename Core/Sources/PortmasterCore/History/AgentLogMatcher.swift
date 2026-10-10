@@ -125,6 +125,13 @@ public enum LogMatch: Hashable, Sendable {
 /// rather than a clock read so a caller takes one reading per pass and every decision in
 /// that pass is judged against the same instant.
 public enum AgentLogMatcher {
+    /// How far outside a session's connect moment a conversation's interval may
+    /// reach and still match it. One authority: the poller's default and the
+    /// handoff coordinator's re-match both reference this, because two call
+    /// sites drifting on the tolerance would match different files to the same
+    /// session depending on which path asked (ruling 15).
+    public static let defaultOverlap: TimeInterval = 60 * 60
+
     /// One entry per session asked about, keyed by session id — including the sessions
     /// with no conversation spanning them, because the caller has to record an absence
     /// for each of them.

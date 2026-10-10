@@ -542,6 +542,8 @@ final class MCPApprovalPresentationTests: XCTestCase {
         case "stop_project": return ["id": "/src/api"]
         case "set_preference": return ["key": "temperatureUnit", "value": "celsius"]
         case "set_model_price": return ["model": "gpt-5", "price": "0.0000015"]
+        case "handoff_context":
+            return ["session_id": "0B1D3F00-0000-0000-0000-000000000001", "target": "claude"]
         default: return nil
         }
     }

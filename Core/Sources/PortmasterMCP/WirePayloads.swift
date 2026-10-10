@@ -760,6 +760,26 @@ struct AgentSessionsPayload: Encodable {
     }
 }
 
+/// What a completed `handoff_context` did, on the wire: where the brief landed, which
+/// source lines it cites, the receiving agent's pid, and which configured target ran.
+struct HandoffContextPayload: Encodable {
+    let outcome: HandoffOutcome
+
+    init(_ outcome: HandoffOutcome) { self.outcome = outcome }
+
+    private enum CodingKeys: String, CodingKey {
+        case briefPath, citedLines, launchedPID, target
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(outcome.briefPath, forKey: .briefPath)
+        try container.encode(outcome.citedLines, forKey: .citedLines)
+        try container.encode(outcome.launchedPID, forKey: .launchedPID)
+        try container.encode(outcome.target, forKey: .target)
+    }
+}
+
 // MARK: - Model prices
 
 /// One price, as the surfaces show it.

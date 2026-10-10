@@ -505,6 +505,24 @@ final class MCPConfirmationWindow: NSWindowController, NSWindowDelegate {
                 stopTarget: nil,
                 targets: ["\(model) — \(which) price: $\(price) per token"]
             ))
+
+        case .handoffContext:
+            // Preview data first, as everywhere: a session in a synthetic reading has
+            // no log to brief from, so the handoff the write would perform does not
+            // exist to approve.
+            if model.prefs.fixtureMode { return .refused(LiveAppView.previewDataStopRefusal) }
+            let session = request.arguments["session_id"] ?? ""
+            guard UUID(uuidString: session) != nil else {
+                return .refused("Invalid session_id: not an id Portmaster recorded.")
+            }
+            let target = request.arguments["target"] ?? ""
+            guard HandoffTargets.load().keys.contains(target) else {
+                return .refused("'\(target)' is not a configured handoff target.")
+            }
+            return .shown(Resolved(
+                stopTarget: nil,
+                targets: ["\(target) — continue session \(session)"]
+            ))
         }
     }
 }

@@ -228,4 +228,9 @@ public protocol DataProvider: Sendable {
     /// deadlock. Reads that must not block are declared `throws`; this one is declared
     /// for the opposite reason.
     func setPreference(key: String, value: String) async throws
+
+    /// A dry run, a launch, and a once-only record: the handoff flow itself, which
+    /// `HandoffCoordinator` owns. The provider is the seam so the executor never
+    /// learns where a session store or a log directory lives.
+    func handoffContext(sessionID: UUID, target: String) async throws -> HandoffOutcome
 }

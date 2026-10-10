@@ -147,6 +147,19 @@ final class StubProvider: DataProvider, @unchecked Sendable {
         return agentSessionResult
     }
 
+    /// A canned handoff plus the arguments it was asked for: "the executor passed the
+    /// session the client named" is a claim only the provider can answer.
+    var handoffResult = HandoffOutcome(
+        briefPath: "/tmp/brief.md", citedLines: [1, 2, 3], launchedPID: 4242, target: "claude"
+    )
+    private(set) var lastHandoff: (sessionID: UUID, target: String)?
+
+    func handoffContext(sessionID: UUID, target: String) async throws -> HandoffOutcome {
+        try enter("handoffContext")
+        lastHandoff = (sessionID, target)
+        return handoffResult
+    }
+
     func historyRankings(
         window: HistoryWindow, resource: HistoryResource?
     ) async throws -> [AppHistoryTrend] {
@@ -221,25 +234,27 @@ final class ToolExecutorReadTests: XCTestCase {
 
     // MARK: Catalog
 
-    func testCatalogDeclaresSeventeenToolsAndClassifiesEffects() {
+    func testCatalogDeclaresEighteenToolsAndClassifiesEffects() {
         let catalog = ToolExecutor.catalog
-        XCTAssertEqual(catalog.count, 17, "catalog must declare all 17 tools")
+        XCTAssertEqual(catalog.count, 18, "catalog must declare all 18 tools")
 
         let names = catalog.map(\.name)
-        XCTAssertEqual(Set(names).count, 17, "tool names must be unique")
+        XCTAssertEqual(Set(names).count, 18, "tool names must be unique")
 
         let expected: Set<String> = [
             "get_system_overview", "get_top_apps", "get_app_detail", "get_containers",
             "get_projects", "get_history_rankings", "get_temperatures_fans", "get_agent_sessions",
             "get_active_alerts", "get_settings", "get_model_prices", "report_usage",
-            "quit_app", "stop_container", "stop_project", "set_preference", "set_model_price"
+            "quit_app", "stop_container", "stop_project", "set_preference", "set_model_price",
+            "handoff_context"
         ]
         XCTAssertEqual(Set(names), expected)
 
         let mutations = Set(catalog.filter { $0.effect == .mutation }.map(\.name))
         XCTAssertEqual(
             mutations,
-            ["quit_app", "stop_container", "stop_project", "set_preference", "set_model_price"]
+            ["quit_app", "stop_container", "stop_project", "set_preference",
+             "set_model_price", "handoff_context"]
         )
         XCTAssertEqual(catalog.filter { $0.effect == .read }.count, 12)
         for tool in catalog {

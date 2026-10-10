@@ -19,6 +19,11 @@ public struct MCPApprovalRequest: Identifiable, Sendable {
         /// told what the price will change *costs* to them — every past figure
         /// priced at the old one is re-costed the moment it lands.
         case setModelPrice
+        /// A context handoff: a receiving agent launched to continue this session.
+        /// Its own kind because the approval is about a launch into another process —
+        /// the person must be told an agent is about to be started with this
+        /// conversation — not about stopping something or writing a value.
+        case handoffContext
     }
 
     public let id: UUID

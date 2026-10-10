@@ -304,6 +304,9 @@ public struct HostMCPCallContext: MCPToolCalling {
             // detail sentence below carries it, so the one-line summary stays the
             // question and not the arithmetic.
             summary = "Set the price of \(arguments["model"] ?? "")?"
+        case "handoff_context":
+            kind = .handoffContext
+            summary = "Hand off this session to \(arguments["target"] ?? "the target agent")?"
         default:
             // Unreachable for any declared mutation; a mutation added to the catalog
             // without a case here is asked about generically rather than silently,

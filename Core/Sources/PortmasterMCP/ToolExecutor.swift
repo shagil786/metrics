@@ -276,6 +276,17 @@ public struct ToolExecutor: Sendable {
                 (name: "value", required: true, help: "New value for that key")
             ],
             effect: .mutation
+        ),
+        ToolDefinition(
+            name: "handoff_context",
+            description: "Write this session's context brief and launch a receiving "
+                + "agent to continue it in the session's own working directory. A "
+                + "session hands off at most once.",
+            arguments: [
+                (name: "session_id", required: true, help: "Session id from get_agent_sessions"),
+                (name: "target", required: true, help: "Receiving agent: claude | codex, or a configured name")
+            ],
+            effect: .mutation
         )
     ]
 
@@ -341,7 +352,8 @@ public struct ToolExecutor: Sendable {
             let text = try Self.encode(payload)
             if isMutation {
                 audit.record(
-                    tool: name, arguments: normalized, outcome: "allowed", reason: nil
+                    tool: name, arguments: normalized, outcome: "allowed",
+                    reason: (payload as? MCPAuditNoting)?.auditNote
                 )
             }
             return ToolOutcome(text: text, isError: false)
@@ -497,6 +509,12 @@ public struct ToolExecutor: Sendable {
                 cacheRead: cacheRead, reasoning: reasoning, modelID: model
             )
             return AgentUsageRecordedPayload(note: note)
+
+        case "handoff_context":
+            let sessionID = try Self.sessionUUID(arguments)
+            let target = try Self.nonBlank(arguments["target"], field: "target")
+            let outcome = try await provider.handoffContext(sessionID: sessionID, target: target)
+            return HandoffContextPayload(outcome)
 
         // Unreachable while the catalog and this switch stay in step: `execute`
         // refuses any name the catalog does not declare, and every declared name
@@ -775,6 +793,20 @@ public struct ToolExecutor: Sendable {
         return sessionID
     }
 
+    /// The `session_id` argument as a UUID.
+    ///
+    /// Its own helper rather than `requireSessionID`: that one reads the connection's
+    /// own binding (`report_usage` records against the caller's session), while a
+    /// handoff names its session explicitly — any recorded session may be handed off,
+    /// not only the one the call arrived on.
+    private static func sessionUUID(_ arguments: [String: String]) throws -> UUID {
+        let raw = try nonBlank(arguments["session_id"], field: "session_id")
+        guard let id = UUID(uuidString: raw) else {
+            throw MCPToolError(message: "Invalid session_id: not an id Portmaster recorded.")
+        }
+        return id
+    }
+
     // MARK: Ranking
 
     /// Orders rollups by the requested metric, highest first. A nil total means
@@ -822,4 +854,18 @@ public struct ToolExecutor: Sendable {
         }
         return text
     }
+}
+
+/// The `reason` a successful call carries, for payloads that have one.
+///
+/// The executor's vocabulary stays four words (`allowed`/`denied`/`failed`/`rejected`);
+/// this is the note that rides the `allowed` line, so the log records not only that a
+/// handoff ran but where its brief went (ruling 10). Payloads without the conformance
+/// audit with no reason, exactly as before.
+private protocol MCPAuditNoting {
+    var auditNote: String { get }
+}
+
+extension HandoffContextPayload: MCPAuditNoting {
+    var auditNote: String { outcome.auditNote }
 }

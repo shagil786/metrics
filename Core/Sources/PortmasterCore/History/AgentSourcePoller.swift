@@ -164,7 +164,7 @@ public final class AgentSourcePoller: @unchecked Sendable {
     public init(
         store: AgentSessionStore,
         adapters: [any TokenSourceAdapter] = [ClaudeCodeLogAdapter()],
-        overlap: TimeInterval = 60 * 60,
+        overlap: TimeInterval = AgentLogMatcher.defaultOverlap,
         onPass: (@Sendable (AgentSourcePass) -> Void)? = nil
     ) {
         self.store = store
