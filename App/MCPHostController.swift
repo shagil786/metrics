@@ -373,6 +373,20 @@ final class MCPHostController: ObservableObject {
                 await MainActor.run {
                     AppModel.shared.agentSessionStore.map { StoreAgentSessionReading(store: $0) }
                 }
+            },
+            // One coordinator for both surfaces: this closure runs on a socket thread
+            // and the store is main-actor owned, so it hops exactly the way the reads
+            // above hop — to the same factory the pressure strip calls.
+            handoff: { sessionID, target in
+                try await MainActor.run {
+                    guard let store = AppModel.shared.agentSessionStore else {
+                        throw MCPToolError(
+                            message: "Session history is not available, so nothing was handed off."
+                        )
+                    }
+                    return try HandoffCoordinator.live(store: store)
+                        .handoff(sessionID: sessionID, target: target)
+                }
             }
         )
     }

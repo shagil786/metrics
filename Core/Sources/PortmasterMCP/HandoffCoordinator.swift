@@ -224,4 +224,42 @@ public struct HandoffCoordinator: Sendable {
         return FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
             && isDir.boolValue
     }
+
+    /// The app's own coordinator: the log root Claude Code writes to, the system
+    /// launcher, the per-user defaults, and briefs beside them. One construction for
+    /// both surfaces, so the MCP path and the strip cannot drift on where a brief
+    /// lands or which defaults a kill switch is read from.
+    public static func live(store: AgentSessionStore) -> HandoffCoordinator {
+        HandoffCoordinator(
+            store: store,
+            adapter: ClaudeCodeLogAdapter(),
+            launcher: SystemHandoffLauncher(),
+            defaults: .standard,
+            handoffDirectory: MCPSettings.defaultDirectory.appendingPathComponent("handoffs")
+        )
+    }
+
+    /// The UI path's own audit line (ruling 10): the same tool name, `origin: app`,
+    /// so one log tells a person's press from an assistant's call. Success carries
+    /// the brief note and failure the refusal — the same two things the executor's
+    /// line records for the MCP path.
+    public static func recordAppHandoff(
+        sessionID: UUID, target: String, result: Result<HandoffOutcome, Error>
+    ) {
+        let audit = AuditLog(directory: MCPSettings.defaultDirectory)
+        let arguments = ["session_id": sessionID.uuidString, "target": target, "origin": "app"]
+        switch result {
+        case .success(let handoff):
+            audit.record(
+                tool: "handoff_context", arguments: arguments,
+                outcome: "allowed", reason: handoff.auditNote
+            )
+        case .failure(let error):
+            let reason = (error as? MCPToolError)?.message ?? error.localizedDescription
+            audit.record(
+                tool: "handoff_context", arguments: arguments,
+                outcome: "failed", reason: reason
+            )
+        }
+    }
 }

@@ -92,4 +92,86 @@ final class AppHandoffWiringTests: XCTestCase {
         }
         return String(characters)
     }
+
+    // MARK: The affordance
+
+    /// The strip's button opens one sheet, and the sheet offers both ways out the
+    /// spec chose — the command the agent must run itself, and the handoff — behind
+    /// the mode mirror and the kill switch, from the session the notice is about.
+    func testTheStripOffersAnActionAndTheSheetOffersBothWaysOut() throws {
+        let overview = try source("App/OverviewView.swift")
+
+        XCTAssertTrue(
+            overview.contains("struct PressureActionsSheet"),
+            "the sheet the strip opens must exist beside the strip"
+        )
+        XCTAssertTrue(
+            overview.contains(".sheet(isPresented:"),
+            "the strip presents its actions as a sheet"
+        )
+        XCTAssertTrue(
+            overview.contains("/compact"),
+            "the sheet offers the exact command, because Portmaster cannot run it"
+        )
+        XCTAssertTrue(
+            overview.contains("HandoffTargets.load"),
+            "the sheet lists the configured receiving agents, not a hard-coded pair"
+        )
+        XCTAssertTrue(
+            overview.contains("notice.sessionID"),
+            "the handoff is of the session the notice is about"
+        )
+        XCTAssertTrue(
+            overview.contains("AppDelegate.shared?.mcpHost.mode"),
+            "the sheet mirrors the host's mode exactly as Settings does (ruling 16)"
+        )
+        XCTAssertTrue(
+            overview.contains("contextHandoffsEnabled"),
+            "the sheet respects the kill switch"
+        )
+    }
+
+    /// Both surfaces reach one coordinator factory, and the app's own path writes its
+    /// own audit line — the two claims only a whole-file scan can hold still.
+    func testThePressGoesThroughOneCoordinatorAndAuditsItsOwnOrigin() throws {
+        let appModel = try source("App/AppModel.swift")
+        XCTAssertTrue(
+            appModel.contains("func performHandoff(sessionID: UUID, target: String)"),
+            "the app's handoff entry point must exist by this name"
+        )
+        XCTAssertTrue(
+            appModel.contains("HandoffCoordinator.live(store:"),
+            "both surfaces build the coordinator through one factory"
+        )
+        XCTAssertTrue(
+            appModel.contains("recordAppHandoff"),
+            "the app path writes its own audit line (ruling 10)"
+        )
+
+        let controller = try source("App/MCPHostController.swift")
+        XCTAssertTrue(
+            controller.contains("handoff: { sessionID, target in"),
+            "the socket path reaches the same coordinator through the provider seam"
+        )
+
+        let coordinator = try source("Core/Sources/PortmasterMCP/HandoffCoordinator.swift")
+        XCTAssertTrue(
+            coordinator.contains(#""origin": "app""#),
+            "the app's audit line carries origin, so the two surfaces are tellable apart"
+        )
+    }
+
+    /// The kill switch has one authority (the coordinator) and one switch (Settings),
+    /// named after what it switches.
+    func testTheKillSwitchHasAToggleInTheGeneralSettings() throws {
+        let settings = try source("App/SettingsView.swift")
+        XCTAssertTrue(
+            settings.contains("contextHandoffsEnabled"),
+            "the kill switch must be settable where the other preferences live"
+        )
+        XCTAssertTrue(
+            settings.contains("Agent handoffs"),
+            "the toggle is named after what it switches"
+        )
+    }
 }

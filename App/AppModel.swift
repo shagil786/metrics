@@ -4,6 +4,7 @@ import Foundation
 import SwiftUI
 import Combine
 import PortmasterCore
+import PortmasterMCP
 import ServiceManagement
 import os
 
@@ -98,6 +99,24 @@ final class AppModel: ObservableObject {
                     sessionID: s.id, clientName: s.clientName, tokensLeftWorst: worst)
             }
             .min { $0.tokensLeftWorst < $1.tokensLeftWorst }
+    }
+
+    /// One handoff from the app's own surface (ruling 10): the coordinator does the
+    /// work, and this path writes its own audit line — same tool name, `origin: app` —
+    /// so the log tells a person's press apart from an assistant's tool call. The MCP
+    /// path audits through the executor instead; neither path audits twice.
+    func performHandoff(sessionID: UUID, target: String) throws -> HandoffOutcome {
+        guard let store = agentSessionStore else {
+            throw MCPToolError(
+                message: "Session history is not available, so nothing was handed off."
+            )
+        }
+        let result = Result {
+            try HandoffCoordinator.live(store: store)
+                .handoff(sessionID: sessionID, target: target)
+        }
+        HandoffCoordinator.recordAppHandoff(sessionID: sessionID, target: target, result: result)
+        return try result.get()
     }
 
     /// One pass has finished, on the main queue.

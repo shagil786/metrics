@@ -102,6 +102,17 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            Toggle("Agent handoffs", isOn: Binding(
+                get: { model.prefs.contextHandoffsEnabled },
+                set: { model.prefs.contextHandoffsEnabled = $0 }
+            ))
+            Text("Lets Portmaster write this session's context brief and launch a receiving agent when you ask from the pressure strip or from an MCP client. One switch for both paths: while it is off, nothing is launched and nothing is recorded as handed off.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(20)

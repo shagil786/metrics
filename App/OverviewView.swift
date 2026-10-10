@@ -5,6 +5,8 @@ import SwiftUI
 import Charts
 import UniformTypeIdentifiers
 import PortmasterCore
+import AppKit
+import PortmasterMCP
 
 struct OverviewView: View {
     @EnvironmentObject private var model: AppModel
@@ -779,16 +781,105 @@ struct OverviewView: View {
 /// unverified, so we quote what Claude Code printed and assert nothing about it.
 struct ContextPressureStrip: View {
     let notice: AppModel.ContextPressureNotice
+    @State private var showingActions = false
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "gauge.with.dots.needle.67percent")
             Text("\(notice.clientName ?? "Agent") — \(Fmt.tokens(notice.tokensLeftWorst)) tokens left (worst observed)")
                 .font(.callout)
             Spacer()
+            Button("Take Action…") { showingActions = true }
+                .accessibilityLabel("Take action on this session's context pressure")
         }
         .padding(10)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityLabel("\(notice.clientName ?? "Agent"), \(Fmt.tokens(notice.tokensLeftWorst)) tokens left, worst observed")
+        .sheet(isPresented: $showingActions) {
+            PressureActionsSheet(notice: notice)
+        }
+    }
+}
+
+/// Both ways out of context pressure, in the words the spec chose: run `/compact`
+/// in the agent's own terminal (Portmaster holds no channel to that prompt — it
+/// offers the exact command instead), or hand the conversation to a receiving
+/// agent. The handoff is a launch and obeys everything a launch obeys: the MCP
+/// mode mirror disables it with the reason shown, the kill switch disables it
+/// with its reason shown, and a refusal arrives as text rather than silence.
+struct PressureActionsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var model: AppModel
+    let notice: AppModel.ContextPressureNotice
+
+    @State private var copiedCompact = false
+    @State private var resultLine: String?
+
+    private var modeAllowsHandoff: Bool {
+        AppDelegate.shared?.mcpHost.mode == .allowSession
+    }
+
+    private var blockedReason: String? {
+        if !model.prefs.contextHandoffsEnabled {
+            return "Agent handoffs are switched off in Settings → General."
+        }
+        if !modeAllowsHandoff {
+            return "Handoffs run only while Portmaster's MCP mode allows session actions (Settings → MCP)."
+        }
+        return nil
+    }
+
+    private var targets: [String] { HandoffTargets.load().keys.sorted() }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("\(notice.clientName ?? "Agent") — \(Fmt.tokens(notice.tokensLeftWorst)) tokens left (worst observed)")
+                .font(.headline)
+            Text("This conversation can outgrow one context window. Two ways forward:")
+                .font(.subheadline)
+
+            Button(copiedCompact ? "Copied /compact" : "Copy /compact") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("/compact", forType: .string)
+                copiedCompact = true
+            }
+            Text("Portmaster cannot run it for you: `/compact` belongs to the agent's own prompt, which has no channel from here. Copy it and paste it in that terminal.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            ForEach(targets, id: \.self) { target in
+                Button("Hand off to \(target)") {
+                    do {
+                        let outcome = try model.performHandoff(
+                            sessionID: notice.sessionID, target: target
+                        )
+                        resultLine = "Handing off to \(target) — brief written at \(outcome.briefPath)"
+                    } catch {
+                        resultLine = (error as? MCPToolError)?.message ?? error.localizedDescription
+                    }
+                }
+                .disabled(blockedReason != nil)
+                .accessibilityLabel("Hand this session off to \(target)")
+            }
+            if let blocked = blockedReason {
+                Text(blocked)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let line = resultLine {
+                Text(line)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button("Close") { dismiss() }
+        }
+        .padding(20)
+        .frame(minWidth: 440, alignment: .leading)
     }
 }
 
