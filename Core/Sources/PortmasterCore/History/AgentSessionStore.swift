@@ -37,11 +37,11 @@ public final class AgentSession {
     /// what the session already survived.
     public var tokensLeftWorst: Int?
 
-    /// The session this one handed off to, set when a spawned target's PID
-    /// connects back (spec §4, amendment 1). Nil is "not observed" — never a
-    /// zero and never "no chain".
+    /// The session that handed this one off (nil for a chain head), set when a
+    /// spawned target's PID connects back (spec §4, amendment 1). Nil is
+    /// "not observed" — never a zero and never "no chain".
     public var handedOffFrom: UUID?
-    /// The session that handed off to this one. The pair is written together,
+    /// The session this one handed off to. The pair is written together,
     /// under the store's lock, in `recordSession`.
     public var handedOffTo: UUID?
     /// PID of the agent process this session spawned at handoff. Set once
