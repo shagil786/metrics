@@ -788,7 +788,7 @@ struct ContextPressureStrip: View {
         }
         .padding(10)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityLabel("Agent budget notice")
+        .accessibilityLabel("\(notice.clientName ?? "Agent"), \(Fmt.tokens(notice.tokensLeftWorst)) tokens left, worst observed")
     }
 }
 

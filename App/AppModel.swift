@@ -93,7 +93,7 @@ final class AppModel: ObservableObject {
             .filter { liveSessionIDs().contains($0.id) }
             .compactMap { s -> ContextPressureNotice? in
                 guard let first = s.tokensLeftFirst, let worst = s.tokensLeftWorst,
-                      worst * 2 <= first else { return nil }
+                      first <= Int.max / 2, worst * 2 <= first else { return nil }
                 return ContextPressureNotice(
                     sessionID: s.id, clientName: s.clientName, tokensLeftWorst: worst)
             }
@@ -109,10 +109,13 @@ final class AppModel: ObservableObject {
     /// one moved a number the user can see; a pass that found the same totals again is
     /// `debug`, because a line every thirty seconds is not news.
     ///
-    /// **Only a pass that changed something republishes.** Re-reading the store for a
-    /// pass that wrote nothing would spend a read and a redraw every interval on a number
-    /// that did not move — the same work `surfaceAppeared` deliberately does once rather
-    /// than per tick.
+    /// **A pass republishes when it wrote records, took withdrawals, or folded a
+    /// pressure change; a pass that moved nothing does not republish.** Re-reading the
+    /// store for a pass that established nothing would spend a read and a redraw every
+    /// interval on a number that did not move — the same work `surfaceAppeared`
+    /// deliberately does once rather than per tick. "Folded a pressure change" is
+    /// counted by `pressureUpdates`, which counts moves and not observations, so a pass
+    /// that re-read the same budget twice republishes once.
     ///
     /// Failures are not logged here: the poller already reports each one it survives with
     /// its own `NSLog`, and a second line saying it again would be two lines in the log
@@ -120,7 +123,7 @@ final class AppModel: ObservableObject {
     func agentSourcePassCompleted(_ pass: AgentSourcePass) {
         let summary = "sessions=\(pass.sessionsConsidered) sources=\(pass.sourcesQueried) "
             + "wrote=\(pass.records.count) withdrew=\(pass.withdrawals.count) "
-            + "absent=\(pass.absences.count)"
+            + "pressure=\(pass.pressureUpdates) absent=\(pass.absences.count)"
         if pass.records.isEmpty && pass.withdrawals.isEmpty {
             Self.agentSourceLog.debug("\(summary, privacy: .public)")
         } else {

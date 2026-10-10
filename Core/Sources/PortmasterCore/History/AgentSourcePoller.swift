@@ -84,8 +84,9 @@ public struct AgentSourcePass: Hashable, Sendable {
     public let withdrawals: [TokenUsageRecord]
     public let absences: [AgentSourceAbsence]
     public let failures: [AgentSourceFailure]
-    /// Pressure readings folded onto sessions this pass. Counted apart from
-    /// `records`: a pass can move pressure with no usage figure at all, and the
+    /// Pressure *changes* folded onto sessions this pass — a fold that actually moved a
+    /// value (first set, or worst lowered), not every observation of one. Counted apart
+    /// from `records`: a pass can move pressure with no usage figure at all, and the
     /// two are independent facts about what the pass established.
     public let pressureUpdates: Int
 
@@ -364,9 +365,10 @@ public final class AgentSourcePoller: @unchecked Sendable {
                 if case .unique(let candidate) = match,
                    let reading = adapter.contextPressure(at: candidate.url) {
                     do {
-                        try store.recordPressure(
-                            sessionID: session.id, tokensLeft: reading.tokensLeft)
-                        pressureUpdates += 1
+                        if try store.recordPressure(
+                            sessionID: session.id, tokensLeft: reading.tokensLeft) {
+                            pressureUpdates += 1
+                        }
                     } catch {
                         NSLog("Portmaster agent source poll could not record pressure: \(error)")
                         failures.append(AgentSourceFailure(
@@ -389,7 +391,7 @@ public final class AgentSourcePoller: @unchecked Sendable {
             do {
                 try store.flush()
             } catch {
-                NSLog("Portmaster agent source poll could not flush usage: \(error)")
+                NSLog("Portmaster agent source poll could not flush agent source pass: \(error)")
                 failures.append(AgentSourceFailure(source: "store", sessionID: nil, detail: "\(error)"))
             }
         }

@@ -150,6 +150,33 @@ final class ClaudeCodeLogAdapterTests: XCTestCase {
         }
     }
 
+    // MARK: - Context pressure
+
+    /// The one untested link: this adapter's `contextPressure` hands a real log to the
+    /// extractor, and the extractor's own tests never reach it. A reminder line in the
+    /// shape Claude Code writes must come back as a reading, and the word `Infinite`
+    /// must come back as no reading at all.
+    func testAReminderLineProducesAReadingAndInfiniteDoesNot() throws {
+        let root = try makeRoot()
+        let adapter = ClaudeCodeLogAdapter(projectsRoot: root)
+
+        let url = try writeLog("""
+        {"type":"user","content":"go"}
+        {"type":"attachment","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>14999357 tokens left</total_tokens>"},"timestamp":"2026-10-03T22:31:52.569Z"}
+        """, in: root, name: "reminder")
+        XCTAssertEqual(
+            adapter.contextPressure(at: url),
+            PressureReading(tokensLeft: 14_999_357, lineNumber: 2)
+        )
+
+        let infinite = try writeLog(
+            #"{"type":"attachment","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>Infinite tokens left</total_tokens>"}}"#,
+            in: root, name: "infinite"
+        )
+        XCTAssertNil(adapter.contextPressure(at: infinite),
+                     "a non-numeric rendering is an absence, never a zero")
+    }
+
     // MARK: - Candidate matching
 
     /// A session, in the two-column form matching consumes.

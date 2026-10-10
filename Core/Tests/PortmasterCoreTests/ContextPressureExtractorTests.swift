@@ -32,6 +32,14 @@ final class ContextPressureExtractorTests: XCTestCase {
                      "a non-numeric rendering is an absence, never a zero")
     }
 
+    func testATwentyFiveDigitReadingIsAbsentNotTruncated() throws {
+        let url = try write([
+            reminder("<total_tokens>1234567890123456789012345 tokens left</total_tokens>"),
+        ])
+        XCTAssertNil(try ContextPressureExtractor.peak(in: url),
+                     "beyond Int.max: absence, not truncation and not a crash")
+    }
+
     func testALineThatIsNotJSONDoesNotStopTheRead() throws {
         let url = try write([
             "not json at all",

@@ -27,7 +27,9 @@ public final class AgentSession {
     public var lastToolCallAt: Date?
     /// Nil while the socket is open, which outlives the process.
     public var endedAt: Date?
-    /// First numeric `tokens left` this session's conversation reported, per the poller.
+    /// Numeric `tokens left` at first sight, per the poller: the minimum the *first*
+    /// observation reported across the whole file, so for a resumed conversation it may
+    /// already be eroded — not necessarily the chronological first line's own value.
     /// `nil` means no reading exists — never that the budget is empty.
     public var tokensLeftFirst: Int?
     /// Worst (minimum) `tokens left` observed across passes. Fold: set on first
@@ -256,16 +258,25 @@ public final class AgentSessionStore: @unchecked Sendable {
     /// first value seen and the worst value seen; intermediate values are deliberately
     /// not stored, because the strip needs a reference point and a floor, not a history.
     ///
+    /// Returns whether anything moved: `true` when the fold set the first value or
+    /// lowered the worst, `false` for an idempotent re-observation of a value the
+    /// session already held — so a caller counting "updates" can count changes rather
+    /// than observations.
+    ///
     /// `throws` for symmetry with `recordSession`/`recordUsage` (neither has a throwing
     /// body either), and no save: persistence rides the pass's existing `flush()` at the
     /// end of `AgentSourcePoller.runPass`, so a save here would be a second write
     /// discipline to keep in step with the first.
-    public func recordPressure(sessionID: UUID, tokensLeft: Int) throws {
+    @discardableResult
+    public func recordPressure(sessionID: UUID, tokensLeft: Int) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let session = fetchSession(sessionID) else { return }
-        if session.tokensLeftFirst == nil { session.tokensLeftFirst = tokensLeft }
+        guard let session = fetchSession(sessionID) else { return false }
+        let firstWasSet = session.tokensLeftFirst != nil
+        if !firstWasSet { session.tokensLeftFirst = tokensLeft }
+        let worstBefore = session.tokensLeftWorst
         session.tokensLeftWorst =
-            session.tokensLeftWorst.map { min($0, tokensLeft) } ?? tokensLeft
+            worstBefore.map { min($0, tokensLeft) } ?? tokensLeft
+        return !firstWasSet || session.tokensLeftWorst != worstBefore
     }
 
     public func setPrice(_ price: Decimal, modelID: String, component: PriceComponent = .input) throws {

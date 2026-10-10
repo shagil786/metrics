@@ -377,6 +377,29 @@ final class AgentSourcePollerTests: XCTestCase {
         XCTAssertEqual(snapshot?.tokensLeftWorst, 14_999_357, "the fold reached the file")
     }
 
+    /// The counter counts changes, not observations: a second pass over the same
+    /// already-recorded value folds nothing, so it increments nothing — and a pass
+    /// with no records and no moved pressure has no reason to flush.
+    func testASecondPressureOnlyPassOverTheSameValueCountsNoChange() throws {
+        let store = try makeStore()
+        let now = Date()
+        let sessionID = try recordSession(store, connectedAt: now)
+        let adapter = CountingTokenAdapter(candidates: [candidate("a.jsonl", from: now)])
+        adapter.parsedUsage = []
+        adapter.pressure = PressureReading(tokensLeft: 14_999_357, lineNumber: 4)
+        let poller = AgentSourcePoller(store: store, adapters: [adapter], overlap: overlap)
+
+        let first = poller.pollOnce()
+        XCTAssertEqual(first.pressureUpdates, 1, "the first observation moves the fold")
+
+        let second = poller.pollOnce()
+        XCTAssertTrue(second.records.isEmpty)
+        XCTAssertEqual(second.pressureUpdates, 0, "the same value again moves nothing")
+        let snapshot = try store.sessions().first { $0.id == sessionID }!
+        XCTAssertEqual(snapshot.tokensLeftWorst, 14_999_357,
+                       "the fold still holds the one value it saw")
+    }
+
     // MARK: - What a pass persists
 
     /// One record per model the log attributed usage to, stamped with the session that

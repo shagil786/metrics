@@ -406,6 +406,10 @@ final class AppAgentSourceWiringTests: XCTestCase {
             occurrences(of: "* 2 <= ", in: try wholeAppSource()), 1,
             "one unvalidated threshold, one call site"
         )
+        XCTAssertEqual(
+            occurrences(of: "first <= Int.max / 2", in: try wholeAppSource()), 1,
+            "the multiplication is guarded once, beside the one threshold"
+        )
     }
 
     /// **`contextPressureNotice` is assigned in one file, and inside
