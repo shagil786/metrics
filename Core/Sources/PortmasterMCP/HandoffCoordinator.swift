@@ -170,6 +170,18 @@ public struct HandoffCoordinator: Sendable {
                     + "The brief was saved at \(briefPath.path) for manual use."
             )
         }
+        // A launcher that reports a non-positive pid after a successful launch has
+        // not really started anything we can find again; recording it would hand
+        // the store a pid that no process on the machine will ever match — the
+        // unlinkable-handoff hole this guard closes. Nothing real to terminate
+        // either, so no `launcher.terminate` on this path.
+        guard pid > 0 else {
+            throw MCPToolError(
+                message: "\(target.executable) reported no usable process id "
+                    + "(\(pid)), so nothing was recorded. The brief was saved at "
+                    + "\(briefPath.path) for manual use."
+            )
+        }
 
         // 10. Record under the lock. If a second handoff won the race, the
         // process we just spawned is ours to undo — the spawn was contingent

@@ -224,6 +224,38 @@ final class HandoffCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.launcher.launches.count, 0)
     }
 
+    func testANonPositivePIDIsRefusedBeforeTheStoreSeesIt() throws {
+        let h = try Harness()
+        defer { h.cleanup() }
+        try h.recordSession()
+        _ = try h.writeLog(fixture(workingDir: h.workingDir.path))
+        // A launcher that "succeeds" but reports no usable pid: the spawn is not
+        // something the store can find again, so it must never be recorded.
+        h.launcher.nextPID = 0
+        let coordinator = try h.makeCoordinator()
+
+        XCTAssertThrowsError(try coordinator.handoff(sessionID: h.sessionID, target: "codex")) {
+            let message = "\($0)"
+            XCTAssertTrue(message.contains("no usable process id"), "names the exact fact")
+            XCTAssertTrue(message.contains("nothing was recorded"))
+            XCTAssertTrue(message.contains("brief was saved"), "the dry run still happened")
+        }
+        let snapshot = try h.store.sessions().first { $0.id == h.sessionID }
+        XCTAssertNil(
+            snapshot?.handoffTargetPID,
+            "a non-positive pid is never written to the store"
+        )
+        XCTAssertTrue(
+            h.launcher.terminated.isEmpty,
+            "nothing real to terminate — the pid is not a process"
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: h.handoffDir.path),
+            ["\(h.sessionID.uuidString).md"],
+            "the dry run produced the brief even though nothing was recorded"
+        )
+    }
+
     func testAnUnsourcedLogIsRefusedWithNothingWritten() throws {
         let h = try Harness()
         defer { h.cleanup() }

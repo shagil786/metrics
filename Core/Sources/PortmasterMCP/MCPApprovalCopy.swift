@@ -153,6 +153,8 @@ public enum MCPApprovalCopy {
             return "Portmaster will change:"
         case .setModelPrice:
             return "Every session already recorded for this model will be re-costed:"
+        // leadIn(for:count:) — never reached today (this kind's requests carry no
+        // resolved targets), kept truthful for the day one does.
         case .handoffContext:
             return "The brief will be handed to:"
         }

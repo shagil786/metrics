@@ -101,7 +101,7 @@ public struct ToolExecutor: Sendable {
         self.priceWriter = priceWriter ?? UnavailableModelPriceWriter()
     }
 
-    /// All 17 tools the MCP server exposes. Names wired into dispatch stay in
+    /// All 18 tools the MCP server exposes. Names wired into dispatch stay in
     /// step with this list, because `execute` refuses anything not declared here.
     public static let catalog: [ToolDefinition] = [
         // Reads
