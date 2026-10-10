@@ -22,8 +22,9 @@ public enum HandoffBriefExtractor {
         // tool_use in line order, and the ids a tool_result ever answered.
         var toolUses: [(id: String, item: BriefItem, input: [String: Any])] = []
         var answered: Set<String> = []
-        // Mutations keyed by their tool_use id: the in-flight call is claimed by
-        // Next only, so its id must be known before Done/Files are finalized.
+        // Mutations keyed by their tool_use id: whether the in-flight call
+        // stays in Done is decided after the walk, once the pending id is
+        // known, so each claim must carry the id that produced it.
         var mutations: [(id: String, done: BriefItem, file: BriefItem?)] = []
 
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
