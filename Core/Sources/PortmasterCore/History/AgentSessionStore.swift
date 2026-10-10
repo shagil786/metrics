@@ -37,6 +37,21 @@ public final class AgentSession {
     /// what the session already survived.
     public var tokensLeftWorst: Int?
 
+    /// The session this one handed off to, set when a spawned target's PID
+    /// connects back (spec §4, amendment 1). Nil is "not observed" — never a
+    /// zero and never "no chain".
+    public var handedOffFrom: UUID?
+    /// The session that handed off to this one. The pair is written together,
+    /// under the store's lock, in `recordSession`.
+    public var handedOffTo: UUID?
+    /// PID of the agent process this session spawned at handoff. Set once
+    /// (`recordHandoff` refuses a second), read by the link in `recordSession`.
+    public var handoffTargetPID: Int32?
+    /// The configured target name that PID was spawned as ("codex"). Carried so
+    /// the chain arrow can name the receiver: `clientName` is always nil on the
+    /// socket path, because the MCP SDK consumes `initialize`.
+    public var handoffTargetName: String?
+
     public init(
         id: UUID, peerPID: Int32, clientName: String?, clientVersion: String?,
         connectedAt: Date, lastToolCallAt: Date? = nil, endedAt: Date? = nil
@@ -168,6 +183,41 @@ public enum PriceComponent: String, Sendable {
     public static let named: PriceComponent = .input
 }
 
+/// One session's share of a handoff chain, with the label the chain line shows.
+public struct ChainShare: Equatable, Sendable {
+    public let sessionID: UUID
+    public let label: String
+    /// Nil when this session's cost is unknown — an unpriced member, a
+    /// conflict, or no usage. A nil share forces a nil chain total: a chain
+    /// total is one figure or it is absent (ruling 4).
+    public let usd: Decimal?
+}
+
+/// The observed thread: every session linked by handoff edges, head first,
+/// with one total only when every member's cost is known.
+public struct ChainReport: Equatable, Sendable {
+    public let shares: [ChainShare]
+    public let totalUSD: Decimal?
+
+    /// `$3.42 · 2 sessions · Claude ($2.14) → Codex ($1.28)` (spec §4), or the
+    /// no-total form that names the absence instead of leaving a hole.
+    public var renderedLine: String {
+        let names = shares.map(\.label).joined(separator: " → ")
+        let count = shares.count
+        guard let totalUSD else {
+            return "\(count) sessions · \(names) · total not priced"
+        }
+        let itemised = shares.compactMap { share -> String? in
+            share.usd.map { "\(share.label) (\(Fmt.usd($0)))" }
+        }
+        guard itemised.count == shares.count else {
+            return "\(count) sessions · \(names) · total not priced"
+        }
+        return "\(Fmt.usd(totalUSD)) · \(count) sessions · "
+            + itemised.joined(separator: " → ")
+    }
+}
+
 public struct AgentSessionSnapshot: Sendable {
     public let id: UUID
     public let peerPID: Int32
@@ -179,8 +229,28 @@ public struct AgentSessionSnapshot: Sendable {
     public let tokensLeftFirst: Int?
     /// Worst (minimum) `tokens left` observed, or `nil` when no reading exists.
     public let tokensLeftWorst: Int?
+    public let handoffTargetPID: Int32?
+    public let handoffTargetName: String?
+    public let handedOffFrom: UUID?
+    public let handedOffTo: UUID?
     public let usage: TokenUsage
     public let cost: SessionCost
+    /// The chain this session belongs to, computed across the whole table in
+    /// `sessions()`; nil for a session with no observed handoff edge.
+    public let chain: ChainReport?
+
+    // The only caller is `chaining` in `AgentSessionStore`, outside this type's
+    // lexical scope — which is exactly where Swift's `private` stops.
+    fileprivate func withChain(_ report: ChainReport?) -> AgentSessionSnapshot {
+        AgentSessionSnapshot(
+            id: id, peerPID: peerPID, clientName: clientName, clientVersion: clientVersion,
+            connectedAt: connectedAt, endedAt: endedAt,
+            tokensLeftFirst: tokensLeftFirst, tokensLeftWorst: tokensLeftWorst,
+            handoffTargetPID: handoffTargetPID, handoffTargetName: handoffTargetName,
+            handedOffFrom: handedOffFrom, handedOffTo: handedOffTo,
+            usage: usage, cost: cost, chain: report
+        )
+    }
 }
 
 public final class AgentSessionStore: @unchecked Sendable {
@@ -234,19 +304,51 @@ public final class AgentSessionStore: @unchecked Sendable {
         connectedAt: Date
     ) throws {
         lock.lock(); defer { lock.unlock() }
+        let session: AgentSession
         // Upsert by id: a reconnect reuses nothing, but a retried record must not
         // create a second row for one connection.
         if let existing = fetchSession(id) {
             existing.peerPID = peerPID
             existing.clientName = clientName
             existing.clientVersion = clientVersion
-            return
+            session = existing
+        } else {
+            let created = AgentSession(
+                id: id, peerPID: peerPID,
+                clientName: clientName, clientVersion: clientVersion,
+                connectedAt: connectedAt
+            )
+            context.insert(created)
+            session = created
         }
-        context.insert(AgentSession(
-            id: id, peerPID: peerPID,
-            clientName: clientName, clientVersion: clientVersion,
-            connectedAt: connectedAt
-        ))
+
+        // The link, inside the same lock that guards every other invariant
+        // (spec amendment 1): a connecting process whose pid is a recorded
+        // handoff target claims the edge — both sides, one write. Once-only in
+        // both directions: a source with `handedOffTo` set does not re-link, and
+        // a target already claimed does not get a second predecessor (amendment 2).
+        // Each node having at most one outgoing edge is what structurally
+        // prevents cycles; no separate cycle check exists because none is needed.
+        guard peerPID > 0,
+              session.handedOffFrom == nil,
+              let source = linkableSourceLocked(peerPID: peerPID),
+              source.id != session.id
+        else { return }
+        source.handedOffTo = session.id
+        session.handedOffFrom = source.id
+    }
+
+    /// The unlinked source row whose recorded target PID is `peerPID`, oldest
+    /// claim first so a stale-PID collision is at least deterministic.
+    private func linkableSourceLocked(peerPID: Int32) -> AgentSession? {
+        let descriptor = FetchDescriptor<AgentSession>(
+            predicate: #Predicate {
+                $0.handoffTargetPID == peerPID && $0.handedOffTo == nil
+            },
+            sortBy: [SortDescriptor(\.connectedAt)]
+        )
+        let matches = (try? context.fetch(descriptor)) ?? []
+        return matches.first
     }
 
     public func recordUsage(_ record: TokenUsageRecord) throws {
@@ -277,6 +379,25 @@ public final class AgentSessionStore: @unchecked Sendable {
         session.tokensLeftWorst =
             worstBefore.map { min($0, tokensLeft) } ?? tokensLeft
         return !firstWasSet || session.tokensLeftWorst != worstBefore
+    }
+
+    /// Records that `sourceID` spawned `targetPID` (spec amendment 1). The
+    /// authoritative once-only check lives here, under the lock, not in a
+    /// pre-check that could race a second handoff between read and spawn.
+    ///
+    /// Returns false when the source does not exist or has already handed off.
+    /// No save: the coordinator flushes immediately after a successful launch,
+    /// so a crash cannot leave a spawned agent unrecorded.
+    @discardableResult
+    public func recordHandoff(
+        sourceID: UUID, targetPID: Int32, targetName: String
+    ) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let source = fetchSession(sourceID) else { return false }
+        guard source.handoffTargetPID == nil else { return false }
+        source.handoffTargetPID = targetPID
+        source.handoffTargetName = targetName
+        return true
     }
 
     public func setPrice(_ price: Decimal, modelID: String, component: PriceComponent = .input) throws {
@@ -384,7 +505,7 @@ public final class AgentSessionStore: @unchecked Sendable {
         // would restore the per-row queries without changing any result.
         let recordsBySession = usageRecordsGroupedLocked()
         let table = priceTableLocked()
-        return rows.map { row in
+        let snapshots = rows.map { row -> AgentSessionSnapshot in
             let records = recordsBySession[row.id] ?? []
             return AgentSessionSnapshot(
                 id: row.id,
@@ -395,10 +516,82 @@ public final class AgentSessionStore: @unchecked Sendable {
                 endedAt: row.endedAt,
                 tokensLeftFirst: row.tokensLeftFirst,
                 tokensLeftWorst: row.tokensLeftWorst,
+                handoffTargetPID: row.handoffTargetPID,
+                handoffTargetName: row.handoffTargetName,
+                handedOffFrom: row.handedOffFrom,
+                handedOffTo: row.handedOffTo,
                 usage: TokenUsage.aggregating(records),
-                cost: costLocked(records: records, table: table)
+                cost: costLocked(records: records, table: table),
+                chain: nil
             )
         }
+        return Self.chaining(snapshots)
+    }
+
+    /// Attaches each linked session's `ChainReport` (spec §4). One walk per
+    /// chain, memoised by head — recomputing per row would walk the same chain
+    /// once per member on every read of a list that already batches its other
+    /// queries for the same reason.
+    static func chaining(_ snapshots: [AgentSessionSnapshot]) -> [AgentSessionSnapshot] {
+        let byID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.id, $0) })
+        var reports: [UUID: ChainReport] = [:]
+
+        // Walk up to the head, then forward — both hops bounded by the table
+        // size so a corrupt pair of pointers cannot spin under the store's read.
+        func members(from id: UUID) -> [AgentSessionSnapshot] {
+            guard var node = byID[id] else { return [] }
+            var hops = 0
+            while let from = node.handedOffFrom, hops <= snapshots.count,
+                  let next = byID[from] {
+                node = next
+                hops += 1
+            }
+            var list = [node]
+            hops = 0
+            while let to = node.handedOffTo, hops <= snapshots.count,
+                  let next = byID[to] {
+                list.append(next)
+                node = next
+                hops += 1
+            }
+            return list
+        }
+
+        var output: [AgentSessionSnapshot] = []
+        output.reserveCapacity(snapshots.count)
+        for snapshot in snapshots {
+            guard snapshot.handedOffFrom != nil || snapshot.handedOffTo != nil else {
+                output.append(snapshot)
+                continue
+            }
+            let chain = members(from: snapshot.id)
+            guard chain.count > 1 else {
+                output.append(snapshot)
+                continue
+            }
+            let headID = chain[0].id
+            let report = reports[headID] ?? Self.chainReport(chain)
+            reports[headID] = report
+            output.append(snapshot.withChain(report))
+        }
+        return output
+    }
+
+    static func chainReport(_ members: [AgentSessionSnapshot]) -> ChainReport {
+        var shares: [ChainShare] = []
+        shares.reserveCapacity(members.count)
+        for (index, member) in members.enumerated() {
+            // Head: whatever the session says about itself (today always
+            // "agent", because the host never sees `initialize`). Tail: the
+            // target name we spawned, which we do know (ruling 5).
+            let label = index == 0
+                ? (member.clientName ?? "agent")
+                : (members[index - 1].handoffTargetName ?? member.clientName ?? "agent")
+            shares.append(ChainShare(sessionID: member.id, label: label, usd: member.cost.usd))
+        }
+        let priced = shares.compactMap(\.usd)
+        let total = priced.count == shares.count ? priced.reduce(0, +) : nil
+        return ChainReport(shares: shares, totalUSD: total)
     }
 
     public func usage(for sessionID: UUID) throws -> TokenUsage {

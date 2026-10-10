@@ -223,6 +223,11 @@ final class AgentSessionStoreTests: XCTestCase {
         XCTAssertNotNil(session, "an old file must still open — lightweight migration")
         XCTAssertNil(session?.tokensLeftFirst, "not-yet-migrated means nil, never zero")
         XCTAssertNil(session?.tokensLeftWorst)
+        XCTAssertNil(session?.handedOffFrom, "a pre-chain file has no edges, and nil is not a zero")
+        XCTAssertNil(session?.handedOffTo)
+        XCTAssertNil(session?.handoffTargetPID)
+        XCTAssertNil(session?.handoffTargetName)
+        XCTAssertNil(session?.chain, "no observed link is not an observed chain")
     }
 
     // MARK: - Cost
@@ -1182,5 +1187,147 @@ final class AgentSessionStoreTests: XCTestCase {
             entry.pricePerTokenText = canonical
             XCTAssertNotNil(entry.pricePerToken, "\"\(canonical)\" is a price")
         }
+    }
+
+    // MARK: - Handoff chain
+
+    func testHandoffForAnUnknownSessionRecordsNothing() throws {
+        let store = try makeStore()
+        XCTAssertFalse(try store.recordHandoff(sourceID: UUID(), targetPID: 4242, targetName: "codex"),
+                       "no row is invented for an id we do not have")
+        XCTAssertTrue(try store.sessions().isEmpty, "and no row is written for one either")
+    }
+
+    func testASecondHandoffFromTheSameSessionIsRefused() throws {
+        let store = try makeStore()
+        let id = UUID()
+        try store.recordSession(id: id, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date())
+        XCTAssertTrue(try store.recordHandoff(sourceID: id, targetPID: 4242, targetName: "codex"))
+        XCTAssertFalse(try store.recordHandoff(sourceID: id, targetPID: 9999, targetName: "claude"),
+                       "a session hands off once; a second spawn would fork the thread")
+        let s = try XCTUnwrap(store.sessions().first { $0.id == id })
+        XCTAssertEqual(s.handoffTargetPID, 4242, "the refused attempt must not overwrite the first")
+        XCTAssertEqual(s.handoffTargetName, "codex")
+        XCTAssertNil(s.handedOffTo, "an unarrived target leaves the edge absent, not zero")
+    }
+
+    func testAConnectingPeerPIDLinksBothSessionsInOneWrite() throws {
+        let store = try makeStore()
+        let sourceID = UUID(), targetID = UUID()
+        try store.recordSession(id: sourceID, peerPID: 1, clientName: "a", clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 100))
+        _ = try store.recordHandoff(sourceID: sourceID, targetPID: 4242, targetName: "codex")
+        try store.recordSession(id: targetID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 200))
+        try store.flush()
+
+        let source = try XCTUnwrap(store.sessions().first { $0.id == sourceID })
+        let target = try XCTUnwrap(store.sessions().first { $0.id == targetID })
+        XCTAssertEqual(source.handedOffTo, targetID)
+        XCTAssertEqual(target.handedOffFrom, sourceID)
+        XCTAssertNil(source.handedOffFrom, "the head has no predecessor")
+        XCTAssertNil(target.handedOffTo, "the tail has no successor yet")
+    }
+
+    func testAStaleTargetPIDThatNeverArrivesStaysUnlinked() throws {
+        let store = try makeStore()
+        let id = UUID()
+        try store.recordSession(id: id, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date())
+        _ = try store.recordHandoff(sourceID: id, targetPID: 4242, targetName: "codex")
+        let s = try XCTUnwrap(store.sessions().first { $0.id == id })
+        XCTAssertNil(s.handedOffTo, "nobody arrived with that pid — an honest absence")
+        XCTAssertNil(s.chain, "no observed link means no chain")
+    }
+
+    func testAnAlreadyLinkedTargetIsNotStolenByASecondClaim() throws {
+        let store = try makeStore()
+        let sourceID = UUID(), targetID = UUID(), otherID = UUID()
+        try store.recordSession(id: sourceID, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 100))
+        _ = try store.recordHandoff(sourceID: sourceID, targetPID: 4242, targetName: "codex")
+        try store.recordSession(id: targetID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 200))
+        try store.recordSession(id: otherID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 300))
+        let target = try XCTUnwrap(store.sessions().first { $0.id == targetID })
+        let other = try XCTUnwrap(store.sessions().first { $0.id == otherID })
+        XCTAssertEqual(target.handedOffFrom, sourceID, "into-target is once only (amendment 2)")
+        XCTAssertNil(other.handedOffFrom)
+        let source = try XCTUnwrap(store.sessions().first { $0.id == sourceID })
+        XCTAssertEqual(source.handedOffTo, targetID, "the first link stands")
+    }
+
+    func testAChainReportsOneTotalWithEachShareItemised() throws {
+        let store = try makeStore()
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        let sourceID = UUID(), targetID = UUID()
+        try store.recordSession(id: sourceID, peerPID: 1, clientName: "Claude", clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 100))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sourceID, recordedAt: Date(), input: 2_000_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        _ = try store.recordHandoff(sourceID: sourceID, targetPID: 4242, targetName: "codex")
+        try store.recordSession(id: targetID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 200))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: targetID, recordedAt: Date(), input: 1_000_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        try store.flush()
+
+        let source = try XCTUnwrap(store.sessions().first { $0.id == sourceID })
+        let target = try XCTUnwrap(store.sessions().first { $0.id == targetID })
+        let chain = try XCTUnwrap(source.chain)
+        XCTAssertEqual(chain, target.chain, "both ends see the same chain")
+        XCTAssertEqual(chain.shares.map(\.sessionID), [sourceID, targetID], "head first")
+        XCTAssertEqual(chain.shares.map(\.label), ["Claude", "codex"],
+                       "the tail is labelled by the target we spawned (ruling 2)")
+        XCTAssertEqual(chain.totalUSD, Decimal(string: "3"),
+                       "2,000,000 + 1,000,000 tokens at $0.000001 each")
+        XCTAssertEqual(
+            chain.renderedLine,
+            "$3.00 · 2 sessions · Claude ($2.00) → codex ($1.00)"
+        )
+    }
+
+    func testAChainWithOneUnpricedMemberHasNoTotalAtAll() throws {
+        let store = try makeStore()
+        try store.setPrice(Decimal(string: "0.000001")!, modelID: "m")
+        let sourceID = UUID(), targetID = UUID()
+        try store.recordSession(id: sourceID, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 100))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: sourceID, recordedAt: Date(), input: 1_000_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "m", provenance: .selfReported
+        ))
+        _ = try store.recordHandoff(sourceID: sourceID, targetPID: 4242, targetName: "codex")
+        try store.recordSession(id: targetID, peerPID: 4242, clientName: nil, clientVersion: nil,
+                                connectedAt: Date(timeIntervalSince1970: 200))
+        try store.recordUsage(TokenUsageRecord(
+            sessionID: targetID, recordedAt: Date(), input: 1_000_000, output: 0,
+            cacheRead: nil, reasoning: nil, modelID: "unpriced", provenance: .selfReported
+        ))
+        try store.flush()
+
+        let source = try XCTUnwrap(store.sessions().first { $0.id == sourceID })
+        let chain = try XCTUnwrap(source.chain)
+        XCTAssertNil(chain.totalUSD, "a partial total is the exact lie this repo exists to prevent")
+        XCTAssertEqual(
+            chain.renderedLine,
+            "2 sessions · agent → codex · total not priced",
+            "no dollars at all when the total is unknown — not a partial itemisation"
+        )
+    }
+
+    func testAStandAloneSessionHasNoChain() throws {
+        let store = try makeStore()
+        let id = UUID()
+        try store.recordSession(id: id, peerPID: 1, clientName: nil, clientVersion: nil,
+                                connectedAt: Date())
+        let s = try XCTUnwrap(store.sessions().first { $0.id == id })
+        XCTAssertNil(s.chain)
     }
 }
