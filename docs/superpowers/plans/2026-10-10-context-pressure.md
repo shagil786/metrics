@@ -151,10 +151,10 @@ public enum ContextPressureExtractor {
     public static func peak(in url: URL) throws -> PressureReading? {
         let text = try String(contentsOf: url, encoding: .utf8)
         var worst: PressureReading?
-        for (offset, line) in text.split(separator: "\n", omittingEmptySubsequences: true)
+        for (offset, textLine) in text.split(separator: "\n", omittingEmptySubsequences: true)
             .enumerated() {
             // A log mid-write can hold a partial line; unparseable JSON skips, it does not fail.
-            guard let data = line.data(using: .utf8),
+            guard let data = textLine.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let attachment = object["attachment"] as? [String: Any],
                   (attachment["type"] as? String) == "total_tokens_reminder",
@@ -162,9 +162,9 @@ public enum ContextPressureExtractor {
                   let match = reminder.firstMatch(of: pattern)
             else { continue }
             guard let value = Int(match.1) else { continue }
-            let line = offset + 1
+            let lineNumber = offset + 1
             if worst == nil || value < worst!.tokensLeft {
-                worst = PressureReading(tokensLeft: value, lineNumber: line)
+                worst = PressureReading(tokensLeft: value, lineNumber: lineNumber)
             }
         }
         return worst
@@ -179,7 +179,7 @@ Expected: PASS — 6 tests.
 
 - [ ] **Step 5: Run the whole Core suite, then commit**
 
-Run: `cd Core && swift test` → 0 failures (398 + 6 new, 1 pre-existing skip).
+Run: `cd Core && swift test` → 0 failures (both targets; absolute counts drift — growth by the new tests is the signal, not the total).
 
 ```bash
 git add Core/Sources/PortmasterCore/History/ContextPressureExtractor.swift \
@@ -446,7 +446,7 @@ git commit -m "feat: a session remembers the first and worst tokens-left it saw"
 
 Pin these three claims:
 1. `OverviewView.swift` renders `ContextPressureStrip` **above** the grid (assert both the call and that its source position precedes the grid's `LazyVGrid`/`grid` call).
-2. The threshold expression `tokensLeftWorst * 2 <= tokensLeftFirst` appears **exactly once** across the whole stripped `App/` tree (a second threshold is a second unvalidated policy).
+2. The operator core `* 2 <= ` appears **exactly once** across the whole stripped `App/` tree (a second threshold is a second unvalidated policy). Assert on the operator core, not the operand names, so the test pins the policy's *site count* rather than the spelling of local variables.
 3. The derivation lives in `refreshAgentSessions` — `contextPressureNotice` is assigned in exactly one file (a second assignment site is a second source of truth).
 
 - [ ] **Step 2: Run to verify failure**
