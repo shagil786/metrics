@@ -69,6 +69,15 @@ final class AppModel: ObservableObject {
     /// second would spend work to redraw a number that is almost always identical.
     @Published private(set) var agentSessions: [AgentSessionSnapshot] = []
 
+    /// One live session whose budget has visibly eroded, worth a strip above the grid.
+    struct ContextPressureNotice: Equatable {
+        let sessionID: UUID
+        let clientName: String?
+        let tokensLeftWorst: Int
+    }
+
+    @Published private(set) var contextPressureNotice: ContextPressureNotice?
+
     /// Re-reads the sessions for the Overview card.
     func refreshAgentSessions() {
         guard let store = agentSessionStore else {
@@ -76,6 +85,19 @@ final class AppModel: ObservableObject {
             return
         }
         agentSessions = (try? store.sessions()) ?? []
+        // Provisional: half the session's own first reading. Unvalidated against real
+        // data — we have never watched a budget actually erode — so it lives at this one
+        // call site, named, like the 1% disagreement tolerance. Absent first or worst
+        // means no notice: we do not invent a reference point.
+        contextPressureNotice = agentSessions
+            .filter { liveSessionIDs().contains($0.id) }
+            .compactMap { s -> ContextPressureNotice? in
+                guard let first = s.tokensLeftFirst, let worst = s.tokensLeftWorst,
+                      worst * 2 <= first else { return nil }
+                return ContextPressureNotice(
+                    sessionID: s.id, clientName: s.clientName, tokensLeftWorst: worst)
+            }
+            .min { $0.tokensLeftWorst < $1.tokensLeftWorst }
     }
 
     /// One pass has finished, on the main queue.
@@ -104,7 +126,8 @@ final class AppModel: ObservableObject {
         } else {
             Self.agentSourceLog.notice("\(summary, privacy: .public)")
         }
-        guard !pass.records.isEmpty || !pass.withdrawals.isEmpty else { return }
+        guard !pass.records.isEmpty || !pass.withdrawals.isEmpty || pass.pressureUpdates > 0
+        else { return }
         refreshAgentSessions()
     }
 

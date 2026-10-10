@@ -54,6 +54,7 @@ struct OverviewView: View {
                         .disabled(!hasReading)
                 }.padding(.bottom, 4)
                 if let exportError { ErrorBanner(message: exportError) { self.exportError = nil } }
+                if let notice = model.contextPressureNotice { ContextPressureStrip(notice: notice) }
                 cardGrid(ids: ["cpu", "memory", "gpu", "disk", "network", "power"], width: geo.size.width)
                 worthALook
                 overviewSection("Right Now", ids: ["memoryType", "memoryApps", "powerApps"], width: geo.size.width)
@@ -771,6 +772,23 @@ struct OverviewView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, minHeight: 44, alignment: .center)
+    }
+}
+
+/// The log's own words, deliberately: the number's meaning is mode-dependent and
+/// unverified, so we quote what Claude Code printed and assert nothing about it.
+struct ContextPressureStrip: View {
+    let notice: AppModel.ContextPressureNotice
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "gauge.with.dots.needle.67percent")
+            Text("\(notice.clientName ?? "Agent") — \(Fmt.tokens(notice.tokensLeftWorst)) tokens left (worst observed)")
+                .font(.callout)
+            Spacer()
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityLabel("Agent budget notice")
     }
 }
 

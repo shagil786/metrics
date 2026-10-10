@@ -1,7 +1,7 @@
 // The App half of the agent-source wiring, asserted from source.
 //
 // There is no App test target: `project.yml` declares the `Portmaster` application and
-// the `PortmasterCore` package, and nothing runs against `App/` — so the wiring's four
+// the `PortmasterCore` package, and nothing runs against `App/` — so the wiring's
 // claims cannot be exercised at runtime without adding a target, which this task is not
 // allowed to do and which would outweigh the claims. What the repository already does
 // instead is `MCPSettingsChromeTests`: read the shipped source from the repository root
@@ -11,6 +11,10 @@
 // rather than silently asserting over nothing), and comments are stripped before any
 // matching, because a doc comment can discuss the very strings it forbids (the same
 // rule, for the same reason, as that file's `withoutComments`).
+//
+// The same mechanism pins the context-pressure strip's claims (placement above the
+// grid, one threshold site, one assignment site), with the same limit: a source scan
+// says where code is, never that it runs.
 //
 // **What this proves, and what it does not.** It proves where the poller is built —
 // once, inside the `do` that opens the store — that no second error channel exists for
@@ -354,6 +358,76 @@ final class AppAgentSourceWiringTests: XCTestCase {
         XCTAssertTrue(
             appeared.contains("agentSourcePoller?.requestPoll()"),
             "a surface asks — non-blocking, under the interval the timer obeys"
+        )
+    }
+
+    // MARK: - The strip above the grid
+
+    /// **The strip renders above the overview grid, exactly once, from the model's
+    /// notice.** Placement is the claim: a strip drawn after the cards answers a
+    /// question the reader has already looked past, and a second render would answer
+    /// it twice. Anchored to the body's `cardGrid` call rather than to `LazyVGrid`,
+    /// which sits inside `cardGrid`'s own definition below the body — a strip
+    /// anywhere in the body precedes that, so the `LazyVGrid` anchor could not see a
+    /// strip moved below the grid.
+    ///
+    /// What it does not prove: that the strip ever appears. That needs a live session
+    /// whose budget actually eroded, which the app run in this task's report attempts
+    /// and reports honestly.
+    func testThePressureStripIsRenderedAboveTheGrid() throws {
+        let overview = try source("App/OverviewView.swift")
+        XCTAssertEqual(
+            occurrences(of: "ContextPressureStrip(notice:", in: overview), 1,
+            "the strip is rendered once, from the model's notice"
+        )
+        let strip = try XCTUnwrap(
+            overview.range(of: "ContextPressureStrip(notice:"),
+            "OverviewView no longer renders ContextPressureStrip"
+        )
+        let grid = try XCTUnwrap(
+            overview.range(of: "cardGrid(ids: [\"cpu\""),
+            "OverviewView no longer calls the overview grid"
+        )
+        XCTAssertTrue(
+            strip.lowerBound < grid.lowerBound,
+            "the strip must sit above the grid, not below it"
+        )
+    }
+
+    /// **The provisional threshold has exactly one site across `App/`.** It is
+    /// unvalidated policy — half a session's own first reading — so a second site
+    /// would be a second policy no data ever justified, drifting from the first with
+    /// nothing on screen to say so. Counted on the operator core rather than the
+    /// operand names: the derivation binds its own locals, and a rename must not move
+    /// the count. Comments are stripped before matching, so a comment quoting the
+    /// threshold is not a site.
+    func testTheProvisionalThresholdHasExactlyOneSiteAcrossApp() throws {
+        XCTAssertEqual(
+            occurrences(of: "* 2 <= ", in: try wholeAppSource()), 1,
+            "one unvalidated threshold, one call site"
+        )
+    }
+
+    /// **`contextPressureNotice` is assigned in one file, and inside
+    /// `refreshAgentSessions`.** The strip and the sessions card below it must not
+    /// disagree, and they cannot while the notice is derived only where the session
+    /// list is re-read; a second assignment anywhere else in `App/` would be a second
+    /// source of truth the two could drift apart from. The needle is
+    /// `contextPressureNotice = `, so the `@Published var` declaration is neither an
+    /// assignment nor a site.
+    func testTheContextPressureNoticeIsAssignedInExactlyOneFile() throws {
+        XCTAssertEqual(
+            occurrences(of: "contextPressureNotice = ", in: try wholeAppSource()), 1,
+            "one assignment across App — a second site is a second source of truth"
+        )
+        let app = try source("App/AppModel.swift")
+        let refresh = try XCTUnwrap(
+            region(in: app, from: "func refreshAgentSessions()"),
+            "`refreshAgentSessions` was not found in AppModel"
+        )
+        XCTAssertTrue(
+            refresh.contains("contextPressureNotice = "),
+            "the notice is derived where the session list is re-read"
         )
     }
 }
