@@ -116,7 +116,9 @@ extension HandoffBrief {
     /// priority order — goal > next > done > files, with state last (spec §3
     /// lists state nowhere in the priority, and the closing turns are the most
     /// reconstructable section) — and clipping the goal last. Every drop is
-    /// recorded in `dropped`; truncation is never silent.
+    /// recorded in `dropped`; truncation is never silent. The notes themselves
+    /// cost room, so each pass re-checks the budget and note-inflation
+    /// resumes the cascade rather than being allowed to overspend it.
     public func budgeted() -> HandoffBrief {
         // The brief's fields are immutable, so the budget works on locals and
         // reassembles through the shipped init at each checkpoint.
@@ -126,9 +128,22 @@ extension HandoffBrief {
         var state = self.state
         var next = self.next
         var dropped = self.dropped
+        let originalDoneCount = done.count
+        // The clip marker is materialized inside `current()` only once a clip
+        // has actually happened, so every budget check pays for the marker
+        // the final render will carry — and a goal that never shrank never
+        // claims one.
+        var goalClipped = false
         func current() -> HandoffBrief {
-            HandoffBrief(
-                goal: goal, done: done, files: files, state: state, next: next,
+            var effectiveGoal = goal
+            if goalClipped, let item = goal {
+                effectiveGoal = BriefItem(
+                    text: item.text + "… [clipped to fit the handoff budget]",
+                    line: item.line
+                )
+            }
+            return HandoffBrief(
+                goal: effectiveGoal, done: done, files: files, state: state, next: next,
                 workingDirectory: workingDirectory, sourceLogPath: sourceLogPath,
                 sessionID: sessionID, dropped: dropped
             )
@@ -136,54 +151,65 @@ extension HandoffBrief {
         func overBudget() -> Bool {
             Self.estimateTokens(current().renderedMarkdown()) > Self.budgetTokens
         }
+        func recordDoneDrop() {
+            let removed = originalDoneCount - done.count
+            guard removed > 0 else { return }
+            let note = "done: \(removed) of \(originalDoneCount) later entries dropped (length budget)"
+            if let existing = dropped.lastIndex(where: { $0.hasPrefix("done:") }) {
+                // A resumed trim updates the count in place — one note, never
+                // a stack of them.
+                dropped[existing] = note
+            } else {
+                dropped.append(note)
+            }
+        }
         guard overBudget() else { return current() }
 
-        if !state.isEmpty {
-            let count = state.count
-            state = []
-            dropped.append(
-                "state: \(count) closing turns dropped (length budget; lowest priority)"
-            )
-            if !overBudget() { return current() }
-        }
-
-        if !files.isEmpty {
-            let count = files.count
-            files = []
-            dropped.append(
-                "files: \(count) entries dropped (length budget; Done cites the same operations)"
-            )
-            if !overBudget() { return current() }
-        }
-
-        let doneCount = done.count
-        while !done.isEmpty && overBudget() {
-            done.removeLast()
-        }
-        let removed = doneCount - done.count
-        if removed > 0 {
-            dropped.append(
-                "done: \(removed) of \(doneCount) later entries dropped (length budget)"
-            )
-        }
-        if !overBudget() { return current() }
-
-        if let item = next {
-            next = nil
-            dropped.append("next: \"\(item.text)\" dropped (length budget)")
-            if !overBudget() { return current() }
-        }
-
-        // The goal is the one thing never dropped — a brief without the user's
-        // request is not a brief. It is clipped, and the clip says so.
-        if let item = goal {
-            var text = item.text
-            while overBudget() && text.count > 64 {
-                text = String(text.prefix(text.count / 2))
+        while overBudget() {
+            if !state.isEmpty {
+                let count = state.count
+                state = []
+                dropped.append(
+                    "state: \(count) closing turns dropped (length budget; lowest priority)"
+                )
+                continue
             }
-            text += "… [clipped to fit the handoff budget]"
-            goal = BriefItem(text: text, line: item.line)
-            dropped.append("goal: clipped to fit the length budget (its line is unchanged)")
+
+            if !files.isEmpty {
+                let count = files.count
+                files = []
+                dropped.append(
+                    "files: \(count) entries dropped (length budget; Done cites the same operations)"
+                )
+                continue
+            }
+
+            if !done.isEmpty {
+                done.removeLast()
+                recordDoneDrop()
+                continue
+            }
+
+            if let item = next {
+                next = nil
+                dropped.append("next: \"\(item.text)\" dropped (length budget)")
+                continue
+            }
+
+            // The goal is the one thing never dropped — a brief without the
+            // user's request is not a brief. It is clipped, and the clip says
+            // so, but only once the text has actually shrunk.
+            if let item = goal, item.text.count > 64 {
+                goal = BriefItem(text: String(item.text.prefix(item.text.count / 2)), line: item.line)
+                if !goalClipped {
+                    goalClipped = true
+                    dropped.append("goal: clipped to fit the length budget (its line is unchanged)")
+                }
+                continue
+            }
+
+            // Nothing left that can shrink — over budget is the honest answer.
+            break
         }
         return current()
     }

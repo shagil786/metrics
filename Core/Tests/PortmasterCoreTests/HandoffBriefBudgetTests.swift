@@ -66,4 +66,24 @@ final class HandoffBriefBudgetTests: XCTestCase {
     func testTheEstimatorIsTheDocumentedHeuristic() {
         XCTAssertEqual(HandoffBrief.estimateTokens(String(repeating: "a", count: 4000)), 1000)
     }
+
+    func testTheDropNotesCannotPushTheBriefBackOverItsOwnBudget() {
+        // 60 done items at pad 158 trim to 32 items (1487 tokens); the done
+        // note itself costs ~16 tokens, which used to cross the budget and
+        // fire the goal clip on a goal that never shrank.
+        let done = (1...60).map { BriefItem(text: pad("ran `cmd\($0)` ", size: 158), line: $0) }
+        let b = brief(done: done)
+        let budgeted = b.budgeted()
+        XCTAssertLessThanOrEqual(
+            HandoffBrief.estimateTokens(budgeted.renderedMarkdown()),
+            HandoffBrief.budgetTokens,
+            "a note about a drop may not cost more room than the drop freed"
+        )
+        XCTAssertNil(
+            budgeted.dropped.first { $0.hasPrefix("goal:") },
+            "a short goal that never shrank is never reported clipped"
+        )
+        XCTAssertEqual(budgeted.goal?.text, "do the thing", "the clip marker never claims a clip that did not happen")
+        XCTAssertNotNil(budgeted.dropped.first { $0.hasPrefix("done:") }, "the done trim is still named")
+    }
 }
