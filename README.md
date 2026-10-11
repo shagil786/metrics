@@ -132,7 +132,7 @@ Use the path exactly as `--show-bin-path` prints it — it is already absolute, 
 
 ### Tools
 
-Twelve read tools and five mutations. A read never changes anything; a mutation is default-deny until you choose a mode (below). `report_usage` is the one read that writes anything — a row in Portmaster's own database — and the reason it is classified that way is given below.
+Twelve read tools and six mutations. A read never changes anything; a mutation is default-deny until you choose a mode (below). `report_usage` is the one read that writes anything — a row in Portmaster's own database — and the reason it is classified that way is given below.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
