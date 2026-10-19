@@ -1,6 +1,6 @@
 # Agent Context Handoff — Execution Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** When a session's context pressure is visible, extract a citation-backed brief, link sessions into a once-only handoff chain with one honest thread total, and launch a receiving agent with the brief on stdin — behind the existing mutation gate, with a dry run before every launch and a kill switch in preferences.
 
@@ -88,7 +88,7 @@
   - `public enum HandoffBriefExtractor { public static func extract(from url: URL) throws -> HandoffBrief; public static func extract(from text: String, sourceLogPath: String) -> HandoffBrief }`
   - `line` is always the **1-based physical line number** in the source file (same convention as `ContextPressureExtractor`, blank lines counted).
 
-- [ ] **Step 1: Write the failing extractor tests**
+- [x] **Step 1: Write the failing extractor tests**
 
 ```swift
 // Core/Tests/PortmasterCoreTests/HandoffBriefExtractorTests.swift
@@ -224,12 +224,12 @@ final class HandoffBriefExtractorTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run (from `Core/`): `swift test --filter HandoffBriefExtractorTests`
 Expected: FAIL to compile — `HandoffBrief`, `HandoffBriefExtractor`, `BriefItem` do not exist.
 
-- [ ] **Step 3: Write the brief types and extractor**
+- [x] **Step 3: Write the brief types and extractor**
 
 ```swift
 // Core/Sources/PortmasterCore/History/HandoffBrief.swift
@@ -496,12 +496,12 @@ public enum HandoffBriefExtractor {
 
 Note: in `nextText`, the `file_path` branch is simply `return path` — drop the pointless `pending.id.isEmpty ? "" : ""` ternary shown above; it is a leftover of drafting and must not be written that way. The committed form is `return path`.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run (from `Core/`): `swift test --filter HandoffBriefExtractorTests`
 Expected: PASS (6 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/HandoffBrief.swift \
@@ -525,7 +525,7 @@ git commit -m "feat: the brief cites the line behind every claim"
   - `public static func estimateTokens(_ text: String) -> Int`
   - `public func budgeted() -> HandoffBrief` — copy with `dropped` filled, items removed, goal clipped, never silent.
 
-- [ ] **Step 1: Write the failing budget tests**
+- [x] **Step 1: Write the failing budget tests**
 
 ```swift
 // Core/Tests/PortmasterCoreTests/HandoffBriefBudgetTests.swift
@@ -599,12 +599,12 @@ final class HandoffBriefBudgetTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run (from `Core/`): `swift test --filter HandoffBriefBudgetTests`
 Expected: FAIL to compile — `budgeted()`, `budgetTokens`, `estimateTokens` do not exist.
 
-- [ ] **Step 3: Implement the budget**
+- [x] **Step 3: Implement the budget**
 
 Append to `HandoffBrief.swift`:
 
@@ -687,12 +687,12 @@ extension HandoffBrief {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run (from `Core/`): `swift test --filter HandoffBriefBudgetTests && swift test --filter HandoffBriefExtractorTests`
 Expected: PASS (5 budget + 6 extractor).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/HandoffBrief.swift \
@@ -718,7 +718,7 @@ git commit -m "feat: the brief names what the length budget dropped"
   - `public struct ChainShare { sessionID: UUID; label: String; usd: Decimal? }`
   - `public struct ChainReport { shares: [ChainShare]; totalUSD: Decimal?; var renderedLine: String }`
 
-- [ ] **Step 1: Write the failing tests** (append a `// MARK: - Handoff chain` section to `AgentSessionStoreTests.swift`)
+- [x] **Step 1: Write the failing tests** (append a `// MARK: - Handoff chain` section to `AgentSessionStoreTests.swift`)
 
 ```swift
     // MARK: - Handoff chain
@@ -859,12 +859,12 @@ git commit -m "feat: the brief names what the length budget dropped"
 
 Note on `Fmt.usd`: the `$0.003` strings above assume `Fmt.usd` renders sub-dollar decimals verbatim (`"$0.003"` — its documented behaviour for `amount < 1`). If the exact expected string differs once run, fix the **expected literal** to the formatter's true output in the same commit and note it in the ledger; do not change `Fmt`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run (from `Core/`): `swift test --filter AgentSessionStoreTests`
 Expected: FAIL to compile — `recordHandoff`, `handoffTargetPID`, `chain`, `ChainReport` do not exist.
 
-- [ ] **Step 3: Implement the store changes**
+- [x] **Step 3: Implement the store changes**
 
 On `AgentSession`, after `tokensLeftWorst`:
 
@@ -1134,12 +1134,12 @@ Extend the migration test `testAStoreWrittenBeforeTheFieldsExistedStillOpens` (l
         XCTAssertNil(session?.chain, "no observed link is not an observed chain")
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run (from `Core/`): `swift test --filter AgentSessionStoreTests`
 Expected: PASS (existing tests + 7 new; the migration test gains 5 assertions). If the `$0.003`-style money strings disagree with `Fmt.usd`, correct the expected literals only (ruling note in the ledger).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/AgentSessionStore.swift \
@@ -1161,7 +1161,7 @@ git commit -m "feat: a session remembers where its work was handed to"
 - Consumes: `AgentSessionSnapshot.chain`, `ChainReport.renderedLine` (Task 3).
 - Produces: wire fields `handedOffFrom`/`handedOffTo` (UUID strings, omitted when nil); `SessionLine` renders `chain.renderedLine` as a second line **only** on the head row.
 
-- [ ] **Step 1: Write the failing wire test** (append to `AgentSessionToolTests.swift`)
+- [x] **Step 1: Write the failing wire test** (append to `AgentSessionToolTests.swift`)
 
 ```swift
     // MARK: - Chain edges
@@ -1196,12 +1196,12 @@ git commit -m "feat: a session remembers where its work was handed to"
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run (from `Core/`): `swift test --filter AgentSessionToolTests`
 Expected: FAIL — payload has no `handedOffTo` key (assertion 1 fails or key missing).
 
-- [ ] **Step 3: Implement the wire fields and the card line**
+- [x] **Step 3: Implement the wire fields and the card line**
 
 In `WirePayloads.swift`, `AgentSessionPayload` — after `tokensLeftWorst`:
 
@@ -1258,7 +1258,7 @@ private struct SessionLine: View {
 
 (The `usage`/`cost` private computed properties below `body` are untouched.)
 
-- [ ] **Step 4: Write the failing source-scan test**
+- [x] **Step 4: Write the failing source-scan test**
 
 ```swift
 // Core/Tests/PortmasterCoreTests/AppHandoffWiringTests.swift
@@ -1347,17 +1347,17 @@ final class AppHandoffWiringTests: XCTestCase {
 
 The sketch above is not shippable — line comments must be consumed to end of line. Write the real helper by copying `withoutComments` **verbatim** from `Core/Tests/PortmasterCoreTests/AppAgentSourceWiringTests.swift` (it already handles `//`, `/* */`, and string literals, and its proven behaviour is the point: two different copies of this helper must behave identically or the two scan suites disagree about what "in the source" means).
 
-- [ ] **Step 5: Run both tests to verify they pass**
+- [x] **Step 5: Run both tests to verify they pass**
 
 Run (from `Core/`): `swift test --filter AgentSessionToolTests && swift test --filter AppHandoffWiringTests`
 Expected: PASS.
 
-- [ ] **Step 6: Compile the app (the card change lives in App/)**
+- [x] **Step 6: Compile the app (the card change lives in App/)**
 
 Run: `xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build`
 Expected: **BUILD SUCCEEDED**, zero new warnings (six pre-existing warnings in untouched files are fine).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Core/Sources/PortmasterMCP/WirePayloads.swift \
@@ -1385,7 +1385,7 @@ git commit -m "feat: the wire and the sessions card say where the work went"
   - `public protocol HandoffLaunching: Sendable { func resolve(_ executable: String, path: String?) -> String?; func launch(executable: String, arguments: [String], workingDirectory: String, stdinText: String) throws -> Int32; func terminate(pid: Int32) }`
   - `public struct SystemHandoffLauncher: HandoffLaunching`
 
-- [ ] **Step 1: Write the failing target-config tests**
+- [x] **Step 1: Write the failing target-config tests**
 
 ```swift
 // Core/Tests/PortmasterMCPTests/HandoffTargetsTests.swift
@@ -1438,12 +1438,12 @@ final class HandoffTargetsTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `Core/`): `swift test --filter HandoffTargetsTests`
 Expected: FAIL to compile — `HandoffTargets` does not exist.
 
-- [ ] **Step 3: Implement target configuration**
+- [x] **Step 3: Implement target configuration**
 
 ```swift
 // Core/Sources/PortmasterMCP/HandoffTargets.swift
@@ -1488,7 +1488,7 @@ public enum HandoffTargets {
 }
 ```
 
-- [ ] **Step 4: Write the failing launcher tests**
+- [x] **Step 4: Write the failing launcher tests**
 
 ```swift
 // Core/Tests/PortmasterMCPTests/HandoffLauncherTests.swift
@@ -1562,12 +1562,12 @@ final class HandoffLauncherTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 5: Run to verify failure**
+- [x] **Step 5: Run to verify failure**
 
 Run (from `Core/`): `swift test --filter HandoffLauncherTests`
 Expected: FAIL to compile — `SystemHandoffLauncher` does not exist.
 
-- [ ] **Step 6: Implement the launcher**
+- [x] **Step 6: Implement the launcher**
 
 ```swift
 // Core/Sources/PortmasterMCP/HandoffLauncher.swift
@@ -1659,12 +1659,12 @@ public struct SystemHandoffLauncher: HandoffLaunching {
 }
 ```
 
-- [ ] **Step 7: Run both suites to verify they pass**
+- [x] **Step 7: Run both suites to verify they pass**
 
 Run (from `Core/`): `swift test --filter HandoffTargetsTests && swift test --filter HandoffLauncherTests`
 Expected: PASS (3 + 4 tests).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add Core/Sources/PortmasterMCP/HandoffTargets.swift \
@@ -1702,7 +1702,7 @@ git commit -m "feat: an agent is launched by configuration, with the brief on st
   - DataProvider: `func handoffContext(sessionID: UUID, target: String) async throws -> HandoffOutcome`
   - Catalog tool `handoff_context` (mutation; args `session_id`, `target`, both required)
 
-- [ ] **Step 1: Write the failing kill-switch tests**
+- [x] **Step 1: Write the failing kill-switch tests**
 
 ```swift
 // Core/Tests/PortmasterCoreTests/AppPreferencesHandoffTests.swift
@@ -1748,12 +1748,12 @@ final class AppPreferencesHandoffTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `Core/`): `swift test --filter AppPreferencesHandoffTests`
 Expected: FAIL to compile — `contextHandoffsEnabled` does not exist.
 
-- [ ] **Step 3: Implement the kill-switch preference**
+- [x] **Step 3: Implement the kill-switch preference**
 
 In `Core/Sources/PortmasterCore/Models/Preferences.swift` (`AppPreferences`):
 - Add field after `showInDock`:
@@ -1776,7 +1776,7 @@ In `Core/Sources/PortmasterCore/Models/Preferences.swift` (`AppPreferences`):
 
 Re-run: `swift test --filter AppPreferencesHandoffTests` → PASS (3).
 
-- [ ] **Step 4: Write the failing coordinator tests**
+- [x] **Step 4: Write the failing coordinator tests**
 
 ```swift
 // Core/Tests/PortmasterMCPTests/HandoffCoordinatorTests.swift
@@ -2032,12 +2032,12 @@ final class HandoffCoordinatorTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 5: Run to verify failure**
+- [x] **Step 5: Run to verify failure**
 
 Run (from `Core/`): `swift test --filter HandoffCoordinatorTests`
 Expected: FAIL to compile — `HandoffCoordinator` does not exist.
 
-- [ ] **Step 6: Implement the overlap constant and the coordinator**
+- [x] **Step 6: Implement the overlap constant and the coordinator**
 
 `AgentLogMatcher.swift` (top of the enum):
 
@@ -2265,11 +2265,11 @@ public struct HandoffCoordinator: Sendable {
 }
 ```
 
-- [ ] **Step 7: Verify the coordinator suite passes**
+- [x] **Step 7: Verify the coordinator suite passes**
 
 The coordinator suite must now pass — it was red at Step 5, when none of these types existed. Run (from `Core/`): `swift test --filter HandoffCoordinatorTests && swift test --filter AgentSourcePollerTests && swift test --filter AgentLogMatcherTests` — expected: PASS. The poller's default moved to the shared constant with the same value (`60 * 60`), so its behaviour is unchanged; the matcher and poller tests pin that.
 
-- [ ] **Step 8: Write the failing wiring tests**
+- [x] **Step 8: Write the failing wiring tests**
 
 The coordinator exists but no client can reach it: not in the catalog, not in dispatch, not on the provider seam, not in the approval window. These tests pin every edge.
 
@@ -2542,7 +2542,7 @@ plus, in the same file:
     }
 ```
 
-- [ ] **Step 9: Run to verify failure**
+- [x] **Step 9: Run to verify failure**
 
 From `Core/`:
 
@@ -2558,7 +2558,7 @@ swift test --filter OnDemandProviderTests          # does not compile: handoffCo
 
 The two compile failures are the red for the two seams that do not exist yet; every other suite fails on its assertions at runtime. Expected: failures everywhere, and the failures name this task.
 
-- [ ] **Step 10: Implement the wiring**
+- [x] **Step 10: Implement the wiring**
 
 `Core/Sources/PortmasterMCP/DataProvider.swift` — the requirement, after `setPreference`:
 
@@ -2802,7 +2802,7 @@ Edit the existing false line to read:
 check 'tools/list over the socket returns 18 tools' "$tool_count" '18'
 ```
 
-- [ ] **Step 11: Run everything to pass**
+- [x] **Step 11: Run everything to pass**
 
 From `Core/`:
 
@@ -2820,7 +2820,7 @@ xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug
 
 Expected: `BUILD SUCCEEDED`, no new warnings (the six pre-existing ones in untouched files stay).
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add Core/Sources/PortmasterMCP/ToolExecutor.swift \
@@ -2869,7 +2869,7 @@ No visual claims are made or permitted (Global Constraints): this task's proof i
   - `PressureActionsSheet` (SwiftUI, in `OverviewView.swift`)
   - audit lines carrying `"origin": "app"`
 
-- [ ] **Step 1: Write the failing source-scan tests**
+- [x] **Step 1: Write the failing source-scan tests**
 
 Append to `Core/Tests/PortmasterCoreTests/AppHandoffWiringTests.swift` (the file Task 4 created; its `source(_:)` helper reads any repository-relative file with comments stripped, and its "the file must be found or the test fails" rule applies to every path here):
 
@@ -2957,11 +2957,11 @@ Append to `Core/Tests/PortmasterCoreTests/AppHandoffWiringTests.swift` (the file
     }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 From `Core/`: `swift test --filter AppHandoffWiringTests` — expected: the three new tests fail naming the needles that are not yet in the sources (the Task 4 tests in the same file stay green).
 
-- [ ] **Step 3: The coordinator factory and the app's audit line**
+- [x] **Step 3: The coordinator factory and the app's audit line**
 
 `Core/Sources/PortmasterMCP/HandoffCoordinator.swift` — two statics inside `struct HandoffCoordinator`, at the end after `isDirectory(_:)`:
 
@@ -3005,7 +3005,7 @@ From `Core/`: `swift test --filter AppHandoffWiringTests` — expected: the thre
     }
 ```
 
-- [ ] **Step 4: `AppModel.performHandoff`**
+- [x] **Step 4: `AppModel.performHandoff`**
 
 `App/AppModel.swift` — add the import at the top (beside `import PortmasterCore`):
 
@@ -3035,7 +3035,7 @@ and the method beside `refreshAgentSessions`:
     }
 ```
 
-- [ ] **Step 5: The strip's button and the sheet**
+- [x] **Step 5: The strip's button and the sheet**
 
 `App/OverviewView.swift` — add the imports after `import PortmasterCore`:
 
@@ -3154,7 +3154,7 @@ struct PressureActionsSheet: View {
 
 (The strip's original two visual lines — gauge icon, tokens-left text, spacer, padding, background, accessibility label — are unchanged above; only the button and the sheet are new.)
 
-- [ ] **Step 6: The socket path's seam**
+- [x] **Step 6: The socket path's seam**
 
 `App/MCPHostController.swift` — `makeProvider()` (line 353) builds `LiveDataProvider(...)` whose last argument is `sessionReading:` (line 372). Close that argument with a comma and add the seam as the new last argument, so the call ends:
 
@@ -3184,7 +3184,7 @@ struct PressureActionsSheet: View {
 
 (The `try await MainActor.run { try … }` shape is the one `App/LiveAppView.swift:173` already proves compiles in this target; `MCPToolError` and `HandoffCoordinator` are visible because the file already imports `PortmasterMCP`.)
 
-- [ ] **Step 7: The kill-switch toggle**
+- [x] **Step 7: The kill-switch toggle**
 
 `App/SettingsView.swift` — in the General tab's `VStack`, immediately after the preview-data toggle's caption `Text`, add:
 
@@ -3203,11 +3203,11 @@ struct PressureActionsSheet: View {
 
 (`model.prefs` saves itself: `@Published var prefs` has `didSet { prefs.save() }`, the same mechanism the surrounding toggles rely on.)
 
-- [ ] **Step 8: Run the scans to pass**
+- [x] **Step 8: Run the scans to pass**
 
 From `Core/`: `swift test --filter AppHandoffWiringTests` — expected: PASS (all three new needles found; the two Task 4 tests unchanged).
 
-- [ ] **Step 9: Full verification**
+- [x] **Step 9: Full verification**
 
 From `Core/`:
 
@@ -3239,7 +3239,7 @@ Expected: every check passes; the summary reads `17 passed, 0 failed, 1 skipped`
 
 Evidence to capture in the task report: the three command outputs above, verbatim (never a claim from reading source alone).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add App/OverviewView.swift \
@@ -3257,11 +3257,11 @@ Do not add `Core/Package.resolved` if a build dirtied it.
 
 ## Completion checklist (against the spec, sections 2–6)
 
-- [ ] **Brief (§2, rulings 6–8):** Goal/Done/Files/State/Next from the log with physical-line citations; budget ≤ `HandoffBrief.budgetTokens` (1500) with `## Dropped` naming every drop; clipping never silent.
-- [ ] **Chain (§4, rulings 1–5):** one handoff per session, linked by observed PID under the store's lock, `ChainReport` with a total only when every member is priced, one chain line on the head row.
-- [ ] **Execution (§5, rulings 10–15):** `handoff_context` behind the existing gate; audit lines carry `brief=… lines=…` (MCP) or the same note with `origin: app` (UI); approval window describes it in its own kind; kill switch refuses both paths in one place; dry run before launch, spawn-then-record, termination on refusal.
-- [ ] **Launching (§6, ruling 9):** brief on stdin, cwd from the session record, target from `~/.portmaster/handoff-targets.json` or the built-in defaults, not-installed and empty-brief refusals offer the reason.
-- [ ] **Affordance (§"the affordance", rulings 16):** strip → sheet offers `/compact` (copy) and hand-off; mode and kill switch disable with the reason shown, never silently.
-- [ ] **Gates:** `swift test` zero failures; `xcodebuild` BUILD SUCCEEDED with no new warnings; `scripts/mcp-e2e.sh --no-manual` → `17 passed, 0 failed, 1 skipped`, `mcp-e2e: OK`, tools/list = 18.
+- [x] **Brief (§2, rulings 6–8):** Goal/Done/Files/State/Next from the log with physical-line citations; budget ≤ `HandoffBrief.budgetTokens` (1500) with `## Dropped` naming every drop; clipping never silent.
+- [x] **Chain (§4, rulings 1–5):** one handoff per session, linked by observed PID under the store's lock, `ChainReport` with a total only when every member is priced, one chain line on the head row.
+- [x] **Execution (§5, rulings 10–15):** `handoff_context` behind the existing gate; audit lines carry `brief=… lines=…` (MCP) or the same note with `origin: app` (UI); approval window describes it in its own kind; kill switch refuses both paths in one place; dry run before launch, spawn-then-record, termination on refusal.
+- [x] **Launching (§6, ruling 9):** brief on stdin, cwd from the session record, target from `~/.portmaster/handoff-targets.json` or the built-in defaults, not-installed and empty-brief refusals offer the reason.
+- [x] **Affordance (§"the affordance", rulings 16):** strip → sheet offers `/compact` (copy) and hand-off; mode and kill switch disable with the reason shown, never silently.
+- [x] **Gates:** `swift test` zero failures; `xcodebuild` BUILD SUCCEEDED with no new warnings; `scripts/mcp-e2e.sh --no-manual` → `17 passed, 0 failed, 1 skipped`, `mcp-e2e: OK`, tools/list = 18.
 
 Anything that forced a decision not in the 18 rulings is recorded in the SDD ledger as a `Ruling:` line before it is implemented.
