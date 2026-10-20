@@ -48,7 +48,7 @@
 - Consumes: nothing.
 - Produces: `TokenProvenance`, `UsageUnavailableReason`, `TokenUsage`, `SessionCost`, and the `TokenUsageRecord` struct, all `public`, all `Sendable`. Later tasks use `TokenUsage` and `TokenUsageRecord` verbatim.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `Core/Tests/PortmasterCoreTests/AgentUsageTests.swift`:
 
@@ -191,12 +191,12 @@ final class AgentUsageTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter AgentUsageTests`
 Expected: FAIL — `cannot find 'TokenUsage' in scope`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `Core/Sources/PortmasterCore/History/AgentUsage.swift`:
 
@@ -347,12 +347,12 @@ public enum SessionCost: Hashable, Sendable {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd Core && swift test --filter AgentUsageTests`
 Expected: PASS — 8 tests, 0 failures
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Tests/PortmasterCoreTests/AgentUsageTests.swift
@@ -380,7 +380,7 @@ will not reconcile with a provider invoice."
 - Consumes: `TokenUsage`, `TokenUsageRecord`, `TokenProvenance`, `SessionCost` from Task 1.
 - Produces: `public final class AgentSessionStore` with `init(storeURL: URL?) throws`, `recordSession(...)`, `recordUsage(...)`, `sessions()`, `usage(for:)`. Later tasks call these exact signatures.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift`:
 
@@ -580,7 +580,7 @@ final class AgentSessionStoreTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter AgentSessionStoreTests`
 Expected: FAIL — `cannot find 'AgentSessionStore' in scope`
@@ -595,7 +595,7 @@ unit) or as a decimal `String`, and convert at the read boundary. Then adjust th
 cost test to compare against the converted value. Do not proceed to Step 3 until
 this compiles.
 
-- [ ] **Step 3: Write the models and store**
+- [x] **Step 3: Write the models and store**
 
 Create `Core/Sources/PortmasterCore/History/AgentSessionStore.swift`:
 
@@ -920,7 +920,7 @@ The comment above it should note that the list is explicit and a model absent fr
             // failing. Adding a model means adding it here too.
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter AgentSessionStoreTests`
 Expected: PASS — 9 tests, 0 failures
@@ -930,7 +930,7 @@ Then run the whole suite:
 Run: `cd Core && swift test`
 Expected: 232 tests, 0 failures, 1 skipped (223 baseline + 9 new)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/AgentSessionStore.swift Core/Sources/PortmasterCore/History/HistoryStore.swift Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift
@@ -962,7 +962,7 @@ round-trip test exists."
 - Consumes: `TokenUsageRecord`, `TokenProvenance` from Task 1.
 - Produces: `protocol TokenSourceAdapter` with `RawAgentUsage` and `TokenSourceError`. Task 4's fixture uses it; real adapters land in phase C.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `Core/Tests/PortmasterCoreTests/TokenSourceAdapterTests.swift`:
 
@@ -1110,12 +1110,12 @@ final class TokenSourceAdapterTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter TokenSourceAdapterTests`
 Expected: FAIL — `cannot find 'TokenSourceAdapter' in scope`
 
-- [ ] **Step 3: Write the protocol and runner**
+- [x] **Step 3: Write the protocol and runner**
 
 Create `Core/Sources/PortmasterCore/History/TokenSourceAdapter.swift`:
 
@@ -1233,12 +1233,12 @@ public struct TokenSourceRunner: Sendable {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter TokenSourceAdapterTests`
 Expected: PASS — 8 tests, 0 failures
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/TokenSourceAdapter.swift Core/Tests/PortmasterCoreTests/TokenSourceAdapterTests.swift
@@ -1268,7 +1268,7 @@ No real adapter ships here. The fixture in the tests is a fixture."
 - Consumes: `AgentSessionStore`, `TokenUsageRecord`, `TokenProvenance` from Tasks 1–2.
 - Produces: `public protocol SessionRecording: Sendable` with `func record(sessionID:UUID?, clientName:String?, clientVersion:String?, input:Int, output:Int, cacheRead:Int?, reasoning:Int?, modelID:String) throws -> String`. `ToolExecutor.init` gains `sessionRecorder: (any SessionRecording)? = nil`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `Core/Tests/PortmasterMCPTests/AgentUsageToolTests.swift` — this must live beside `ToolExecutorReadTests.swift`, because `StubProvider` is defined in `PortmasterMCPTests` and a `PortmasterCoreTests` file cannot see it.
 
@@ -1400,12 +1400,12 @@ final class AgentUsageToolTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter AgentUsageToolTests`
 Expected: FAIL — `cannot find 'SessionRecording' in scope`
 
-- [ ] **Step 3: Write the recorder protocol**
+- [x] **Step 3: Write the recorder protocol**
 
 Create `Core/Sources/PortmasterMCP/SessionRecorder.swift`:
 
@@ -1487,7 +1487,7 @@ public struct UnavailableSessionRecorder: SessionRecording {
 }
 ```
 
-- [ ] **Step 4: Add the tool to the catalog and dispatch**
+- [x] **Step 4: Add the tool to the catalog and dispatch**
 
 In `Core/Sources/PortmasterMCP/ToolExecutor.swift`, add to `ToolExecutor.catalog` after the last read tool:
 
@@ -1600,12 +1600,12 @@ struct AgentUsageRecordedPayload: Encodable {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter AgentUsageToolTests`
 Expected: PASS — 8 tests, 0 failures
 
-- [ ] **Step 6: Run the whole suite**
+- [x] **Step 6: Run the whole suite**
 
 Run: `cd Core && swift test`
 Expected: 240 tests, 0 failures, 1 skipped
@@ -1613,7 +1613,7 @@ Expected: 240 tests, 0 failures, 1 skipped
 The four catalog-count assertions now expect 14. If they still say 13, Step 4's edit
 did not land.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Core/Sources/PortmasterMCP/SessionRecorder.swift Core/Sources/PortmasterMCP/ToolExecutor.swift Core/Tests/PortmasterMCPTests/AgentUsageToolTests.swift
@@ -1645,7 +1645,7 @@ it cannot report."
 - Consumes: everything above.
 - Produces: nothing consumed by later tasks. This is the last task.
 
-- [ ] **Step 1: Add the failing assertion**
+- [x] **Step 1: Add the failing assertion**
 
 Append to `AgentUsageToolTests`:
 
@@ -1660,12 +1660,12 @@ Append to `AgentUsageToolTests`:
     }
 ```
 
-- [ ] **Step 2: Run the test**
+- [x] **Step 2: Run the test**
 
 Run: `cd Core && swift test --filter AgentUsageToolTests`
 Expected: PASS
 
-- [ ] **Step 3: Document the tool in the README**
+- [x] **Step 3: Document the tool in the README**
 
 In the MCP tool table in `README.md`, add a row for `report_usage` describing it as a declaration rather than a mutation, and note the two token sources.
 
@@ -1699,12 +1699,12 @@ No log adapters ship yet: the protocol and its outcome mapping exist, and the on
 implementation is a test fixture. Nothing here has been run against a real agent.
 ```
 
-- [ ] **Step 4: Update the e2e tool count**
+- [x] **Step 4: Update the e2e tool count**
 
 In `scripts/mcp-e2e.sh`, change the `tools/list` count check from 13 to 14, and its
 `note`/message text to match.
 
-- [ ] **Step 5: Run the full suite and both builds**
+- [x] **Step 5: Run the full suite and both builds**
 
 Run: `cd Core && swift test`
 Expected: 241 tests, 0 failures, 1 skipped
@@ -1715,7 +1715,7 @@ Expected: BUILD SUCCEEDED
 Run: `scripts/mcp-e2e.sh --no-manual <Debug app> <portmaster-mcp>`
 Expected: `17 passed, 0 failed, 1 skipped`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add README.md scripts/mcp-e2e.sh Core/Tests/PortmasterMCPTests/AgentUsageToolTests.swift

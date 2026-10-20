@@ -48,7 +48,7 @@ Conditions the spec implies that a reader's happy-path tests will not catch; eac
   - `struct MCPSettings: Sendable { var mode: MCPMutationMode; static let defaultMode: MCPMutationMode = .off; static func fileURL(directory: URL?) -> URL; static func load(directory: URL? = nil) -> MCPSettings; func save(directory: URL? = nil) throws }` — JSON file at `~/.portmaster/mcp-settings.json`; `directory` parameter exists for test injection; corrupt/missing file loads as defaults.
   - `struct AuditLog: Sendable { init(directory: URL? = nil); func record(tool: String, arguments: [String: String], outcome: String, reason: String?) }` — appends one JSON line `{ts, tool, arguments, outcome, reason, pid}` to `~/.portmaster/mcp-audit.log`, file mode `0600`, directory created `0700`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Test file `Core/Tests/PortmasterMCPTests/MCPSettingsAuditTests.swift` (XCTest, inject a temp directory per test):
 
@@ -61,12 +61,12 @@ func testAuditLogRecordsDenialReason()                 // record(outcome: "denie
 func testAuditLogFileIsOwnerOnly()                     // after record, file permissions == 0o600
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter MCPSettingsAuditTests`
 Expected: FAIL — target `PortmasterMCPTests` does not exist (or module missing).
 
-- [ ] **Step 3: Scaffold the package**
+- [x] **Step 3: Scaffold the package**
 
 Edit `Core/Package.swift`: add dependency
 `.package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "<latest release tag>")`
@@ -83,16 +83,16 @@ Edit `Core/Package.swift`: add dependency
 
 Add the `MCP` product also to nothing else. Create empty `Sources/PortmasterMCP/.keep`-style placeholder plus a minimal `Sources/portmaster-mcp/main.swift` containing `print("")` (replaced in Task 7) so all targets compile.
 
-- [ ] **Step 4: Implement `MCPSettings` and `AuditLog`**
+- [x] **Step 4: Implement `MCPSettings` and `AuditLog`**
 
 Per the Produces block; use `FileManager` for directory creation with `0700` and `chmod(0o600)` on the log file. JSON via `JSONEncoder`/`JSONDecoder`.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter MCPSettingsAuditTests`
 Expected: PASS (6 tests).
 
-- [ ] **Step 6: Full regression check**
+- [x] **Step 6: Full regression check**
 
 Run: `cd Core && swift test`
 Expected: PASS — all pre-existing suites still green.
@@ -119,7 +119,7 @@ Exact decision table (slice-1 semantics, per spec):
 | `confirmEach` | allow | deny `"Portmaster must be open to approve this action."` (slice 1 has no `MCPHost`; Task 8 documents this) |
 | `allowSession` | allow | `appRunning == true` → allow; else deny `"Session grants apply only while Portmaster is running."` |
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `PermissionGateTests.swift`:
 
@@ -131,14 +131,14 @@ func testAllowSessionAllowsWhenAppRunning()
 func testAllowSessionDeniesWhenAppClosed()             // reason == "Session grants apply only while Portmaster is running."
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter PermissionGateTests`
 Expected: FAIL — `PermissionGate` not found.
 
-- [ ] **Step 3: Implement the decision table** in `PermissionGate.swift` (a `switch` over `settings.mode`; reads return `.allow` before the switch).
+- [x] **Step 3: Implement the decision table** in `PermissionGate.swift` (a `switch` over `settings.mode`; reads return `.allow` before the switch).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd Core && swift test --filter PermissionGateTests`
 Expected: PASS (5 tests).
@@ -188,7 +188,7 @@ func setPreference(key: String, value: String) throws
 
 This task implements only: `get_system_overview`, `get_top_apps`, `get_app_detail`. Catalog declares all 13 tools (9 read + 4 mutation) with descriptions now; unimplemented names return `"Tool not implemented yet"` error until Tasks 4–5.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `ToolExecutorReadTests.swift` with a `StubProvider` (stored canned values, call counters, per-method thrown error):
 
@@ -203,16 +203,16 @@ func testPermissionDeniedDoesNotCallProvider()         // gate mode .off; execut
 func testSuccessfulMutationWritesAuditEntry()          // mode .allowSession + appRunning; quit_app → audit file gains outcome "allowed"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter ToolExecutorReadTests`
 Expected: FAIL — module/types missing.
 
-- [ ] **Step 3: Implement `DataProvider.swift` and `ToolExecutor.swift`**
+- [x] **Step 3: Implement `DataProvider.swift` and `ToolExecutor.swift`**
 
 `execute` flow: look up catalog → validate required args → if mutation (name in mutation set `["quit_app","stop_container","stop_project","set_preference"]`) run `gate.decide(isMutation: true)`, audit the decision, and on `.deny` return `isError` without touching the provider → dispatch to the provider method → encode result. `get_top_apps` metric mapping: `cpu → totalCPU`, `memory → totalMemory` (both non-optional), `network → totalNetInBytesPerSec`, `disk → totalDiskWriteBytesPerSec` (nil-safe: nil sorts last).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter ToolExecutorReadTests`
 Expected: PASS (9 tests).
@@ -237,7 +237,7 @@ Dispatch semantics (pin exactly):
 - `get_active_alerts` → `activeAlerts()`; output array + `source` field supplied by provider payload (live vs history-approximate — see Task 6).
 - `get_settings` → `settingsSnapshot()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```swift
 func testContainersDaemonDownIsDataNotError()          // stub DockerSample(availability: .daemonDown, containers: []) → isError false, text contains "daemonDown"
@@ -250,14 +250,14 @@ func testGetActiveAlertsReturnsAlertJSON()
 func testGetSettingsReturnsSnapshotJSON()              // has "mutationMode" key
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter ToolExecutorReadMoreTests`
 Expected: FAIL — tools return `"Tool not implemented yet"`.
 
-- [ ] **Step 3: Implement the six dispatch cases** per the semantics above.
+- [x] **Step 3: Implement the six dispatch cases** per the semantics above.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter ToolExecutorReadMoreTests`
 Expected: PASS (8 tests).
@@ -281,7 +281,7 @@ Dispatch semantics:
 - `set_preference` → `key` + `value` required; key ∉ allowlist → `MCPToolError("Preference '<key>' cannot be changed via MCP. Allowed: <sorted list>.")`; else `provider.setPreference(key:value:)` (invalid enum value errors surface from the provider).
 - Every mutation attempt: `audit.record(...)` with outcome `"allowed"` or `"denied"` + gate reason, **before** dispatch (deny) or after provider result (allowed/failed — outcome `"allowed"` with provider errors reported as tool error text, since the gate allowed the attempt).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```swift
 func testQuitAppPassesForceFlagToProvider()            // allowSession+appRunning, force "true" → stub received force == true; outcome isError false
@@ -295,14 +295,14 @@ func testProviderFailureBecomesToolError()             // stub throws StopError�
 
 Note on `testSetPreferenceMcpModeWritesSettingsFile`: to keep this testable, `ToolExecutor` gets an extra init parameter `settingsDirectory: URL? = nil` threaded into the `mcpMode` write path (defaults to production location).
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter ToolExecutorMutationTests`
 Expected: FAIL on the `set_preference` tests (they return `"Tool not implemented yet"`); the `quit_app`/`stop_container`/audit tests pass immediately (they cover Task 3's dispatch — regression value).
 
-- [ ] **Step 3: Implement mutation dispatch + allowlist** per semantics.
+- [x] **Step 3: Implement mutation dispatch + allowlist** per semantics.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter ToolExecutorMutationTests`
 Expected: PASS (7 tests).
@@ -344,7 +344,7 @@ Method semantics:
 - `setPreference` → if `appRunning()` throw `MCPToolError("Portmaster is running; close it before changing preferences via MCP (live writes arrive with the MCP host).")` (**Review Focus #2** lives here): otherwise read the app-domain blob (`UserDefaults(suiteName: prefsDomain)?.data(forKey: AppPreferences.defaultsKey)`), decode `AppPreferences`, mutate only the allowlisted field, re-encode, write back — sibling fields preserved by construction; `mcpMode` short-circuits to `MCPSettings.save` instead.
   - Value validation: enum fields accept only their `enum` raw values (e.g. `temperatureUnit`: `celsius|fahrenheit`), `compact`: `true|false` — else `MCPToolError("Invalid value '<v>' for '<key>'.")`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Use a stub `SnapshotSource` returning canned `ObservationSnapshot`s and a temp history store seeded via `HistoryStore` fixtures; inject temp dirs for settings/preferences (preferences: inject `UserDefaults(suiteName:)` alternative — add `preferencesDefaults: UserDefaults` init parameter instead of only a domain string; default to `UserDefaults(suiteName: "dev.portmaster.app") ?? .standard`).
 
@@ -363,19 +363,19 @@ func testQuitAppStopsStubbedPids()                     // use a process-controll
 
 Note: make `OnDemandProvider` take injectable `processController` and `preferencesDefaults` seams in its init so no test signals a real process or touches real preferences.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd Core && swift test --filter OnDemandProviderTests`
 Expected: FAIL — type missing.
 
-- [ ] **Step 3: Implement `OnDemandProvider` + `AppLiveness` + `SnapshotSource`** per the Produces block.
+- [x] **Step 3: Implement `OnDemandProvider` + `AppLiveness` + `SnapshotSource`** per the Produces block.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd Core && swift test --filter OnDemandProviderTests`
 Expected: PASS (10 tests).
 
-- [ ] **Step 5: Full regression**
+- [x] **Step 5: Full regression**
 
 Run: `cd Core && swift test`
 Expected: all green.
@@ -392,7 +392,7 @@ Expected: all green.
 - Consumes: `ToolExecutor` (+ `catalog`), `OnDemandProvider`, `PermissionGate`, `AuditLog` (Tasks 1–6); MCP SDK (`import MCP`) — verify exact API names against the pinned SDK docs (`swift build` errors are the source of truth; the SDK provides `Server`, a stdio transport, and list/call tool handlers).
 - Produces: executable product `portmaster-mcp` that speaks MCP over stdin/stdout: `initialize` handshake, `tools/list` from `ToolExecutor.catalog` (names, descriptions, JSON-schema-ish argument hints), `tools/call` → `executor.execute(name:arguments:)` with `arguments` coerced to `[String: String]` (non-string JSON values stringified; missing → `[:]`).
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 `CLIIntegrationTests.swift` — locate the binary once per run via `Process` on `swift build --show-bin-path` (build the product first with `swift build --product portmaster-mcp` in `setUp` if the binary is absent):
 
@@ -410,21 +410,21 @@ func testUnknownToolCallReturnsToolError()             // tools/call name "nope"
 
 Skip (not fail) with `XCTSkip` if `swift build` of the product fails for toolchain reasons unrelated to the test, but never skip on assertion failures.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd Core && swift test --filter CLIIntegrationTests`
 Expected: FAIL — binary is a stub (`print("")`), no MCP responses.
 
-- [ ] **Step 3: Implement `main.swift`**
+- [x] **Step 3: Implement `main.swift`**
 
 Build `ToolExecutor(provider: OnDemandProvider(), gate: PermissionGate(settings: .load(), appRunning: AppLiveness.isPortmasterRunning()), audit: AuditLog())`; register catalog + dispatch on an MCP `Server` over stdio; run until EOF. Keep `main.swift` thin — any logic beyond wiring belongs in a `CLI` helper in the library (testable).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd Core && swift test --filter CLIIntegrationTests`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Full regression**
+- [x] **Step 5: Full regression**
 
 Run: `cd Core && swift test`
 Expected: all green.
@@ -440,11 +440,11 @@ Expected: all green.
 - Consumes: everything above.
 - Produces: documentation only.
 
-- [ ] **Step 1: Write the README section**
+- [x] **Step 1: Write the README section**
 
 Cover: what it is (1 paragraph); build (`cd Core && swift build -c release --product portmaster-mcp`); register with Claude Code (`claude mcp add portmaster -- ~/.portmaster/bin/portmaster-mcp` — use `swift build --show-bin-path -c release` for the real path); tool list table (13 tools, one line each); mutation modes + how to flip `mcpMode` (`~/.portmaster/mcp-settings.json`, default `off`); audit log location (`~/.portmaster/mcp-audit.log`); slice-1 limitations (`confirmEach` always asks for a running Portmaster window that cannot approve yet — use `allowSession` with the app open; preference writes require the app closed; alerts are history-approximate; live provider/MCP host coming in slice 2).
 
-- [ ] **Step 2: Manual end-to-end read**
+- [x] **Step 2: Manual end-to-end read**
 
 Run:
 ```bash
@@ -457,17 +457,17 @@ printf '%s\n' \
 ```
 Expected: JSON-RPC replies; the `tools/call` result contains a real CPU/memory payload or the honest "still starting" error — never fabricated zeros.
 
-- [ ] **Step 3: Manual mutation gate check**
+- [x] **Step 3: Manual mutation gate check**
 
 Run the same pipeline with `tools/call` `quit_app` while `mcp-settings.json` is default (`off`).
 Expected: `isError` true, text `"MCP mutations are disabled in Portmaster settings."`; `~/.portmaster/mcp-audit.log` gained a `denied` line.
 
-- [ ] **Step 4: App regression build**
+- [x] **Step 4: App regression build**
 
 Run: `xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build`
 Expected: BUILD SUCCEEDED (package change didn't break the app target).
 
-- [ ] **Step 5: Full test suite + cleanup**
+- [x] **Step 5: Full test suite + cleanup**
 
 Run: `cd Core && swift test`
 Expected: all suites green. Confirm no debug prints left in `main.swift`; confirm `git status` (if a repo now exists) shows only intended files.
