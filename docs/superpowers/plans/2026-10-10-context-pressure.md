@@ -37,7 +37,7 @@
   - `public struct PressureReading: Sendable, Equatable { public let tokensLeft: Int; public let lineNumber: Int; public init(tokensLeft: Int, lineNumber: Int) }`
   - `public enum ContextPressureExtractor { public static func peak(in url: URL) throws -> PressureReading? }` — `nil` when the file has no numeric reminder; `throws` only for I/O failure.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```swift
 import XCTest
@@ -106,12 +106,12 @@ final class ContextPressureExtractorTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd Core && swift test --filter ContextPressureExtractorTests`
 Expected: FAIL — `cannot find 'ContextPressureExtractor' in scope`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```swift
 import Foundation
@@ -172,12 +172,12 @@ public enum ContextPressureExtractor {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd Core && swift test --filter ContextPressureExtractorTests`
 Expected: PASS — 6 tests.
 
-- [ ] **Step 5: Run the whole Core suite, then commit**
+- [x] **Step 5: Run the whole Core suite, then commit**
 
 Run: `cd Core && swift test` → 0 failures (both targets; absolute counts drift — growth by the new tests is the signal, not the total).
 
@@ -210,7 +210,7 @@ git commit -m "feat: the log's own tokens-left readings, minimum by line"
   - `AgentSourcePass.pressureUpdates: Int`
   - Wire: `SessionPayload` gains `tokensLeftFirst: Int?`, `tokensLeftWorst: Int?` — JSON `null` when absent.
 
-- [ ] **Step 1: Write the failing store tests**
+- [x] **Step 1: Write the failing store tests**
 
 Real helpers in `AgentSessionStoreTests.swift`: `makeStoreOnDisk() throws -> (AgentSessionStore, URL)` (URL is the `.sqlite` file), `recordSession(id:peerPID:clientName:clientVersion:connectedAt:)`, `sessions() throws -> [AgentSessionSnapshot]`. Write against those:
 
@@ -276,12 +276,12 @@ The migration test is a third test in the same file, written exactly:
 
 If `table_info(AgentSession)` names the table differently (SwiftData's entity naming), read the real name from `sqlite_master` first and use it — report which you found. If the ALTER cannot take the lock because the container lingers, **say so in the report**; do not skip the test quietly.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd Core && swift test --filter AgentSessionStoreTests`
 Expected: FAIL — `value of type 'AgentSession' has no member 'tokensLeftFirst'`.
 
-- [ ] **Step 3: Implement the model, fold, and snapshot**
+- [x] **Step 3: Implement the model, fold, and snapshot**
 
 On `AgentSession` (directly under `endedAt`):
 
@@ -317,7 +317,7 @@ Mirror both on `AgentSessionSnapshot` (its memberwise construction site is `Agen
 
 Also mirror both fields into the `AgentSessionSnapshot` literal at `AgentSessionStore.swift:351` (they are the only new values; the rest of the literal is untouched).
 
-- [ ] **Step 4: Wire the adapter seam and the pass**
+- [x] **Step 4: Wire the adapter seam and the pass**
 
 In `TokenSourceAdapter.swift`, a defaulted extension method (a format we don't know cannot claim a signal):
 
@@ -355,7 +355,7 @@ The `do`/`catch` mirrors `recordUsage`'s in the same loop — same failure list,
 
 Add `public let pressureUpdates: Int` to `AgentSourcePass`. There are exactly **two** construction sites, both in `AgentSourcePoller.swift` (`:111` empty-pass constant, `:368` returning pass) — initialise `0` at both; tests only *read* pass fields, so nothing else changes. `AppModel` consumes the counter in Task 3.
 
-- [ ] **Step 5: Wire the session payload**
+- [x] **Step 5: Wire the session payload**
 
 On the session payload struct in `WirePayloads.swift` (next to `peerPID`):
 
@@ -368,7 +368,7 @@ On the session payload struct in `WirePayloads.swift` (next to `peerPID`):
 
 Initialise from the snapshot. Add one MCP test asserting the JSON: both `null` when the snapshot's are nil; integers when set. Match the file's existing JSON-assertion style (do not invent a new one).
 
-- [ ] **Step 6: Write the poller tests**
+- [x] **Step 6: Write the poller tests**
 
 Extend the suite's existing `CountingTokenAdapter` (`AgentSourcePollerTests.swift:18`) with an optional answer — no new adapter type:
 
@@ -415,12 +415,12 @@ Then three tests, using the suite's real helpers — `makeStore()`, `recordSessi
 
 Bodies 2 and 3 follow body 1's exact structure; their comments state the assertions to pin.
 
-- [ ] **Step 7: Run to verify pass**
+- [x] **Step 7: Run to verify pass**
 
 Run: `cd Core && swift test` (one command; both `PortmasterCoreTests` and `PortmasterMCPTests` live in this package).
 Expected: 0 failures, 1 pre-existing skip; Core grows by the store + poller tests, MCP by one wire test.
 
-- [ ] **Step 8: Build and commit**
+- [x] **Step 8: Build and commit**
 
 `xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build` → `** BUILD SUCCEEDED **`, zero new warnings (six pre-existing).
 
@@ -442,19 +442,19 @@ git commit -m "feat: a session remembers the first and worst tokens-left it saw"
 - Consumes: `AgentSessionSnapshot.tokensLeftFirst/.tokensLeftWorst`, `liveSessionIDs`, `Fmt.tokens(_:)`, `refreshAgentSessions()`, `pass.pressureUpdates`.
 - Produces: `AppModel.contextPressureNotice: ContextPressureNotice?`; a `ContextPressureStrip` view.
 
-- [ ] **Step 1: Write the failing source-scan tests** (App has no test target; follow this repo's existing pattern exactly, including comment-stripping)
+- [x] **Step 1: Write the failing source-scan tests** (App has no test target; follow this repo's existing pattern exactly, including comment-stripping)
 
 Pin these three claims:
 1. `OverviewView.swift` renders `ContextPressureStrip` **above** the grid (assert both the call and that its source position precedes the grid's `LazyVGrid`/`grid` call).
 2. The operator core `* 2 <= ` appears **exactly once** across the whole stripped `App/` tree (a second threshold is a second unvalidated policy). Assert on the operator core, not the operand names, so the test pins the policy's *site count* rather than the spelling of local variables.
 3. The derivation lives in `refreshAgentSessions` — `contextPressureNotice` is assigned in exactly one file (a second assignment site is a second source of truth).
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd Core && swift test --filter AppAgentSourceWiringTests`
 Expected: FAIL — strip not yet rendered.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `AppModel`:
 
@@ -512,12 +512,12 @@ struct ContextPressureStrip: View {
 
 Wire: `if let notice = model.contextPressureNotice { ContextPressureStrip(notice: notice) }` immediately above the grid. **No buttons in this plan** — the actions (Continue / Hand off) belong to the handoff plan; a button that cannot act is a lie about what exists.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd Core && swift test --filter AppAgentSourceWiringTests`
 Expected: PASS.
 
-- [ ] **Step 5: Mutation-check, then full verification**
+- [x] **Step 5: Mutation-check, then full verification**
 
 Deliberately break each claim and confirm the matching test goes red, then revert:
 - render the strip *below* the grid → test 1 red;
@@ -530,7 +530,7 @@ Then run everything and paste real output:
 3. `./scripts/mcp-e2e.sh --no-manual <app> <mcp>` — 17 passed, 0 failed, 1 skipped (bundle from `-showBuildSettings` `BUILT_PRODUCTS_DIR`; MCP at `Core/.build/debug/portmaster-mcp`).
 4. **Run the app.** The strip needs a live session with an eroding budget to appear, which we have never observed — so the honest check is that the app runs, the Overview renders, the poller logs its pass line (`log stream` for `category == "agent-sources"`), and no console errors. Report exactly what you saw; do not claim you saw the strip unless you did.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A 'App' 'Core/Tests'
