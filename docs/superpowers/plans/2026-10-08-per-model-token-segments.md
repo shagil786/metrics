@@ -57,7 +57,7 @@ across three commits it would leave two red ones.
   - `SessionCost.notPriced(models: [String])` — was `notPriced(modelID: String)`
   - `SessionCost.conflict(disagreements: [UsageDisagreement])` — was `conflict(models: [String])`
 
-- [ ] **Step 1: Write the failing fold tests**
+- [x] **Step 1: Write the failing fold tests**
 
 Add to `AgentUsageTests.swift`:
 
@@ -133,7 +133,7 @@ Add to `AgentUsageTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Write the failing disagreement tests**
+- [x] **Step 2: Write the failing disagreement tests**
 
 ```swift
     /// 20% apart is a broken reader, not rounding: the two must not be silently
@@ -192,7 +192,7 @@ Add to `AgentUsageTests.swift`:
     }
 ```
 
-- [ ] **Step 3: Write the failing pricing tests**
+- [x] **Step 3: Write the failing pricing tests**
 
 Add to `AgentSessionStoreTests.swift`:
 
@@ -287,12 +287,12 @@ Add to `AgentSessionStoreTests.swift`:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run: `cd Core && swift test --filter "AgentUsageTests|AgentSessionStoreTests"`
 Expected: FAIL to compile — `TokenUsageSegment`, `latestPerSegment`, `hasMaterialDisagreement`, `UsageDisagreement` and `CostLine` do not exist, and `priced`/`notPriced`/`conflict` have their old shapes.
 
-- [ ] **Step 5: Add the segment type**
+- [x] **Step 5: Add the segment type**
 
 In `AgentUsage.swift`, before `enum TokenUsage`:
 
@@ -366,7 +366,7 @@ public struct CostLine: Hashable, Sendable {
 }
 ```
 
-- [ ] **Step 6: Change `TokenUsage` and the fold**
+- [x] **Step 6: Change `TokenUsage` and the fold**
 
 Replace the `reported` case and add the convenience constructor:
 
@@ -443,7 +443,7 @@ Rewrite `aggregating`:
     }
 ```
 
-- [ ] **Step 7: Repurpose the conflict rule**
+- [x] **Step 7: Repurpose the conflict rule**
 
 Delete `hasModelConflict` and replace it with:
 
@@ -490,7 +490,7 @@ Delete `hasModelConflict` and replace it with:
     }
 ```
 
-- [ ] **Step 8: Change `SessionCost`**
+- [x] **Step 8: Change `SessionCost`**
 
 ```swift
 public enum SessionCost: Hashable, Sendable {
@@ -517,7 +517,7 @@ public enum SessionCost: Hashable, Sendable {
 }
 ```
 
-- [ ] **Step 9: Rewrite `costLocked`**
+- [x] **Step 9: Rewrite `costLocked`**
 
 Replace the whole body of `costLocked` in `AgentSessionStore.swift`:
 
@@ -599,7 +599,7 @@ Replace the whole body of `costLocked` in `AgentSessionStore.swift`:
     }
 ```
 
-- [ ] **Step 10: Migrate every remaining call site**
+- [x] **Step 10: Migrate every remaining call site**
 
 Run: `cd Core && swift build 2>&1 | grep "error:"`
 Expected: errors at every use of the old shapes. Fix each:
@@ -612,12 +612,12 @@ Expected: errors at every use of the old shapes. Fix each:
 
 `AgentSessionWiringTests.swift` compiles without changes at this point: `TokenUsagePayload` and `SessionCostPayload` construct from `TokenUsage`/`SessionCost` but match on cases positionally, so re-run the suite and fix only what fails.
 
-- [ ] **Step 11: Run the full Core suite**
+- [x] **Step 11: Run the full Core suite**
 
 Run: `cd Core && swift test`
 Expected: Core PASS. If MCP tests fail, every failure must be a wire-payload shape mismatch that Task 3 fixes — anything else is a fault in this task.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/AgentUsage.swift Core/Sources/PortmasterCore/History/AgentSessionStore.swift Core/Tests/PortmasterCoreTests/AgentUsageTests.swift Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift
@@ -659,7 +659,7 @@ separate defect, and this is its own fix.
 - Consumes: nothing from Task 1; `prune(olderThan: Date, keepingSessionIDs: Set<UUID>)` keeps its signature
 - Produces: the same signature with corrected semantics. **No new public API.**
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `AgentSessionStoreTests.swift`, and **delete `testPruneTrimmingCanResolveATwoProvenanceConflictIntoAPrice`** in the same edit — it asserts the defect:
 
@@ -736,12 +736,12 @@ Add to `AgentSessionStoreTests.swift`, and **delete `testPruneTrimmingCanResolve
     }
 ```
 
-- [ ] **Step 2: Run to verify the first test fails**
+- [x] **Step 2: Run to verify the first test fails**
 
 Run: `cd Core && swift test --filter "AgentSessionStoreTests/testPrune"`
 Expected: `testPruneDoesNotChangeAFigureForATwoSourceSession` FAILS — the old trim deletes the sole self-report, so `usage` after the sweep is the parse's segment alone.
 
-- [ ] **Step 3: Fix the trim**
+- [x] **Step 3: Fix the trim**
 
 In `prune`, replace the trim loop:
 
@@ -797,12 +797,12 @@ Add the key type near `prune`:
     }
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cd Core && swift test --filter "AgentSessionStoreTests/testPrune"`
 Expected: both new tests PASS.
 
-- [ ] **Step 5: Rewrite the doc comment on `prune`**
+- [x] **Step 5: Rewrite the doc comment on `prune`**
 
 The comment block at `AgentSessionStore.swift:415` says the trim is unsafe for two-provenance sessions and that "no adapter ships" so it cannot happen. Both halves are now false. Replace that block with:
 
@@ -814,12 +814,12 @@ The comment block at `AgentSessionStore.swift:415` says the trim is unsafe for t
     ///   disappear from an aggregate as a side effect of retention.
 ```
 
-- [ ] **Step 6: Run the full Core suite**
+- [x] **Step 6: Run the full Core suite**
 
 Run: `cd Core && swift test`
 Expected: Core PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Core/Sources/PortmasterCore/History/AgentSessionStore.swift Core/Tests/PortmasterCoreTests/AgentSessionStoreTests.swift
@@ -854,7 +854,7 @@ behaviour, and its inverse was written first."
 - Consumes: `TokenUsageSegment`, `UsageDisagreement`, `CostLine` (Task 1)
 - Produces: `TokenUsagePayload` with `segments: [SegmentPayload]?`, `SessionCostPayload` with `lines: [CostLinePayload]?` and `disagreements: [DisagreementPayload]?`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `AgentSessionWiringTests.swift`:
 
@@ -885,12 +885,12 @@ In `AgentSessionWiringTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cd Core && swift test --filter AgentSessionWiringTests`
 Expected: FAIL — `TokenUsagePayload` has no `segments` and `SessionCostPayload` has no `lines`.
 
-- [ ] **Step 3: Rewrite `TokenUsagePayload`**
+- [x] **Step 3: Rewrite `TokenUsagePayload`**
 
 ```swift
 /// One session's usage as a list of per-model segments, with the absence kept
@@ -943,7 +943,7 @@ struct SegmentPayload: Encodable {
 }
 ```
 
-- [ ] **Step 4: Rewrite `SessionCostPayload`**
+- [x] **Step 4: Rewrite `SessionCostPayload`**
 
 ```swift
 /// A session's cost, with `notPriced` and `conflict` distinct from a priced zero.
@@ -1027,17 +1027,17 @@ struct DisagreementPayload: Encodable {
 }
 ```
 
-- [ ] **Step 5: Run to verify it passes**
+- [x] **Step 5: Run to verify it passes**
 
 Run: `cd Core && swift test --filter AgentSessionWiringTests`
 Expected: PASS.
 
-- [ ] **Step 6: Run everything**
+- [x] **Step 6: Run everything**
 
 Run: `cd Core && swift test`
 Expected: all PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Core/Sources/PortmasterMCP/WirePayloads.swift Core/Tests/PortmasterMCPTests/AgentSessionWiringTests.swift
@@ -1063,7 +1063,7 @@ and a decimal string round-trips through any client unchanged."
 - Consumes: the `TokenUsage` and `SessionCost` shapes from Task 1
 - Produces: no new public API; UI only
 
-- [ ] **Step 1: Update the aggregate line to name every model**
+- [x] **Step 1: Update the aggregate line to name every model**
 
 In `AgentSessionsCard`, replace the usage total so it names the models when there is
 more than one, because a single summed token count is what hid the escalation:
@@ -1084,7 +1084,7 @@ more than one, because a single summed token count is what hid the escalation:
     }
 ```
 
-- [ ] **Step 2: Update `SessionLine.usage`**
+- [x] **Step 2: Update `SessionLine.usage`**
 
 ```swift
     private var usage: String {
@@ -1115,7 +1115,7 @@ more than one, because a single summed token count is what hid the escalation:
     }
 ```
 
-- [ ] **Step 3: Update `SessionLine.cost`**
+- [x] **Step 3: Update `SessionLine.cost`**
 
 ```swift
     private var cost: String {
@@ -1143,12 +1143,12 @@ more than one, because a single summed token count is what hid the escalation:
     }
 ```
 
-- [ ] **Step 4: Build**
+- [x] **Step 4: Build**
 
 Run: `xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configuration Debug build`
 Expected: `** BUILD SUCCEEDED **` with no warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add App/OverviewView.swift
@@ -1171,14 +1171,14 @@ A conflict prints both totals and which source reported each, rather than the wo
 - Modify: `README.md`
 - Modify: `docs/superpowers/specs/2026-10-02-mcp-support-design.md` (status only)
 
-- [ ] **Step 1: Correct the README's claim about the adapter**
+- [x] **Step 1: Correct the README's claim about the adapter**
 
 The README says per-model records "retire the known-unsound case." That was false
 until Task 1. Update it to describe segments and the per-model split, and remove the
 claim that a self-report can be priced per model — a cumulative report carries the
 older model's tokens inside its total, so it cannot be.
 
-- [ ] **Step 2: Run every suite**
+- [x] **Step 2: Run every suite**
 
 ```bash
 cd Core && swift test
@@ -1190,12 +1190,12 @@ cd .. && xcodebuild -project Portmaster.xcodeproj -scheme Portmaster -configurat
 
 Expected: Core PASS, build clean, e2e summary `17 passed, 0 failed, 1 skipped`.
 
-- [ ] **Step 3: Record the baseline counts**
+- [x] **Step 3: Record the baseline counts**
 
 Run: `cd Core && swift test 2>&1 | grep -E "Executed [0-9]+ tests, with" | tail -2`
 Expected: record the two totals and put them in the commit message.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md docs/superpowers/specs/2026-10-02-mcp-support-design.md
